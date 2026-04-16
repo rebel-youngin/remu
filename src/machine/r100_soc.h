@@ -17,7 +17,7 @@
  * QOM type names
  * ======================================================================== */
 
-#define TYPE_R100_SOC_MACHINE   "r100-soc"
+#define TYPE_R100_SOC_MACHINE   "r100-soc-machine"
 #define TYPE_R100_CMU           "r100-cmu"
 #define TYPE_R100_PMU           "r100-pmu"
 #define TYPE_R100_SYSREG        "r100-sysreg"

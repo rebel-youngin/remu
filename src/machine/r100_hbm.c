@@ -92,7 +92,7 @@ static void r100_hbm_class_init(ObjectClass *oc, void *data)
     DeviceClass *dc = DEVICE_CLASS(oc);
 
     dc->realize = r100_hbm_realize;
-    dc->reset = r100_hbm_reset;
+    device_class_set_legacy_reset(dc, r100_hbm_reset);
     device_class_set_props(dc, r100_hbm_properties);
 }
 

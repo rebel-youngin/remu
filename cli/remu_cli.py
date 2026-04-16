@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""
+REMU CLI — R100 NPU System Emulator management tool.
+
+Usage:
+    remu build [--clean] [--jobs N]
+    remu run [--gdb] [--trace] [--chiplets N]
+    remu gdb [--port PORT]
+    remu status
+    remu images [--list | --check]
+"""
+
+import os
+import sys
+import shutil
+import signal
+import subprocess
+from pathlib import Path
+
+import click
+
+REMU_ROOT = Path(__file__).resolve().parent.parent
+QEMU_SRC = REMU_ROOT / "external" / "qemu"
+QEMU_BUILD = REMU_ROOT / "build" / "qemu"
+QEMU_BIN = QEMU_BUILD / "qemu-system-aarch64"
+MACHINE_SRC = REMU_ROOT / "src" / "machine"
+INCLUDE_SRC = REMU_ROOT / "src" / "include"
+IMAGES_DIR = REMU_ROOT / "images"
+
+# R100 firmware image definitions: (filename, load_address, description)
+FW_IMAGES = [
+    ("bl1.bin",           0x1E00010000, "TF-A BL1 (iRAM)"),
+    ("bl2.bin",           0x1E0004B000, "TF-A BL2 (iRAM)"),
+    ("bl31_cp0.bin",      0x0000000000, "TF-A BL31 for CP0 (DRAM)"),
+    ("bl31_cp1.bin",      0x0014100000, "TF-A BL31 for CP1 (DRAM)"),
+    ("freertos_cp0.bin",  0x0000200000, "FreeRTOS for CP0 (DRAM)"),
+    ("freertos_cp1.bin",  0x0014200000, "FreeRTOS for CP1 (DRAM)"),
+]
+
+
+def _check_qemu_src():
+    if not QEMU_SRC.is_dir():
+        click.secho("QEMU source not found at: %s" % QEMU_SRC, fg="red")
+        click.echo("Run:  git clone --depth 1 --branch v9.2.0 "
+                    "https://gitlab.com/qemu-project/qemu.git %s" % QEMU_SRC)
+        raise SystemExit(1)
+
+
+def _check_qemu_bin():
+    if not QEMU_BIN.is_file():
+        click.secho("QEMU binary not found. Run 'remu build' first.", fg="red")
+        raise SystemExit(1)
+
+
+def _link_sources():
+    """Symlink remu device models into the QEMU source tree."""
+    r100_dir = QEMU_SRC / "hw" / "arm" / "r100"
+    if not r100_dir.exists():
+        r100_dir.symlink_to(MACHINE_SRC)
+        click.echo("  Linked %s -> %s" % (r100_dir, MACHINE_SRC))
+
+    include_link = QEMU_SRC / "include" / "hw" / "arm" / "remu_addrmap.h"
+    if not include_link.exists():
+        include_link.symlink_to(INCLUDE_SRC / "remu_addrmap.h")
+        click.echo("  Linked %s" % include_link)
+
+    r100_soc_h_link = QEMU_SRC / "include" / "hw" / "arm" / "r100_soc.h"
+    if not r100_soc_h_link.exists():
+        r100_soc_h_link.symlink_to(MACHINE_SRC / "r100_soc.h")
+        click.echo("  Linked %s" % r100_soc_h_link)
+
+
+def _patch_meson():
+    """Ensure QEMU's hw/arm/meson.build includes our subdir."""
+    meson_path = QEMU_SRC / "hw" / "arm" / "meson.build"
+    marker = "subdir('r100')"
+
+    content = meson_path.read_text()
+    if marker not in content:
+        content += "\n%s\n" % marker
+        meson_path.write_text(content)
+        click.echo("  Patched %s" % meson_path)
+        return True
+    return False
+
+
+def _run(cmd, cwd=None, check=True, **kwargs):
+    """Run a subprocess, printing stdout/stderr live."""
+    click.echo("  $ %s" % " ".join(str(c) for c in cmd))
+    return subprocess.run(cmd, cwd=cwd, check=check, **kwargs)
+
+
+# ── CLI Group ────────────────────────────────────────────────────────────────
+
+@click.group()
+@click.version_option("0.1.0", prog_name="remu")
+def cli():
+    """REMU — R100 NPU System Emulator CLI."""
+
+
+# ── build ────────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.option("--clean", is_flag=True, help="Remove build directory first.")
+@click.option("--jobs", "-j", type=int, default=0,
+              help="Parallel build jobs (0 = auto-detect).")
+def build(clean, jobs):
+    """Build QEMU with R100 device models."""
+    _check_qemu_src()
+
+    if clean:
+        click.echo("Cleaning...")
+        if QEMU_BUILD.exists():
+            shutil.rmtree(QEMU_BUILD)
+        r100_link = QEMU_SRC / "hw" / "arm" / "r100"
+        if r100_link.is_symlink():
+            r100_link.unlink()
+        click.secho("Clean complete.", fg="green")
+        if not click.confirm("Continue with build?"):
+            return
+
+    click.echo("Linking remu sources into QEMU tree...")
+    _link_sources()
+
+    click.echo("Patching meson.build...")
+    _patch_meson()
+
+    QEMU_BUILD.mkdir(parents=True, exist_ok=True)
+
+    # Configure
+    if not (QEMU_BUILD / "build.ninja").exists():
+        click.echo("Configuring QEMU (aarch64-softmmu)...")
+        _run([
+            str(QEMU_SRC / "configure"),
+            "--target-list=aarch64-softmmu",
+            "--prefix=%s" % (REMU_ROOT / "install"),
+            "--enable-debug",
+            "--disable-werror",
+            "--disable-docs",
+            "--disable-guest-agent",
+            "--extra-cflags=-I%s" % INCLUDE_SRC,
+        ], cwd=QEMU_BUILD)
+
+    # Build
+    nj = jobs if jobs > 0 else os.cpu_count()
+    click.echo("Building with %d jobs..." % nj)
+    _run(["ninja", "-j", str(nj)], cwd=QEMU_BUILD)
+
+    click.secho("\nBuild complete: %s" % QEMU_BIN, fg="green")
+
+
+# ── run ──────────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.option("--gdb", is_flag=True, help="Wait for GDB connection on :1234.")
+@click.option("--trace", is_flag=True,
+              help="Enable guest_errors and unimp logging.")
+@click.option("--chiplets", type=int, default=4,
+              help="Number of chiplets (1-4). Default 4.")
+@click.option("--memory", "-m", default="1G",
+              help="DRAM size per chiplet (e.g. 1G, 512M).")
+def run(gdb, trace, chiplets, memory):
+    """Boot R100 firmware on the emulated SoC."""
+    _check_qemu_bin()
+
+    cmd = [
+        str(QEMU_BIN),
+        "-M", "r100-soc",
+        "-nographic",
+        "-serial", "stdio",
+    ]
+
+    if gdb:
+        cmd += ["-s", "-S"]
+        click.secho("Waiting for GDB on localhost:1234...", fg="yellow")
+
+    if trace:
+        cmd += ["-d", "guest_errors,unimp"]
+
+    # Load firmware images
+    found = 0
+    for fname, addr, desc in FW_IMAGES:
+        path = IMAGES_DIR / fname
+        if path.is_file():
+            cmd += ["-device", "loader,file=%s,addr=0x%x" % (path, addr)]
+            found += 1
+
+    if found == 0:
+        click.secho("Warning: no firmware images in %s/" % IMAGES_DIR,
+                     fg="yellow")
+        click.echo("Place bl1.bin, bl31_cp0.bin, freertos_cp0.bin, etc.")
+        if not click.confirm("Run with empty memory anyway?"):
+            return
+
+    click.echo("Starting R100 emulator (%d chiplets)..." % chiplets)
+    click.echo("  Machine: r100-soc (4 chiplets, 32 CA73 cores)")
+    click.echo("  Press Ctrl-A X to quit")
+    click.echo()
+
+    try:
+        os.execvp(cmd[0], cmd)
+    except OSError as e:
+        click.secho("Failed to start QEMU: %s" % e, fg="red")
+        raise SystemExit(1)
+
+
+# ── gdb ──────────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.option("--port", "-p", type=int, default=1234,
+              help="GDB server port. Default 1234.")
+@click.option("--binary", "-b", type=click.Path(exists=True), default=None,
+              help="ELF binary with debug symbols to load.")
+def gdb(port, binary):
+    """Attach GDB to a running QEMU instance."""
+    gdb_cmd = shutil.which("gdb-multiarch") or shutil.which("aarch64-linux-gnu-gdb")
+    if not gdb_cmd:
+        click.secho("gdb-multiarch not found. Install with: "
+                     "sudo apt install gdb-multiarch", fg="red")
+        raise SystemExit(1)
+
+    cmd = [gdb_cmd]
+    if binary:
+        cmd.append(binary)
+    cmd += ["-ex", "target remote :%d" % port]
+
+    click.echo("Connecting to QEMU GDB server on :%d..." % port)
+    os.execvp(cmd[0], cmd)
+
+
+# ── status ───────────────────────────────────────────────────────────────────
+
+@cli.command()
+def status():
+    """Show emulator environment status."""
+    click.echo("REMU — R100 NPU System Emulator")
+    click.echo()
+
+    # QEMU source
+    if QEMU_SRC.is_dir():
+        click.secho("  QEMU source:  %s" % QEMU_SRC, fg="green")
+    else:
+        click.secho("  QEMU source:  NOT FOUND", fg="red")
+
+    # QEMU binary
+    if QEMU_BIN.is_file():
+        click.secho("  QEMU binary:  %s" % QEMU_BIN, fg="green")
+    else:
+        click.secho("  QEMU binary:  NOT BUILT (run: remu build)", fg="yellow")
+
+    # Firmware images
+    click.echo()
+    click.echo("  Firmware images (%s/):" % IMAGES_DIR)
+    any_found = False
+    for fname, addr, desc in FW_IMAGES:
+        path = IMAGES_DIR / fname
+        if path.is_file():
+            size = path.stat().st_size
+            click.secho("    [OK] %-22s %8d bytes  @ 0x%010x  %s" %
+                         (fname, size, addr, desc), fg="green")
+            any_found = True
+        else:
+            click.secho("    [--] %-22s                @ 0x%010x  %s" %
+                         (fname, addr, desc), fg="white", dim=True)
+
+    if not any_found:
+        click.echo()
+        click.secho("  No firmware images found. Build q-sys with "
+                     "'-p zebu' and copy binaries here.", fg="yellow")
+
+    # Device models
+    click.echo()
+    click.echo("  Device models (src/machine/):")
+    models = sorted(MACHINE_SRC.glob("r100_*.c"))
+    for m in models:
+        name = m.stem.replace("r100_", "")
+        click.echo("    %s" % name)
+
+    # Symlink status
+    click.echo()
+    r100_link = QEMU_SRC / "hw" / "arm" / "r100"
+    if r100_link.exists():
+        click.secho("  QEMU integration:  linked", fg="green")
+    else:
+        click.secho("  QEMU integration:  not linked (run: remu build)",
+                     fg="yellow")
+
+
+# ── images ───────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.option("--check", is_flag=True,
+              help="Check which images are present.")
+@click.option("--from-dir", type=click.Path(exists=True), default=None,
+              help="Copy firmware images from a build output directory.")
+def images(check, from_dir):
+    """Manage firmware images for the emulator."""
+    if from_dir:
+        src = Path(from_dir)
+        IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+
+        click.echo("Copying firmware images from %s..." % src)
+        # Try common FW build output patterns
+        patterns = {
+            "bl1.bin": ["bl1.bin", "FreeRTOS_CP/bl1.bin"],
+            "bl31_cp0.bin": ["bl31.bin", "FreeRTOS_CP/bl31.bin"],
+            "freertos_cp0.bin": [
+                "FreeRTOS_CP.bin",
+                "FreeRTOS_CP/FreeRTOS_CP.bin",
+            ],
+        }
+        for target, candidates in patterns.items():
+            for cand in candidates:
+                cand_path = src / cand
+                if cand_path.is_file():
+                    dest = IMAGES_DIR / target
+                    shutil.copy2(cand_path, dest)
+                    click.secho("  %s -> %s" % (cand_path, dest), fg="green")
+                    break
+
+        click.echo("Done. Run 'remu images --check' to verify.")
+        return
+
+    # Default: show image status (same as --check)
+    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    click.echo("Firmware images in %s/:" % IMAGES_DIR)
+    click.echo()
+    for fname, addr, desc in FW_IMAGES:
+        path = IMAGES_DIR / fname
+        if path.is_file():
+            size = path.stat().st_size
+            click.secho("  [OK] %-22s %8d bytes  @ 0x%010x" %
+                         (fname, size, addr), fg="green")
+        else:
+            click.secho("  [--] %-22s  missing         @ 0x%010x" %
+                         (fname, addr), fg="red")
+    click.echo()
+    click.echo("Copy images manually or use: remu images --from-dir <path>")
+
+
+# ── entry point ──────────────────────────────────────────────────────────────
+
+def main():
+    cli()
+
+
+if __name__ == "__main__":
+    main()

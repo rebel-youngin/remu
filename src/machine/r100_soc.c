@@ -22,10 +22,12 @@
 #include "hw/arm/armv7m.h"
 #include "hw/intc/arm_gicv3.h"
 #include "hw/char/pl011.h"
+#include "hw/qdev-properties-system.h"
 #include "hw/loader.h"
 #include "sysemu/sysemu.h"
 #include "exec/address-spaces.h"
 #include "target/arm/cpu.h"
+#include "qapi/qmp/qlist.h"
 #include "r100_soc.h"
 
 /*
@@ -288,7 +290,6 @@ static void r100_soc_init(MachineState *machine)
     SysBusDevice *gicbusdev;
     int chiplet, cluster, core, cpu_idx;
     int num_cpus = R100_NUM_CORES_TOTAL;
-    char name[64];
 
     /* Validate CPU count */
     if (machine->smp.cpus != num_cpus && machine->smp.cpus != 0) {
@@ -346,41 +347,57 @@ static void r100_soc_init(MachineState *machine)
     qdev_prop_set_uint32(gicdev, "num-cpu", num_cpus);
     qdev_prop_set_uint32(gicdev, "num-irq", 256);
     qdev_prop_set_uint32(gicdev, "revision", 3);
+    /*
+     * GICv3 redistributor: each CPU needs a 128KB (0x20000) frame.
+     * 32 CPUs = 4MB total. Map as a single contiguous region.
+     */
+    {
+        QList *redist = qlist_new();
+        qlist_append_int(redist, num_cpus);
+        qdev_prop_set_array(gicdev, "redist-region-count", redist);
+    }
     gicbusdev = SYS_BUS_DEVICE(gicdev);
     sysbus_realize_and_unref(gicbusdev, &error_fatal);
 
     /* Map GIC distributor at chiplet 0's GIC address */
     sysbus_mmio_map(gicbusdev, 0, R100_GIC_DIST_BASE);
-    /* Map GIC redistributor */
+    /* Map GIC redistributor (32 CPUs * 0x20000 = 4MB starting at GICR base) */
     sysbus_mmio_map(gicbusdev, 1, R100_GIC_REDIST_CP0_BASE);
 
-    /* Wire GIC IRQs to CPUs */
+    /* Wire GIC IRQ outputs to CPU inputs (matches virt.c pattern) */
     for (cpu_idx = 0; cpu_idx < num_cpus; cpu_idx++) {
-        DeviceState *cpu = DEVICE(qemu_get_cpu(cpu_idx));
-        int ppibase = num_cpus * 2 + cpu_idx * 6;
+        DeviceState *cpudev = DEVICE(qemu_get_cpu(cpu_idx));
 
-        /* IRQ, FIQ, Virtual IRQ, Virtual FIQ, HYP IRQ, HYP FIQ */
-        sysbus_connect_irq(gicbusdev, ppibase + 0,
-                           qdev_get_gpio_in(cpu, ARM_CPU_IRQ));
-        sysbus_connect_irq(gicbusdev, ppibase + 1,
-                           qdev_get_gpio_in(cpu, ARM_CPU_FIQ));
-        sysbus_connect_irq(gicbusdev, ppibase + 2,
-                           qdev_get_gpio_in(cpu, ARM_CPU_VIRQ));
-        sysbus_connect_irq(gicbusdev, ppibase + 3,
-                           qdev_get_gpio_in(cpu, ARM_CPU_VFIQ));
+        sysbus_connect_irq(gicbusdev, cpu_idx,
+                           qdev_get_gpio_in(cpudev, ARM_CPU_IRQ));
+        sysbus_connect_irq(gicbusdev, cpu_idx + num_cpus,
+                           qdev_get_gpio_in(cpudev, ARM_CPU_FIQ));
+        sysbus_connect_irq(gicbusdev, cpu_idx + 2 * num_cpus,
+                           qdev_get_gpio_in(cpudev, ARM_CPU_VIRQ));
+        sysbus_connect_irq(gicbusdev, cpu_idx + 3 * num_cpus,
+                           qdev_get_gpio_in(cpudev, ARM_CPU_VFIQ));
+    }
+
+    /* --- Initialize all 4 chiplets --- */
+    for (chiplet = 0; chiplet < R100_NUM_CHIPLETS; chiplet++) {
+        r100_chiplet_init(machine, chiplet, sysmem);
     }
 
     /*
      * --- PL011 UART ---
      * Map at chiplet 0's PERI0_UART0 address for console output.
+     * Use memory_region_add_subregion_overlap with priority 10 so the
+     * UART takes precedence over the config space container.
      */
-    pl011_create(R100_PERI0_UART0_BASE,
-                 qdev_get_gpio_in(gicdev, 33),  /* SPI 33 */
-                 serial_hd(0));
-
-    /* --- Initialize all 4 chiplets --- */
-    for (chiplet = 0; chiplet < R100_NUM_CHIPLETS; chiplet++) {
-        r100_chiplet_init(machine, chiplet, sysmem);
+    {
+        DeviceState *uart = qdev_new(TYPE_PL011);
+        qdev_prop_set_chr(uart, "chardev", serial_hd(0));
+        SysBusDevice *uart_sbd = SYS_BUS_DEVICE(uart);
+        sysbus_realize_and_unref(uart_sbd, &error_fatal);
+        memory_region_add_subregion_overlap(sysmem, R100_PERI0_UART0_BASE,
+                                            sysbus_mmio_get_region(uart_sbd, 0),
+                                            10);
+        sysbus_connect_irq(uart_sbd, 0, qdev_get_gpio_in(gicdev, 33));
     }
 }
 

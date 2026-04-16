@@ -87,7 +87,7 @@ static void r100_sysreg_class_init(ObjectClass *oc, void *data)
     DeviceClass *dc = DEVICE_CLASS(oc);
 
     dc->realize = r100_sysreg_realize;
-    dc->reset = r100_sysreg_reset;
+    device_class_set_legacy_reset(dc, r100_sysreg_reset);
     device_class_set_props(dc, r100_sysreg_properties);
 }
 

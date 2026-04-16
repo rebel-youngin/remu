@@ -1,0 +1,8 @@
+build/
+install/
+images/*.bin
+external/qemu/
+*.egg-info/
+__pycache__/
+*.pyc
+.claude/
