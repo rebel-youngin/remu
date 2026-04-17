@@ -118,6 +118,10 @@
 #define R100_NBUS_L_CMU_BASE        0x1FF3500000ULL
 #define R100_NBUS_L_RBDMA_CFG_BASE  0x1FF3700000ULL
 
+/* --- PL330 DMA controller (used by BL1 for UCIe firmware load) --- */
+#define R100_DMA_PL330_BASE         0x1FF02C0000ULL
+#define R100_DMA_PL330_SIZE         0x0000001000ULL  /* 4KB: struct pl330 */
+
 /* --- GIC600 --- */
 #define R100_GIC_DIST_BASE          0x1FF3800000ULL
 #define R100_GIC_REDIST_CP0_BASE    0x1FF3840000ULL

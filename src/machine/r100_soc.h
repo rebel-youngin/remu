@@ -24,6 +24,7 @@
 #define TYPE_R100_HBM           "r100-hbm"
 #define TYPE_R100_QSPI_BRIDGE   "r100-qspi-bridge"
 #define TYPE_R100_RBC           "r100-rbc"
+#define TYPE_R100_DMA_PL330     "r100-dma-pl330"
 #define TYPE_R100_UNIMPL        "r100-unimpl"
 
 /* ========================================================================
@@ -102,6 +103,29 @@ struct R100HBMState {
 typedef struct R100HBMState R100HBMState;
 
 DECLARE_INSTANCE_CHECKER(R100HBMState, R100_HBM, TYPE_R100_HBM)
+
+/* ========================================================================
+ * PL330 DMA controller stub
+ *
+ * Fake-completion stub: BL1's dma_load_image() polls ch_stat[0].csr and
+ * dbgcmd for completion. Returning zero on those reads satisfies the poll.
+ * Destination contents are never consumed (RBC stubs report UCIe link-up
+ * without running PHY microcode), so no real memcpy is performed.
+ * ======================================================================== */
+
+#define R100_DMA_REG_COUNT      (R100_DMA_PL330_SIZE / 4)
+
+struct R100DMAPl330State {
+    SysBusDevice parent_obj;
+
+    MemoryRegion iomem;
+    uint32_t regs[R100_DMA_REG_COUNT];
+    uint32_t chiplet_id;
+};
+
+typedef struct R100DMAPl330State R100DMAPl330State;
+
+DECLARE_INSTANCE_CHECKER(R100DMAPl330State, R100_DMA_PL330, TYPE_R100_DMA_PL330)
 
 /* ========================================================================
  * Unimplemented region (catch-all for unmapped config space reads)

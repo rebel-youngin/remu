@@ -190,6 +190,26 @@ static void r100_create_pcie_subctrl(MemoryRegion *cfg_mr, int chiplet_id)
 }
 
 /*
+ * Create and map a PL330 DMA controller stub.
+ *
+ * BL1 uses this during _bl1_init_blk_rbc() to "load" UCIe PHY firmware
+ * into each RBC's SRAM. The stub fakes completion without transferring
+ * data (the RBC stub reports link-up without running PHY microcode).
+ */
+static void r100_create_dma_pl330(MemoryRegion *cfg_mr, int chiplet_id)
+{
+    DeviceState *dev;
+    SysBusDevice *sbd;
+    uint64_t offset = R100_DMA_PL330_BASE - R100_CFG_BASE;
+
+    dev = qdev_new(TYPE_R100_DMA_PL330);
+    qdev_prop_set_uint32(dev, "chiplet-id", chiplet_id);
+    sbd = SYS_BUS_DEVICE(dev);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    memory_region_add_subregion(cfg_mr, offset, sysbus_mmio_get_region(sbd, 0));
+}
+
+/*
  * Create and map an HBM3 controller stub.
  */
 static void r100_create_hbm(MemoryRegion *cfg_mr, int chiplet_id)
@@ -358,6 +378,9 @@ static void r100_chiplet_init(MachineState *machine, int chiplet_id,
 
     /* --- HBM3 controller stub --- */
     r100_create_hbm(cfg_mr, chiplet_id);
+
+    /* --- PL330 DMA controller stub (used by BL1 UCIe FW load) --- */
+    r100_create_dma_pl330(cfg_mr, chiplet_id);
 
     /* --- QSPI bridge (inter-chiplet register access) --- */
     r100_create_qspi_bridge(cfg_mr, chiplet_id);

@@ -4,7 +4,7 @@
 
 **Goal**: TF-A BL1 → BL2 → BL31 → FreeRTOS boots on all 4 chiplets.
 
-**Status**: Real q-sys TF-A BL1 runs and prints boot log to UART. Stopped at UCIe firmware DMA load inside `_bl1_init_blk_rbc()`.
+**Status**: Real q-sys TF-A BL1 runs and prints boot log to UART. PL330 DMA stub unblocks the UCIe firmware load; boot proceeds through `load_and_enable_ucie_link_for_CP()` and into QSPI-bridged secondary-chiplet UCIe loads. Next stop is a read from the flash staging region (`0x1F8000000`), which is not yet modeled.
 
 ### What's done
 
@@ -17,6 +17,7 @@
 - HBM3 stub: training-complete status
 - QSPI bridge: Designware SSI protocol, cross-chiplet register access (with `PRIVATE_BASE` prefix for slave-side addressing)
 - RBC stubs: UCIe LTSM ACTIVE for all 6 blocks per chiplet
+- PL330 DMA stub at `0x1FF02C0000` per chiplet: fake-completion on `ch_stat[0].csr`, `dbgstatus`, `dbgcmd` polls — no real memcpy (RBC stub hides the missing data)
 - Dual-mapped PMU and SYSREG devices at both config-space (`0x1FF0xxxxxx`) and private-alias (`0x1E00xxxxxx`) addresses via `memory_region_init_alias`
 - PCIe sub-controller stub (for `pmu_release_cm7` writes) and CSS600 CNTGEN stub (generic timer reset)
 - Chiplet-wide `unimplemented_device` fallbacks for config space and the 256MB private-alias window (OTP, RBC private aliases, etc.) — graceful handling of unmodeled registers
@@ -36,12 +37,12 @@ INFO:    Release reset of CM7
 NOTICE:  BL1: pmu_release_cm7 complete
 NOTICE:  BL1: Load tboot_u
 NOTICE:  BL1: Detected secondary chiplet count: 3
-NOTICE:  BL1: ZEBU_CI: 0    [stops here — UCIe FW DMA load pending]
+NOTICE:  BL1: ZEBU_CI: 0    [DMA stub unblocks; boot continues silently through RBC CMU + UCIe loads until a flash read at 0x1F8005E000]
 ```
 
 ### What remains
 
-- [ ] Stub the DMA controller (PL330 at `DMA_ROT_OFFSET`) so `dma_load_image()` reports completion — unblocks UCIe firmware load inside `_bl1_init_blk_rbc()`
+- [ ] Back the flash staging region (`0x1F8000000` range) with a RAM model, and preload the UCIe PHY microcode + tboot images there so QSPI bridge load (`qspi_bridge_load_image`) and subsequent CPU reads of UCIe source data succeed
 - [ ] Pre-load BL2/BL31/FreeRTOS to each secondary chiplet's iRAM/DRAM so BL1's cross-chiplet copy finds the data in place
 - [ ] Refine PMU for secondary core release — wire `CPU_CONFIGURATION` writes to QEMU `cpu_resume()` so chiplets 1-3 CPU0 actually start executing
 - [ ] Add per-chiplet UART instances (currently only chiplet 0 has UART mapped)
@@ -97,7 +98,7 @@ NOTICE:  BL1: ZEBU_CI: 0    [stops here — UCIe FW DMA load pending]
 | Timer | QEMU built-in + CSS600_CNTGEN stub | Same | Same |
 | QSPI bridge | Cross-chiplet R/W via `PRIVATE_BASE` prefix | Same | Same |
 | RBC/UCIe (6 x4) | Link-ready stub + PMU RBC status=ON | Same | Same |
-| DMA (PL330) | Not yet stubbed (next blocker) | Stub | Behavioral model |
+| DMA (PL330) | Fake-completion stub (csr/dbgstatus/dbgcmd return 0) | Stub | Behavioral model |
 | PCIe sub-controller | RAM stub (pmu_release_cm7) | Real model | Same |
 | PCIe/doorbell | N/A | Shared mem bridge | Same |
 | DNC (16 x4) | N/A | Return-success | Behavioral model |
