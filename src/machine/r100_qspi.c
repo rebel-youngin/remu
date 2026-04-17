@@ -15,10 +15,16 @@
  * and implement the read/write instruction protocol:
  *   - Instruction 0x70: Read 1 word from remote address
  *   - Instruction 0x80: Write 1 word to remote address
+ *   - Instruction 0x83: Write 16 consecutive words from a starting address
  *
  * Since all chiplets share QEMU's system address space, cross-chiplet
  * access is implemented as direct memory reads/writes at the appropriate
  * chiplet offset.
+ *
+ * The 16-word write is used by qspi_bridge_load_image() in BL1 to stage
+ * tboot_n into each secondary chiplet's local iRAM before releasing its
+ * CP0.cpu0 from reset. Without it, the secondary cores would resume at
+ * an RVBAR whose backing iRAM is empty.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -55,14 +61,29 @@
 #define SR_RFNE             (1 << 3)  /* RX FIFO not empty */
 
 /* QSPI instructions used by the bridge driver */
-#define QSPI_INST_READ_24WAIT  0x70
-#define QSPI_INST_WRITE        0x80
+#define QSPI_INST_READ_24WAIT   0x70
+#define QSPI_INST_WRITE         0x80
+#define QSPI_INST_WRITE_16WORD  0x83
 
-/* State machine for tracking multi-word DRX writes */
+#define QSPI_BURST16_WORDS      16
+
+/*
+ * State machine for tracking multi-word DRX writes.
+ *
+ * The bridge driver pushes a 3-word (1-word write), 2-word (read) or
+ * 18-word (16-word write) sequence into DRX[0..N-1]:
+ *
+ *   DRX[0] = instruction byte
+ *   DRX[1] = 24-bit word-aligned address
+ *   DRX[2..N-1] = data words (for writes only)
+ *
+ * For reads the result is placed in the RX FIFO; a subsequent DRX read
+ * consumes it. For writes we forward each data word in order.
+ */
 typedef enum {
     QSPI_STATE_IDLE,
     QSPI_STATE_GOT_INSTRUCTION,
-    QSPI_STATE_GOT_ADDRESS,
+    QSPI_STATE_WRITING,   /* expecting `data_words_remaining` more data words */
 } QSPIXferState;
 
 #define QSPI_REG_SIZE       0x100
@@ -77,9 +98,11 @@ typedef struct R100QSPIBridgeState {
     /* Transfer state machine */
     QSPIXferState xfer_state;
     uint32_t instruction;
-    uint32_t address;       /* 24-bit address from command */
-    uint32_t upper_addr;    /* Upper address bits (set via set_upper_addr) */
-    uint32_t rx_data;       /* Data read from remote chiplet */
+    uint32_t address;               /* 24-bit address from command */
+    uint32_t write_offset;          /* # of data words already forwarded */
+    uint32_t data_words_remaining;  /* data words pending for current burst */
+    uint32_t upper_addr;            /* Upper address bits (set via set_upper_addr) */
+    uint32_t rx_data;               /* Data read from remote chiplet */
     bool rx_data_valid;
 
     /* Currently selected slave (chiplet ID 1-3) */
@@ -133,8 +156,13 @@ static uint32_t qspi_remote_read(R100QSPIBridgeState *s)
 
 /*
  * Perform a cross-chiplet write via QEMU's system address space.
+ *
+ * `word_offset` is measured in 4-byte units past the instruction's base
+ * address. For a 1-word write this is always 0; for a 16-word burst it
+ * walks 0..15 as successive data words arrive on DRX.
  */
-static void qspi_remote_write(R100QSPIBridgeState *s, uint32_t data)
+static void qspi_remote_write(R100QSPIBridgeState *s, uint32_t word_offset,
+                              uint32_t data)
 {
     uint64_t full_addr;
     uint64_t target;
@@ -143,7 +171,7 @@ static void qspi_remote_write(R100QSPIBridgeState *s, uint32_t data)
     full_addr = (uint64_t)(s->upper_addr & 0xFC000000) |
                 ((uint64_t)s->address << 2);
     target = (uint64_t)s->selected_slave * R100_CHIPLET_OFFSET +
-             R100_PRIVATE_BASE + full_addr;
+             R100_PRIVATE_BASE + full_addr + ((uint64_t)word_offset << 2);
 
     result = address_space_write(&address_space_memory, target,
                                  MEMTXATTRS_UNSPECIFIED,
@@ -197,8 +225,7 @@ static void r100_qspi_write(void *opaque, hwaddr addr, uint64_t val,
 {
     R100QSPIBridgeState *s = R100_QSPI_BRIDGE(opaque);
 
-    switch (addr) {
-    case DW_SSI_SER:
+    if (addr == DW_SSI_SER) {
         /*
          * Slave Enable Register: bit N selects slave N.
          * slave_num in FW is 1-based (1=chiplet1, 2=chiplet2, 3=chiplet3),
@@ -214,19 +241,27 @@ static void r100_qspi_write(void *opaque, hwaddr addr, uint64_t val,
             s->selected_slave = 0;  /* deselected */
         }
         s->regs[addr >> 2] = (uint32_t)val;
-        break;
+        return;
+    }
 
-    case DW_SSI_DRX_BASE:
-    case DW_SSI_DRX_BASE + 4:
-    case DW_SSI_DRX_BASE + 8:
-        /*
-         * Data register writes form the QSPI command:
-         *   DRX[0] = instruction byte (0x70=read, 0x80=write)
-         *   DRX[1] = 24-bit address (word-aligned, already >> 2)
-         *   DRX[2] = data (for writes only)
-         *
-         * Process the command when all parts are received.
-         */
+    if (addr == DW_SSI_SSIENR) {
+        /* SSI enable/disable — reset transfer state on disable */
+        if (!(val & 1)) {
+            s->xfer_state = QSPI_STATE_IDLE;
+        }
+        s->regs[addr >> 2] = (uint32_t)val;
+        return;
+    }
+
+    /*
+     * The data register (DRX) lives at DW_SSI_DRX_BASE (0x60) and the FW
+     * driver writes DRX[0..17] via `regs->drx[i]`. In the real DWC_ssi
+     * all DRX slots share a single TX FIFO push address; but the FW lays
+     * out `struct dw_ssi_regs` as a contiguous uint32_t[36] array starting
+     * at 0x60, so writes actually hit DW_SSI_DRX_BASE + i*4. Treat any
+     * access in [0x60, 0xF0) as a FIFO push.
+     */
+    if (addr >= DW_SSI_DRX_BASE && addr < DW_SSI_DRX_BASE + 36 * 4) {
         switch (s->xfer_state) {
         case QSPI_STATE_IDLE:
             s->instruction = (uint32_t)val;
@@ -235,16 +270,18 @@ static void r100_qspi_write(void *opaque, hwaddr addr, uint64_t val,
 
         case QSPI_STATE_GOT_INSTRUCTION:
             s->address = (uint32_t)val & 0x00FFFFFF;
+            s->write_offset = 0;
             if (s->instruction == QSPI_INST_READ_24WAIT) {
-                /* Read: execute immediately, put result in RX FIFO */
                 s->rx_data = qspi_remote_read(s);
                 s->rx_data_valid = true;
                 s->xfer_state = QSPI_STATE_IDLE;
             } else if (s->instruction == QSPI_INST_WRITE) {
-                /* Write: need one more DRX write for the data */
-                s->xfer_state = QSPI_STATE_GOT_ADDRESS;
+                s->data_words_remaining = 1;
+                s->xfer_state = QSPI_STATE_WRITING;
+            } else if (s->instruction == QSPI_INST_WRITE_16WORD) {
+                s->data_words_remaining = QSPI_BURST16_WORDS;
+                s->xfer_state = QSPI_STATE_WRITING;
             } else {
-                /* Unknown instruction, reset */
                 qemu_log_mask(LOG_GUEST_ERROR,
                               "r100-qspi: unknown instruction 0x%x\n",
                               s->instruction);
@@ -252,28 +289,20 @@ static void r100_qspi_write(void *opaque, hwaddr addr, uint64_t val,
             }
             break;
 
-        case QSPI_STATE_GOT_ADDRESS:
-            /* Write data word to remote chiplet */
-            qspi_remote_write(s, (uint32_t)val);
-            s->xfer_state = QSPI_STATE_IDLE;
+        case QSPI_STATE_WRITING:
+            qspi_remote_write(s, s->write_offset, (uint32_t)val);
+            s->write_offset++;
+            if (--s->data_words_remaining == 0) {
+                s->xfer_state = QSPI_STATE_IDLE;
+            }
             break;
         }
-        break;
+        return;
+    }
 
-    case DW_SSI_SSIENR:
-        /* SSI enable/disable — reset transfer state on disable */
-        if (!(val & 1)) {
-            s->xfer_state = QSPI_STATE_IDLE;
-        }
+    /* Everything else: store for readback. */
+    if ((addr >> 2) < QSPI_REG_COUNT) {
         s->regs[addr >> 2] = (uint32_t)val;
-        break;
-
-    default:
-        /* Store for readback */
-        if ((addr >> 2) < QSPI_REG_COUNT) {
-            s->regs[addr >> 2] = (uint32_t)val;
-        }
-        break;
     }
 }
 
@@ -302,6 +331,8 @@ static void r100_qspi_reset(DeviceState *dev)
     s->xfer_state = QSPI_STATE_IDLE;
     s->instruction = 0;
     s->address = 0;
+    s->write_offset = 0;
+    s->data_words_remaining = 0;
     s->upper_addr = 0;
     s->rx_data = 0;
     s->rx_data_valid = false;

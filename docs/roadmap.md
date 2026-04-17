@@ -4,7 +4,7 @@
 
 **Goal**: TF-A BL1 → BL2 → BL31 → FreeRTOS boots on all 4 chiplets.
 
-**Status**: Real q-sys TF-A BL1 runs and prints boot log to UART. PL330 DMA stub unblocks the UCIe firmware load; boot proceeds through `load_and_enable_ucie_link_for_CP()` and into QSPI-bridged secondary-chiplet UCIe loads. The QSPI NOR flash staging region (`0x1F80000000`, 64 MB, zero-filled) is now modeled — HW-CFG lookup misses gracefully and BL1 falls through to "UCIe speed: default", then stages `tboot_n` and sets RVBAR for chiplets 1-3. Next blocker: secondary-chiplet CPU0 release (PMU `CPU_CONFIGURATION` write must map to QEMU `cpu_resume()`) and the flood of `r100-qspi: unknown instruction 0x83` operations once BL1 polls the secondary chiplets after reset release.
+**Status**: Real q-sys TF-A BL1 runs on all 4 chiplets. After staging `tboot_n` into each secondary chiplet's iRAM via the QSPI 16-word burst write and releasing CP0.cpu0 of chiplets 1-3 through PMU `CPU_CONFIGURATION`, four BL1 instances are now executing concurrently — chiplet 0 hands off to BL2 and the secondary chiplets re-enter BL1 from their locally-staged image and progress into BL2. Output is interleaved because there is no serialization across the per-chiplet UART instances (currently only chiplet 0 has UART wired). Next blocker is UCIe link-status polling from BL2 (`Ch 0 (0x1e05820000) UCIe Linkup timed out`) — the RBC stub only seeds the primary LTSM fields and BL2's per-direction link-up handshake reads more detailed PHY status.
 
 ### What's done
 
@@ -15,7 +15,9 @@
 - PMU stub: OM_STAT=NORMAL_BOOT, RST_STAT=PINRESET, all CPU/cluster/DCL/RBC status registers seeded to powered-on
 - SYSREG stub: per-chiplet ID (0-3) via SYSREMAP registers
 - HBM3 stub: training-complete status
-- QSPI bridge: Designware SSI protocol, cross-chiplet register access (with `PRIVATE_BASE` prefix for slave-side addressing)
+- QSPI bridge: Designware SSI protocol, cross-chiplet register access (with `PRIVATE_BASE` prefix for slave-side addressing); supports 1-word read (`0x70`), 1-word write (`0x80`), and 16-word burst write (`0x83`) — the last used by BL1 `qspi_bridge_load_image()` to stage `tboot_n` into secondary chiplets' iRAM
+- Per-chiplet SYSREG_CP0 RAM region (64 KB at private-alias `0x1E01010000`) backing BL1's `plat_set_cpu_rvbar()` writes; the PMU reads RVBARADDR0_LOW/HIGH back when a CPU release is triggered
+- PMU secondary core release: `CPU_CONFIGURATION` writes decode cluster/cpu, update `CPU_STATUS`, and call `arm_set_cpu_on(mpidr, entry)` with the RVBAR + chiplet-offset translation so the released vCPU starts in its own chiplet's iRAM copy
 - RBC stubs: UCIe LTSM ACTIVE for all 6 blocks per chiplet
 - PL330 DMA stub at `0x1FF02C0000` per chiplet: fake-completion on `ch_stat[0].csr`, `dbgstatus`, `dbgcmd` polls — no real memcpy (RBC stub hides the missing data)
 - Dual-mapped PMU and SYSREG devices at both config-space (`0x1FF0xxxxxx`) and private-alias (`0x1E00xxxxxx`) addresses via `memory_region_init_alias`
@@ -36,24 +38,30 @@ NOTICE:  BL1: Chiplet reset flag: 0x0 status: 0x0010
 NOTICE:  BL1: Load tboot_p0
 INFO:    Release reset of CM7
 NOTICE:  BL1: pmu_release_cm7 complete
-NOTICE:  BL1: check QSPI bridge
-INFO:    BL1: QSPI bridge status check time 0, chiplet{1,2,3}
 NOTICE:  BL1: Load tboot_u
 NOTICE:  BL1: Detected secondary chiplet count: 3
-NOTICE:  BL1: ZEBU_CI: 0
 NOTICE:  UCIe speed: default           [flash HW-CFG magic miss → default]
 NOTICE:  BL1: Load tboot_n
 INFO:    Set RVBAR of chiplet: {1,2,3}, cluster: 0, cpu: 0, ep: 0x1E00028000
-NOTICE:  BL1: Release reset of CP0.cpu0 of chiplet-1   [hang — secondary cores not released]
+NOTICE:  BL1: Release reset of CP0.cpu0 of chiplet-{1,2,3}
+INFO:    cluster: 0, cpu: 0 turned off
+INFO:    cluster: 0, cpu: 0 turned on          [secondary vCPUs start at RVBAR]
+Booting Trusted Firmware                       [chiplet-1..3 re-enter BL1]
+NOTICE:  BL1: v2.9.0(debug):...
+INFO:    BL1: Loading BL2
+NOTICE:  BL1: Booting BL2
+NOTICE:  BL2: Detected secondary chiplet count: 2 / 1
+ERROR:   Ch 0 (0x1e05820000) UCIe Linkup timed out after 5 seconds  [next blocker]
 ```
 
 ### What remains
 
 - [x] Back the flash staging region (`0x1F80000000`, 64 MB) with a RAM model so `nvmem_flash_hw_cfg_read()` and `flash_nor_read()` memcpys succeed; optional `images/flash.bin` preload wired into the CLI
-- [ ] Extend the QSPI bridge instruction decoder — BL1 post-reset sequence emits `unknown instruction 0x83` in a tight loop on chiplets 1-3 after `Release reset of CP0.cpu0`
+- [x] Extend the QSPI bridge instruction decoder with `0x83` (WRITE_16WORD) — BL1's `qspi_bridge_load_image()` stages `tboot_n` into each secondary chiplet's iRAM through this burst write
+- [x] Refine PMU for secondary core release — `CPU_CONFIGURATION` writes now update `CPU_STATUS` and call `arm_set_cpu_on()` with the FW-written RVBAR (offset by `chiplet_id * CHIPLET_OFFSET` so the released vCPU lands in its own chiplet's iRAM copy)
+- [ ] Wire UCIe PHY/link status so BL2's `Ch N (base) UCIe Linkup` poll completes; BL2 reads per-direction RBC registers (the current RBC stub only seeds primary LTSM ACTIVE). Once past this, BL2 can hand control to BL31.
+- [ ] Per-chiplet UART instances (currently only chiplet 0 has UART mapped — secondary chiplets' BL1/BL2 banners interleave because they all share chiplet 0's UART alias via the private-alias catch-all)
 - [ ] Pre-load BL2/BL31/FreeRTOS to each secondary chiplet's iRAM/DRAM so BL1's cross-chiplet copy finds the data in place (alternatively: populate `flash.bin` with a real GPT image and let BL1 DMA-stage everything itself)
-- [ ] Refine PMU for secondary core release — wire `CPU_CONFIGURATION` writes to QEMU `cpu_resume()` so chiplets 1-3 CPU0 actually start executing
-- [ ] Add per-chiplet UART instances (currently only chiplet 0 has UART mapped)
 - [ ] Build system: fix `sys/build.sh` path where `debug` COMMAND resets CLI flags, so `CHIPLET_COUNT=1` builds work (alternative to the DMA stub for single-chiplet boot)
 - [ ] Test GDB attach and multi-core debugging (`thread N` to switch vCPUs)
 
@@ -100,7 +108,8 @@ NOTICE:  BL1: Release reset of CP0.cpu0 of chiplet-1   [hang — secondary cores
 | Peripheral | Phase 1 | Phase 2 | Phase 3 |
 |------------|---------|---------|---------|
 | CMU (20 blocks x4) | PLL-lock stub | Same | Same |
-| PMU (x4) | Boot-status + RBC/boot-mode defaults | Full register bank | Same |
+| PMU (x4) | Boot-status + RBC/boot-mode defaults + CPU_CONFIGURATION → `arm_set_cpu_on/off` | Full register bank | Same |
+| SYSREG_CP0 (x4) | RAM (RVBAR capture) | Add CP1 + TZPC enforcement | Same |
 | GIC600 | QEMU built-in | Same | Same |
 | UART | 16550 (serial-mm) | Per-chiplet instances | Same |
 | Timer | QEMU built-in + CSS600_CNTGEN stub | Same | Same |

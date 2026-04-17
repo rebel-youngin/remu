@@ -420,6 +420,27 @@ static void r100_chiplet_init(MachineState *machine, int chiplet_id,
     /* --- SYSREG (chiplet ID) — config space + private alias --- */
     r100_create_sysreg(cfg_mr, sysmem, chiplet_id, chiplet_base);
 
+    /*
+     * --- SYSREG_CP0 RAM (private alias only, 64 KB) ---
+     * BL1's plat_set_cpu_rvbar() writes each secondary CP0.cpu0's reset
+     * vector to RVBARADDR0_LOW/HIGH inside this block, via the QSPI
+     * bridge. The PMU device later reads the stored value when a
+     * CPU_CONFIGURATION write releases that core. A plain RAM region
+     * is sufficient — the FW only ever writes RVBAR (and a few TZPC
+     * regs that no currently-modelled path reads back).
+     */
+    {
+        MemoryRegion *mr = g_new(MemoryRegion, 1);
+        char nm[64];
+        snprintf(nm, sizeof(nm), "r100.chiplet%d.sysreg_cp0", chiplet_id);
+        memory_region_init_ram(mr, NULL, nm, R100_SYSREG_CP0_SIZE,
+                               &error_fatal);
+        memory_region_add_subregion_overlap(sysmem,
+                                            chiplet_base +
+                                                R100_SYSREG_CP0_PRIVATE_BASE,
+                                            mr, 0);
+    }
+
     /* --- HBM3 controller stub --- */
     r100_create_hbm(cfg_mr, chiplet_id);
 

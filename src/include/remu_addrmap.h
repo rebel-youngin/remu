@@ -217,6 +217,8 @@
 #define R100_PRIVATE_BASE               0x1E00000000ULL
 #define R100_SYSREMAP_PRIVATE_BASE      0x1E00220000ULL  /* SYSREG_SYSREMAP private alias */
 #define R100_CPMU_PRIVATE_BASE          0x1E00230000ULL  /* PMU private alias */
+#define R100_SYSREG_CP0_PRIVATE_BASE    0x1E01010000ULL  /* SYSREG_CP0 private alias (RVBAR etc.) */
+#define R100_SYSREG_CP0_SIZE            0x10000ULL       /* 64KB */
 
 /*
  * Catch-all RAM window for the per-chiplet "private" alias region.
@@ -255,6 +257,21 @@
 #define R100_PMU_CPU0_STATUS            0x2004
 #define R100_PMU_CPU0_OPTION            0x2008
 #define R100_PMU_PERCPU_OFFSET          0x0080
+#define R100_PMU_PERCLUSTER_OFFSET      0x0200
+/*
+ * CPU_CONFIGURATION power-on/off encoding — see platform_def.h:
+ *   AUTOMATIC_WAKEUP  = BIT(31)
+ *   INITIATE_WAKEUP   = 0xF << 16
+ *   LOCAL_PWR_ON      = 0xF
+ */
+#define R100_PMU_CPU_CFG_LOCAL_PWR_MASK 0xFU
+/*
+ * SYSREG_CP* per-CPU RVBAR offsets (see platform_def.h).
+ * PMU reads these back to route a released vCPU to the FW-chosen entry.
+ */
+#define R100_SYSREG_RVBARADDR0_LOW      0x354
+#define R100_SYSREG_RVBARADDR0_HIGH     0x358
+#define R100_SYSREG_PERCPU_RVBAR_OFF    0x8
 #define R100_PMU_CP0_NONCPU_CONFIG      0x2400
 #define R100_PMU_CP0_NONCPU_STATUS      0x2404
 #define R100_PMU_CP0_L2_CONFIG          0x2600

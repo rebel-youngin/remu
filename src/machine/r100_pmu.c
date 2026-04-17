@@ -12,6 +12,12 @@
  *   - CP0_L2_STATUS (0x2604): L2 cache power status
  *   - DCL0_STATUS (0x4284): D-Cluster power status
  *
+ * Writes to CPU_CONFIGURATION release (or halt) the target AP core; we
+ * translate them into QEMU arm_set_cpu_on()/arm_set_cpu_off() calls so
+ * BL1's reset_release_secondary_cp0() actually starts the secondary
+ * chiplets' CP0.cpu0 at the RVBAR that was previously staged via the
+ * QSPI bridge. See external/.../rebel_h_plat.c:plat_pmu_cpu_on().
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -19,6 +25,8 @@
 #include "qemu/log.h"
 #include "hw/sysbus.h"
 #include "hw/qdev-properties.h"
+#include "exec/address-spaces.h"
+#include "target/arm/arm-powerctl.h"
 #include "r100_soc.h"
 
 static void r100_pmu_set_defaults(R100PMUState *s)
@@ -98,11 +106,141 @@ static uint64_t r100_pmu_read(void *opaque, hwaddr addr, unsigned size)
     return s->regs[reg_idx];
 }
 
+/*
+ * Read back the 64-bit RVBAR previously written to this chiplet's
+ * SYSREG_CP0 by BL1 (`plat_set_cpu_rvbar`). Returns 0 if the backing
+ * RAM region is unmapped or access fails — callers treat 0 as "no
+ * override" and skip the release.
+ *
+ * The SYSREG_CP0 device lives at `chiplet_id * CHIPLET_OFFSET +
+ * SYSREG_CP0_PRIVATE_BASE` in our flat sysmem; the QSPI bridge writes
+ * land there when BL1 targets the secondary chiplet's private alias.
+ */
+static uint64_t r100_pmu_read_rvbar(R100PMUState *s, uint32_t cluster,
+                                    uint32_t cpu)
+{
+    uint64_t base = (uint64_t)s->chiplet_id * R100_CHIPLET_OFFSET +
+                    R100_SYSREG_CP0_PRIVATE_BASE;
+    uint32_t lo = 0, hi = 0;
+    MemTxResult r;
+
+    /*
+     * CLUSTER_CP1 is located 0x800000 beyond CP0 in the FW's direct
+     * MMIO path, but BL1's QSPI release always targets CP0. Keep the
+     * CP1 case as a no-op for now; BL2 does the intra-chiplet CP1
+     * release via direct MMIO which lands at the SYSREG_CP1 alias and
+     * is out of scope for this secondary-release path.
+     */
+    if (cluster != 0) {
+        return 0;
+    }
+
+    r = address_space_read(&address_space_memory,
+                           base + R100_SYSREG_RVBARADDR0_LOW +
+                               R100_SYSREG_PERCPU_RVBAR_OFF * cpu,
+                           MEMTXATTRS_UNSPECIFIED, &lo, sizeof(lo));
+    if (r != MEMTX_OK) {
+        return 0;
+    }
+    r = address_space_read(&address_space_memory,
+                           base + R100_SYSREG_RVBARADDR0_HIGH +
+                               R100_SYSREG_PERCPU_RVBAR_OFF * cpu,
+                           MEMTXATTRS_UNSPECIFIED, &hi, sizeof(hi));
+    if (r != MEMTX_OK) {
+        return 0;
+    }
+    return ((uint64_t)hi << 32) | lo;
+}
+
+/*
+ * Handle a write to a CPU_CONFIGURATION register. Decode the
+ * cluster/core index from the offset, update the mirrored CPU_STATUS
+ * so the FW's post-release poll completes, and kick the corresponding
+ * vCPU on or off via the ARM power-control helpers.
+ *
+ * cfg_off is the register offset within the PMU block (0x2000 for
+ * CP0.CPU0, +PERCPU_OFFSET per core, +PERCLUSTER_OFFSET per cluster).
+ */
+static void r100_pmu_handle_cpu_config(R100PMUState *s, uint32_t cfg_off,
+                                       uint32_t val)
+{
+    uint32_t cluster_off = cfg_off - R100_PMU_CPU0_CONFIGURATION;
+    uint32_t cluster = cluster_off / R100_PMU_PERCLUSTER_OFFSET;
+    uint32_t cpu_in_cluster = (cluster_off % R100_PMU_PERCLUSTER_OFFSET)
+                              / R100_PMU_PERCPU_OFFSET;
+    uint32_t status_off;
+    bool power_on;
+    uint64_t mpidr, entry;
+    int ret;
+
+    if (cluster >= R100_NUM_CLUSTERS ||
+        cpu_in_cluster >= R100_NUM_CORES_PER_CLUSTER) {
+        return;
+    }
+
+    power_on = (val & R100_PMU_CPU_CFG_LOCAL_PWR_MASK) == R100_PMU_LOCAL_PWR_ON;
+
+    status_off = R100_PMU_CPU0_STATUS +
+                 cluster * R100_PMU_PERCLUSTER_OFFSET +
+                 cpu_in_cluster * R100_PMU_PERCPU_OFFSET;
+    s->regs[status_off >> 2] = power_on ? R100_PMU_CPU_STATUS_ON : 0;
+
+    mpidr = ((uint64_t)s->chiplet_id << 16) | ((uint64_t)cluster << 8)
+            | cpu_in_cluster;
+
+    /*
+     * Chiplet 0 / CP0 / cpu0 is the BSP — it was already started at
+     * machine reset via the rvbar property, so CPU_CONFIGURATION writes
+     * touching it are a no-op on the QEMU side.
+     */
+    if (mpidr == 0) {
+        return;
+    }
+
+    if (!power_on) {
+        /*
+         * plat_pmu_cpu_off() is called as a precondition of cpu_on in
+         * BL1's reset-release sequence; for already-off secondaries
+         * arm_set_cpu_off returns IS_OFF which is harmless.
+         */
+        arm_set_cpu_off(mpidr);
+        return;
+    }
+
+    entry = r100_pmu_read_rvbar(s, cluster, cpu_in_cluster);
+    if (!entry) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "r100-pmu[cl%u]: cpu_on without RVBAR (cluster=%u "
+                      "cpu=%u) — skipping release\n",
+                      s->chiplet_id, cluster, cpu_in_cluster);
+        return;
+    }
+
+    /*
+     * Translate the chiplet-local alias (`0x1E00xxxxxx`) into the flat
+     * QEMU address space. All chiplet-local RAM is cloned into a
+     * dedicated subregion at `chiplet_id * CHIPLET_OFFSET`; without
+     * this offset the released secondary vCPU would start fetching
+     * from chiplet 0's iRAM.
+     */
+    entry += (uint64_t)s->chiplet_id * R100_CHIPLET_OFFSET;
+
+    ret = arm_set_cpu_on(mpidr, entry, 0, 3, true);
+    if (ret != QEMU_ARM_POWERCTL_RET_SUCCESS &&
+        ret != QEMU_ARM_POWERCTL_ALREADY_ON) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "r100-pmu[cl%u]: arm_set_cpu_on(mpidr=0x%" PRIx64
+                      ", entry=0x%" PRIx64 ") failed: %d\n",
+                      s->chiplet_id, mpidr, entry, ret);
+    }
+}
+
 static void r100_pmu_write(void *opaque, hwaddr addr, uint64_t val,
                            unsigned size)
 {
     R100PMUState *s = R100_PMU(opaque);
     uint32_t reg_idx = addr >> 2;
+    uint32_t off = (uint32_t)addr;
 
     if (reg_idx >= R100_PMU_REG_COUNT) {
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -114,12 +252,22 @@ static void r100_pmu_write(void *opaque, hwaddr addr, uint64_t val,
     s->regs[reg_idx] = (uint32_t)val;
 
     /*
-     * When a CPU_CONFIGURATION register is written with a power-on value,
-     * the corresponding CPU should be released from reset. This is how
-     * BL31 brings up secondary cores.
-     *
-     * TODO: Implement PSCI / secondary core release via CPU status writes.
+     * CPU_CONFIGURATION registers live at PMU offsets
+     * 0x2000 + cluster*PERCLUSTER_OFFSET + cpu*PERCPU_OFFSET for
+     * cluster in {CP0, CP1} and cpu in 0..3. Fan out to the release
+     * handler for any matching offset.
      */
+    if (off >= R100_PMU_CPU0_CONFIGURATION) {
+        uint32_t cluster_off = off - R100_PMU_CPU0_CONFIGURATION;
+        uint32_t cluster = cluster_off / R100_PMU_PERCLUSTER_OFFSET;
+        uint32_t lane = cluster_off % R100_PMU_PERCLUSTER_OFFSET;
+
+        if (cluster < R100_NUM_CLUSTERS &&
+            lane < R100_NUM_CORES_PER_CLUSTER * R100_PMU_PERCPU_OFFSET &&
+            (lane % R100_PMU_PERCPU_OFFSET) == 0) {
+            r100_pmu_handle_cpu_config(s, off, (uint32_t)val);
+        }
+    }
 }
 
 static const MemoryRegionOps r100_pmu_ops = {

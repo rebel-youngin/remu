@@ -62,6 +62,13 @@ struct R100PMUState {
     uint32_t secondary_chiplet_count;
 };
 
+/*
+ * Pull in the ARM power-control helpers (arm_set_cpu_on / off) so the
+ * PMU can release vCPUs from reset in response to CPU_CONFIGURATION
+ * writes. Matches what TF-A's `plat_pmu_cpu_on()` does on silicon —
+ * writing LOCAL_PWR_ON to CPU_CONFIGURATION is the reset-release signal.
+ */
+
 typedef struct R100PMUState R100PMUState;
 
 DECLARE_INSTANCE_CHECKER(R100PMUState, R100_PMU, TYPE_R100_PMU)
