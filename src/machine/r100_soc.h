@@ -23,6 +23,7 @@
 #define TYPE_R100_SYSREG        "r100-sysreg"
 #define TYPE_R100_HBM           "r100-hbm"
 #define TYPE_R100_QSPI_BRIDGE   "r100-qspi-bridge"
+#define TYPE_R100_QSPI_BOOT     "r100-qspi-boot"
 #define TYPE_R100_RBC           "r100-rbc"
 #define TYPE_R100_DMA_PL330     "r100-dma-pl330"
 #define TYPE_R100_SMMU          "r100-smmu"

@@ -17,5 +17,6 @@ arm_ss.add(files(
     'r100_sysreg.c',
     'r100_hbm.c',
     'r100_qspi.c',
+    'r100_qspi_boot.c',
     'r100_rbc.c',
 ))

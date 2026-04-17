@@ -68,8 +68,11 @@ REMU uses two QEMU instances connected by shared memory:
 │  │  SYSREG — chiplet ID (per-chiplet view)    │  │
 │  │  HBM3 — sparse regs, training-ready        │  │
 │  │  QSPI bridge — cross-chiplet register I/O  │  │
+│  │  QSPI_ROT (DWC_SSI) — flash boot + NOR SMC │  │
 │  │  RBC — UCIe link-up status                 │  │
 │  │  SMMU-600 TCU — CR0ACK / GBPA / CMDQ+SYNC  │  │
+│  │  PVT — idle/valid-bit stub (pvt_init)      │  │
+│  │  HILS ring tail — drains FreeRTOS .logbuf  │  │
 │  │  Mailbox RAM — inter-chiplet handshake     │  │
 │  │  GIC600, per-chiplet 16550 UART, Timer     │  │
 │  └────────────────────────────────────────────┘  │
@@ -178,8 +181,10 @@ All device models follow the QEMU QOM (QEMU Object Model) pattern:
 | `r100_sysreg.c` | SYSREG | 1 per chiplet | Returns chiplet ID (0-3) |
 | `r100_hbm.c` | HBM3 controller | 1 per chiplet | Sparse write-back (6 MB window, default 0xFFFFFFFF), ICON req0/req1 RMW mirror |
 | `r100_qspi.c` | QSPI bridge | 1 per chiplet | Designware SSI, cross-chiplet R/W + upper-addr latch (28-bit offset) |
+| `r100_qspi_boot.c` | QSPI_ROT (DWC_SSI master) | 1 per chiplet | Dual-mapped (cfg-space `0x1FF0500000` + private alias `0x1E00500000`); DW SSI status always idle (`TFNF\|TFE\|RFNE`, `BUSY=0`), `TXFLR=0`, DRX reads return `0x82` (`FLASH_READY\|WRITE_ENABLE_LATCH`) so every `qspi_boot.c:tx_available()` and `check_read_*_status()` poll exits on iteration 0; covers BL1 flash-load and BL31 `NOR_FLASH_SVC_*` SMC paths |
 | `r100_rbc.c` | RBC/UCIe | 6 per chiplet | Dual-mapped (cfg-space `0x1FF5xxxxxx` + private alias `0x1E05xxxxxx`); `global_reg_cmn_mcu_scratch_reg1 = 0xFFFFFFFF` (ZEBU link-up) + `lstatus_link_status=1` |
 | `r100_smmu.c` | SMMU-600 TCU | 1 per chiplet (primary only wired) | `CR0→CR0ACK` mirror + `GBPA.UPDATE` auto-clear (BL2 `smmu_early_init`); CMDQ walker: on each `CMDQ_PROD` write, walks entries in DRAM via `cpu_physical_memory_read`, writes 32-bit 0 to MSI address of every `CMD_SYNC` (CS=SIG_IRQ), and auto-advances `CMDQ_CONS` to PROD so FreeRTOS EL1 `smmu_sync()` returns on first iteration |
+| `r100_pvt.c` | PVT monitor | 5 per chiplet (ROT + 4 DCL) | `PVT_CON_STATUS=0x3` (idle), per-sensor `_valid=1`, rest RAM — unblocks FreeRTOS `pvt_init()` `PVT_ENABLE_{PROC,VOLT,TEMP}_CONTROLLER` polls |
 | `r100_dma.c` | PL330 DMA | 1 per chiplet | Fake completion on csr/dbgstatus/dbgcmd polls |
 | `r100_logbuf.c` | HILS ring tail | 1 (chiplet 0 only) | Polls DRAM `.logbuf` ring at 0x10000000 on a 50 ms timer, drains `RLOG_*`/`FLOG_*` entries to own chardev |
 | `remu_addrmap.h` | — | — | All address constants (from `g_sys_addrmap.h`) |
@@ -196,6 +201,7 @@ These files in the external repos define the hardware behavior that the emulator
 | PMU boot status | `q-sys/bootloader/cp/tf-a/plat/rebel/rebel_h/rebel_h_pmu.c` |
 | Boot stages | `q-sys/bootloader/cp/tf-a/plat/rebel/rebel_h/rebel_h_bl{1,2,31}_setup.c` |
 | QSPI bridge protocol | `q-sys/bootloader/cp/tf-a/drivers/synopsys/qspi_bridge/qspi_bridge.c` |
+| DWC_SSI master (QSPI_ROT) | `q-sys/drivers/qspi_boot/qspi_boot.{c,h}` + `services/std_svc/nor_flash/nor_flash_main.c` |
 | RBC/UCIe init | `q-sys/bootloader/cp/tf-a/plat/rebel/rebel_h/rebel_h_rbc.c` |
 | PCI BARs + memory map | `kmd/rebellions/rebel/rebel.h` |
 | FW-host handshake | `kmd/rebellions/common/{fw_if.c,ring.c,queue.c}` |

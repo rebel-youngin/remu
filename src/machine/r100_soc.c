@@ -363,6 +363,54 @@ static void r100_create_qspi_bridge(MemoryRegion *cfg_mr, int chiplet_id)
 }
 
 /*
+ * Create and map the DWC_SSI master-QSPI controller (QSPI_ROT).
+ *
+ * This is the controller the FW talks to for on-board NOR flash access —
+ * BL1's qspi_boot_config()/bl1_load_fip_image() and the BL31 std-svc
+ * NOR_FLASH_SVC_{READ_DATA,ERASE_4K,...} handlers both route through
+ * external/.../q/sys/drivers/qspi_boot/qspi_boot.c, which hard-codes its
+ * reg_base to QSPI_ROT_PRIVATE (0x1E00500000).
+ *
+ * Same dual-mapping pattern as PMU / SYSREG: the device's iomem sits in
+ * the chiplet's config-space container at R100_QSPI_ROT_BASE, and an
+ * alias of the same iomem is layered at chiplet_base + QSPI_ROT_PRIVATE
+ * in the global sysmem. That way reads/writes from both the FW driver
+ * (private alias) and any possible cross-chiplet config-space access
+ * land on the same sparse register file — keeping drx writes coherent
+ * with the status-byte model on DRX reads.
+ *
+ * Without this device FreeRTOS's postproc_cm7_logger_init() spins in
+ * tx_available() polling DW_SSI_SR for 2 000 000 us after the shell
+ * prompt and prints `spi tx available timeout error` to UART0.
+ */
+static void r100_create_qspi_boot(MemoryRegion *cfg_mr, MemoryRegion *sysmem,
+                                  int chiplet_id, uint64_t chiplet_base)
+{
+    DeviceState *dev;
+    SysBusDevice *sbd;
+    MemoryRegion *iomem;
+    MemoryRegion *alias;
+    uint64_t cfg_offset = R100_QSPI_ROT_BASE - R100_CFG_BASE;
+    char name[64];
+
+    dev = qdev_new(TYPE_R100_QSPI_BOOT);
+    qdev_prop_set_uint32(dev, "chiplet-id", chiplet_id);
+    sbd = SYS_BUS_DEVICE(dev);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+
+    iomem = sysbus_mmio_get_region(sbd, 0);
+    memory_region_add_subregion(cfg_mr, cfg_offset, iomem);
+
+    alias = g_new(MemoryRegion, 1);
+    snprintf(name, sizeof(name), "r100.chiplet%d.qspi_boot_priv", chiplet_id);
+    memory_region_init_alias(alias, NULL, name, iomem, 0,
+                             R100_QSPI_ROT_REG_SIZE);
+    memory_region_add_subregion_overlap(sysmem,
+                                        chiplet_base + R100_QSPI_ROT_PRIVATE_BASE,
+                                        alias, 1);
+}
+
+/*
  * Create and map RBC (UCIe link) stub devices for a chiplet.
  *
  * Each RBC block is dual-mapped:
@@ -587,6 +635,12 @@ static void r100_chiplet_init(MachineState *machine, int chiplet_id,
 
     /* --- QSPI bridge (inter-chiplet register access) --- */
     r100_create_qspi_bridge(cfg_mr, chiplet_id);
+
+    /* --- QSPI_ROT master controller (DWC_SSI) — config space + private alias
+     *     Required for FreeRTOS postproc_cm7_logger / BL31 NOR_FLASH SMCs
+     *     (erase/write/read-status) — without it tx_available() times out
+     *     after the FreeRTOS shell prompt. */
+    r100_create_qspi_boot(cfg_mr, sysmem, chiplet_id, chiplet_base);
 
     /* --- RBC stubs (UCIe link status) — config space + private alias --- */
     r100_create_rbc_blocks(cfg_mr, sysmem, chiplet_id, chiplet_base);

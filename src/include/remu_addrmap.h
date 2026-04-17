@@ -87,6 +87,18 @@
 #define R100_ROT_MAILBOX_M2_BASE    0x1FF02A0000ULL
 #define R100_ROT_PVT_CON_BASE       0x1FF0260000ULL
 
+/*
+ * Master DWC_SSI QSPI controller used by BL1's qspi_boot_config() and by
+ * FreeRTOS / BL31 flash-service SMC path (NOR_FLASH_SVC_ERASE_4K etc.) via
+ * q-sys drivers/qspi_boot/qspi_boot.c. See QSPI_ROT_REG_OFFSET (0x0500000)
+ * + PRIVATE_BASE in rebel_h_baseoffset.h; the FW driver hard-codes the
+ * private alias as its reg_base. Reg window is ~0x150 bytes of the Synopsys
+ * DWC_SSI register layout (struct dwc_ssi_synopsys in qspi_boot.h).
+ */
+#define R100_QSPI_ROT_BASE          0x1FF0500000ULL
+#define R100_QSPI_ROT_PRIVATE_BASE  0x1E00500000ULL
+#define R100_QSPI_ROT_REG_SIZE      0x0000010000ULL  /* 64 KB, same as other SFR blocks */
+
 /* --- CP0 block --- */
 #define R100_CP0_CFG_BASE           0x1FF1000000ULL
 #define R100_CP0_CMU_BASE           0x1FF1000000ULL
