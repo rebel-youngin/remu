@@ -11,6 +11,7 @@ arm_ss.add(files(
     'r100_cmu.c',
     'r100_dma.c',
     'r100_pmu.c',
+    'r100_pvt.c',
     'r100_smmu.c',
     'r100_sysreg.c',
     'r100_hbm.c',

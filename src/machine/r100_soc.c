@@ -258,6 +258,51 @@ static void r100_create_hbm(MemoryRegion *cfg_mr, int chiplet_id)
 }
 
 /*
+ * PVT monitor block bases (offsets from R100_CFG_BASE) and debug names.
+ * 5 instances per chiplet — see pvt_base_address[] in
+ * external/ssw-bundle/.../drivers/pvt_con/pvt_con.c.
+ */
+static const struct {
+    uint64_t base;
+    const char *name;
+} r100_pvt_blocks[] = {
+    { R100_ROT_PVT_CON_BASE,   "ROT" },
+    { R100_DCL0_PVT_CON0_BASE, "DCL0_0" },
+    { R100_DCL0_PVT_CON1_BASE, "DCL0_1" },
+    { R100_DCL1_PVT_CON0_BASE, "DCL1_0" },
+    { R100_DCL1_PVT_CON1_BASE, "DCL1_1" },
+};
+
+#define R100_NUM_PVT_BLOCKS ARRAY_SIZE(r100_pvt_blocks)
+
+/*
+ * Create and map the PVT (Process-Voltage-Temperature) monitor stubs.
+ *
+ * FreeRTOS's pvt_init() spins on PVT_CON_STATUS (+0x1C) waiting for the
+ * idle bits, and bounded-waits on per-sensor validity bits. Without this
+ * stub chiplet 0's primary CPU hangs in PVT_ENABLE_PROC_CONTROLLER's
+ * "while (!ps_con_idle)" loop as soon as FreeRTOS takes over from BL31.
+ */
+static void r100_create_pvt_blocks(MemoryRegion *cfg_mr, int chiplet_id)
+{
+    int i;
+
+    for (i = 0; i < R100_NUM_PVT_BLOCKS; i++) {
+        DeviceState *dev;
+        SysBusDevice *sbd;
+        uint64_t offset = r100_pvt_blocks[i].base - R100_CFG_BASE;
+
+        dev = qdev_new(TYPE_R100_PVT);
+        qdev_prop_set_uint32(dev, "chiplet-id", chiplet_id);
+        qdev_prop_set_string(dev, "name", r100_pvt_blocks[i].name);
+        sbd = SYS_BUS_DEVICE(dev);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        memory_region_add_subregion(cfg_mr, offset,
+                                    sysbus_mmio_get_region(sbd, 0));
+    }
+}
+
+/*
  * Create and map the SMMU-600 TCU register block stub.
  *
  * BL2's smmu_early_init() programs the event-queue / strtab registers
@@ -533,6 +578,9 @@ static void r100_chiplet_init(MachineState *machine, int chiplet_id,
 
     /* --- SMMU-600 TCU stub (cr0/cr0ack mirror, gbpa update auto-clear) --- */
     r100_create_smmu(cfg_mr, chiplet_id);
+
+    /* --- PVT monitor stubs (5 per chiplet; idle/valid bits pre-asserted) --- */
+    r100_create_pvt_blocks(cfg_mr, chiplet_id);
 
     /* --- PL330 DMA controller stub (used by BL1 UCIe FW load) --- */
     r100_create_dma_pl330(cfg_mr, chiplet_id);

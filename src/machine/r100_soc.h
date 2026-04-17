@@ -26,6 +26,7 @@
 #define TYPE_R100_RBC           "r100-rbc"
 #define TYPE_R100_DMA_PL330     "r100-dma-pl330"
 #define TYPE_R100_SMMU          "r100-smmu"
+#define TYPE_R100_PVT           "r100-pvt"
 #define TYPE_R100_UNIMPL        "r100-unimpl"
 
 #define R100_RBC_BLOCK_SIZE     0x80000ULL  /* 512KB per RBC block */
@@ -168,6 +169,40 @@ struct R100SMMUState {
 typedef struct R100SMMUState R100SMMUState;
 
 DECLARE_INSTANCE_CHECKER(R100SMMUState, R100_SMMU, TYPE_R100_SMMU)
+
+/* ========================================================================
+ * PVT controller stub (Samsung Process-Voltage-Temperature monitor)
+ *
+ * FreeRTOS's pvt_init() (external/.../drivers/pvt_con/pvt_con.c) spins on
+ * PVT_CON_STATUS.ps_con_idle / ts_con_idle inside PVT_ENABLE_*_CONTROLLER
+ * macros, and bounded-waits on per-sensor ps_valid/vs_valid/ts_valid bits.
+ * Without a device stub the status register is unmodelled and the unbounded
+ * idle-poll hangs the primary CPU just after FreeRTOS enters.
+ *
+ * The stub is a 64 KB register file that:
+ *   - returns 0x3 on reads of PVT_CON_STATUS (+0x1C) so the ps/ts idle
+ *     polls (bits 0 & 1) exit immediately;
+ *   - returns 0x1 on per-sensor *_status reads so PVT_WAIT_UNTIL_VALID
+ *     exits on the first iteration instead of burning its 10 000-count
+ *     timeout per sensor;
+ *   - reads/write-backs everything else.
+ * ======================================================================== */
+
+#define R100_PVT_REG_SIZE       0x10000
+#define R100_PVT_REG_COUNT      (R100_PVT_REG_SIZE / 4)
+
+struct R100PVTState {
+    SysBusDevice parent_obj;
+
+    MemoryRegion iomem;
+    uint32_t regs[R100_PVT_REG_COUNT];
+    uint32_t chiplet_id;
+    char *name;  /* e.g. "ROT", "DCL0_0", "DCL0_1" for debug */
+};
+
+typedef struct R100PVTState R100PVTState;
+
+DECLARE_INSTANCE_CHECKER(R100PVTState, R100_PVT, TYPE_R100_PVT)
 
 /* ========================================================================
  * Unimplemented region (catch-all for unmapped config space reads)
