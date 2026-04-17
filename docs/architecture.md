@@ -153,7 +153,7 @@ All device models follow the QEMU QOM (QEMU Object Model) pattern:
 | `r100_sysreg.c` | SYSREG | 1 per chiplet | Returns chiplet ID (0-3) |
 | `r100_hbm.c` | HBM3 controller | 1 per chiplet | Returns training-complete |
 | `r100_qspi.c` | QSPI bridge | 1 per chiplet | Designware SSI protocol, cross-chiplet R/W |
-| `r100_rbc.c` | RBC/UCIe | 6 per chiplet | LTSM state = ACTIVE (link up) |
+| `r100_rbc.c` | RBC/UCIe | 6 per chiplet | Dual-mapped (cfg-space `0x1FF5xxxxxx` + private alias `0x1E05xxxxxx`); `global_reg_cmn_mcu_scratch_reg1 = 0xFFFFFFFF` (ZEBU link-up) + `lstatus_link_status=1` |
 | `r100_dma.c` | PL330 DMA | 1 per chiplet | Fake completion on csr/dbgstatus/dbgcmd polls |
 | `remu_addrmap.h` | — | — | All address constants (from `g_sys_addrmap.h`) |
 

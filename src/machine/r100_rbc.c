@@ -3,22 +3,37 @@
  * RBC (Rebel Bus Controller) / UCIe link stub
  *
  * The R100 SoC has 6 RBC blocks per chiplet (V00/V01/V10/V11/H00/H01),
- * each managing a UCIe die-to-die link between chiplets. During BL1,
+ * each managing a UCIe die-to-die link between chiplets. During BL1/BL2,
  * the FW:
  *   1. Initializes CMU clocks for each RBC block (handled by CMU stubs)
  *   2. Loads UCIe firmware to each block's SRAM
- *   3. Enables the UCIe core and waits for link-up
+ *   3. Enables the UCIe core and waits for link-up (BL2)
  *
  * This stub models the RBC SYSREG and UCIe PHY registers. It returns
  * "link up" status for all blocks, allowing the FW to proceed past
  * UCIe link training.
  *
  * Each RBC block has:
- *   - SYSREG at offset 0x010000 (from block base)
- *   - UCIe subsystem at offset 0x020000
- *   - MGR (manager) at offset 0x070000
+ *   - CMU at offset 0x000000 (from block base)
+ *   - SYSREG at offset 0x010000
+ *   - UCIe subsystem (SS) at offset 0x020000
+ *   - RBCM (manager) at offset 0x070000
  *
- * The block spans ~512KB (0x80000) in the address map.
+ * The block spans 512KB (0x80000) in the address map.
+ *
+ * UCIe link-up handshake
+ * ----------------------
+ * BL2's wait_ucie_link_up_for_CP() polls check_link_up() until success. The
+ * ZEBU-build FW (what `remu build` produces via `-p zebu`) checks:
+ *
+ *   target_ss->global_reg_cmn_mcu_scratch_reg1 == 0xFFFFFFFF
+ *
+ * i.e. UCIe SS offset 0x2e038 (block offset 0x4e038). See
+ *   external/ssw-bundle/.../tf-a/drivers/aw/ucie.c::check_link_up()
+ *
+ * The non-ZEBU path instead checks
+ *   target_ss->dvsec1_reg_reg_global_dvsec1_ucie_link_status.lstatus_link_status
+ * at UCIe SS offset 0x20014 bit[15]. We seed both so either build works.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -29,18 +44,29 @@
 #include "hw/qdev-properties.h"
 #include "r100_soc.h"
 
-#define R100_RBC_BLOCK_SIZE     0x80000     /* 512KB per RBC block */
+/* R100_RBC_BLOCK_SIZE defined in r100_soc.h (shared with r100_soc.c). */
 #define R100_RBC_REG_COUNT      (R100_RBC_BLOCK_SIZE / 4)
 
 /*
- * UCIe PHY D2D error log register offsets (from UCIe SS base at +0x20000).
- * These are checked by wait_ucie_link_up() in rebel_h_rbc.c.
- *
- * m0_err_log0 contains the LTSM state in bits [4:0]:
- *   0x10 = ACTIVE (link is up and running)
+ * UCIe SS occupies [0x20000, 0x70000) within the RBC block.
+ * RBCM starts at 0x70000.
  */
-#define UCIE_PHY_D2D_M0_ERR_LOG0_OFFSET    0x20000  /* approximate */
-#define UCIE_LTSM_STATE_ACTIVE              0x10
+#define R100_RBC_UCIE_SS_BASE   0x20000
+#define R100_RBC_UCIE_SS_END    0x70000
+
+/*
+ * UCIe SS register offsets (from UCIe SS base, i.e. block offset - 0x20000).
+ *
+ * LINK_STATUS: dvsec1_reg_reg_global_dvsec1_ucie_link_status (offset 0x20014).
+ *   bit[15] = lstatus_link_status; used by non-ZEBU check_link_up().
+ *
+ * SCRATCH_REG1: global_reg_cmn_mcu_scratch_reg1 (offset 0x2e038).
+ *   Read as 0xFFFFFFFF to signal link-up in ZEBU builds.
+ */
+#define UCIE_REG_LINK_STATUS    0x20014
+#define UCIE_REG_SCRATCH_REG1   0x2e038
+#define UCIE_LINK_STATUS_UP     (1u << 15)
+#define UCIE_SCRATCH_LINKUP     0xFFFFFFFFu
 
 typedef struct R100RBCState {
     SysBusDevice parent_obj;
@@ -63,15 +89,22 @@ static uint64_t r100_rbc_read(void *opaque, hwaddr addr, unsigned size)
     }
 
     /*
-     * For addresses within the UCIe subsystem range (0x20000+),
-     * return "link active" state in the LTSM state field.
-     * This satisfies check_link_up() in the FW.
+     * Within the UCIe subsystem [0x20000, 0x70000), spoof link-up for the
+     * registers BL2 polls in check_link_up().
      */
-    if (addr >= 0x20000 && addr < 0x40000) {
-        uint32_t val = s->regs[reg_idx];
-        /* Set LTSM state to ACTIVE in the lower bits */
-        val |= UCIE_LTSM_STATE_ACTIVE;
-        return val;
+    if (addr >= R100_RBC_UCIE_SS_BASE && addr < R100_RBC_UCIE_SS_END) {
+        hwaddr ucie_off = addr - R100_RBC_UCIE_SS_BASE;
+
+        switch (ucie_off) {
+        case UCIE_REG_SCRATCH_REG1:
+            /* ZEBU link-up sentinel (checked as == 0xFFFFFFFF). */
+            return UCIE_SCRATCH_LINKUP;
+        case UCIE_REG_LINK_STATUS:
+            /* Non-ZEBU path: bit[15] = link up. */
+            return s->regs[reg_idx] | UCIE_LINK_STATUS_UP;
+        default:
+            return s->regs[reg_idx];
+        }
     }
 
     return s->regs[reg_idx];

@@ -4,7 +4,7 @@
 
 **Goal**: TF-A BL1 → BL2 → BL31 → FreeRTOS boots on all 4 chiplets.
 
-**Status**: Real q-sys TF-A BL1 runs on all 4 chiplets. After staging `tboot_n` into each secondary chiplet's iRAM via the QSPI 16-word burst write and releasing CP0.cpu0 of chiplets 1-3 through PMU `CPU_CONFIGURATION`, four BL1 instances are now executing concurrently — chiplet 0 hands off to BL2 and the secondary chiplets re-enter BL1 from their locally-staged image and progress into BL2. Output is interleaved because there is no serialization across the per-chiplet UART instances (currently only chiplet 0 has UART wired). Next blocker is UCIe link-status polling from BL2 (`Ch 0 (0x1e05820000) UCIe Linkup timed out`) — the RBC stub only seeds the primary LTSM fields and BL2's per-direction link-up handshake reads more detailed PHY status.
+**Status**: Real q-sys TF-A BL1 runs on all 4 chiplets. After staging `tboot_n` into each secondary chiplet's iRAM via the QSPI 16-word burst write and releasing CP0.cpu0 of chiplets 1-3 through PMU `CPU_CONFIGURATION`, four BL1 instances are now executing concurrently — chiplet 0 hands off to BL2 and the secondary chiplets re-enter BL1 from their locally-staged image and progress into BL2. BL2's `wait_ucie_link_up_for_CP()` poll now completes instantly: the RBC devices are dual-mapped at both config-space (`0x1FF5xxxxxx`) and chiplet-private alias (`0x1E05xxxxxx`) addresses, and the UCIe SS stub returns the ZEBU link-up sentinel `0xFFFFFFFF` for `global_reg_cmn_mcu_scratch_reg1` (UCIe SS offset `0x2e038`, matching `check_link_up()` in the ZEBU build). Next blocker is inside BL2 after the UCIe handshake — all 4 chiplets currently appear to enter the `IS_PRIMARY_CHIPLET` path and race on the subsequent PMU / HBM init steps (output is interleaved because only chiplet 0 has UART wired).
 
 ### What's done
 
@@ -18,7 +18,7 @@
 - QSPI bridge: Designware SSI protocol, cross-chiplet register access (with `PRIVATE_BASE` prefix for slave-side addressing); supports 1-word read (`0x70`), 1-word write (`0x80`), and 16-word burst write (`0x83`) — the last used by BL1 `qspi_bridge_load_image()` to stage `tboot_n` into secondary chiplets' iRAM
 - Per-chiplet SYSREG_CP0 RAM region (64 KB at private-alias `0x1E01010000`) backing BL1's `plat_set_cpu_rvbar()` writes; the PMU reads RVBARADDR0_LOW/HIGH back when a CPU release is triggered
 - PMU secondary core release: `CPU_CONFIGURATION` writes decode cluster/cpu, update `CPU_STATUS`, and call `arm_set_cpu_on(mpidr, entry)` with the RVBAR + chiplet-offset translation so the released vCPU starts in its own chiplet's iRAM copy
-- RBC stubs: UCIe LTSM ACTIVE for all 6 blocks per chiplet
+- RBC stubs: 6 blocks per chiplet (V00/V01/V10/V11/H00/H01), dual-mapped at config-space (`0x1FF5xxxxxx`) and chiplet-private alias (`0x1E05xxxxxx` via `PRIVATE_BASE`). UCIe SS returns ZEBU link-up sentinel `0xFFFFFFFF` at `global_reg_cmn_mcu_scratch_reg1` (UCIe SS offset `0x2e038`) so BL2's `check_link_up()` returns true immediately, plus `lstatus_link_status=1` at `dvsec1_ucie_link_status` (+0x20014) for non-ZEBU builds
 - PL330 DMA stub at `0x1FF02C0000` per chiplet: fake-completion on `ch_stat[0].csr`, `dbgstatus`, `dbgcmd` polls — no real memcpy (RBC stub hides the missing data)
 - Dual-mapped PMU and SYSREG devices at both config-space (`0x1FF0xxxxxx`) and private-alias (`0x1E00xxxxxx`) addresses via `memory_region_init_alias`
 - PCIe sub-controller stub (for `pmu_release_cm7` writes) and CSS600 CNTGEN stub (generic timer reset)
@@ -50,8 +50,9 @@ Booting Trusted Firmware                       [chiplet-1..3 re-enter BL1]
 NOTICE:  BL1: v2.9.0(debug):...
 INFO:    BL1: Loading BL2
 NOTICE:  BL1: Booting BL2
-NOTICE:  BL2: Detected secondary chiplet count: 2 / 1
-ERROR:   Ch 0 (0x1e05820000) UCIe Linkup timed out after 5 seconds  [next blocker]
+NOTICE:  BL2: Detected secondary chiplet count: 3                  [chiplet 0]
+                                                                   [UCIe linkup now passes instantly on all 4 chiplets]
+NOTICE:  BL2: Detected secondary chiplet count: 1 / 0               [secondary chiplets — currently racing into primary path, next blocker]
 ```
 
 ### What remains
@@ -59,7 +60,8 @@ ERROR:   Ch 0 (0x1e05820000) UCIe Linkup timed out after 5 seconds  [next blocke
 - [x] Back the flash staging region (`0x1F80000000`, 64 MB) with a RAM model so `nvmem_flash_hw_cfg_read()` and `flash_nor_read()` memcpys succeed; optional `images/flash.bin` preload wired into the CLI
 - [x] Extend the QSPI bridge instruction decoder with `0x83` (WRITE_16WORD) — BL1's `qspi_bridge_load_image()` stages `tboot_n` into each secondary chiplet's iRAM through this burst write
 - [x] Refine PMU for secondary core release — `CPU_CONFIGURATION` writes now update `CPU_STATUS` and call `arm_set_cpu_on()` with the FW-written RVBAR (offset by `chiplet_id * CHIPLET_OFFSET` so the released vCPU lands in its own chiplet's iRAM copy)
-- [ ] Wire UCIe PHY/link status so BL2's `Ch N (base) UCIe Linkup` poll completes; BL2 reads per-direction RBC registers (the current RBC stub only seeds primary LTSM ACTIVE). Once past this, BL2 can hand control to BL31.
+- [x] Wire UCIe PHY/link status so BL2's `Ch N (base) UCIe Linkup` poll completes — added private-alias mounts for all 6 RBC blocks per chiplet and seeded `global_reg_cmn_mcu_scratch_reg1 = 0xFFFFFFFF` (the ZEBU-build link-up sentinel checked by `check_link_up()`)
+- [ ] Investigate why secondary chiplets enter BL2's `IS_PRIMARY_CHIPLET` path — all 4 chiplets currently print `BL2: Detected secondary chiplet count: …`. Likely SYSREMAP_CHIPLET is not being read via the expected private-alias window on secondary chiplets (trace MMIO with `-d guest_errors` on the chiplet 1-3 BL2 entry path)
 - [ ] Per-chiplet UART instances (currently only chiplet 0 has UART mapped — secondary chiplets' BL1/BL2 banners interleave because they all share chiplet 0's UART alias via the private-alias catch-all)
 - [ ] Pre-load BL2/BL31/FreeRTOS to each secondary chiplet's iRAM/DRAM so BL1's cross-chiplet copy finds the data in place (alternatively: populate `flash.bin` with a real GPT image and let BL1 DMA-stage everything itself)
 - [ ] Build system: fix `sys/build.sh` path where `debug` COMMAND resets CLI flags, so `CHIPLET_COUNT=1` builds work (alternative to the DMA stub for single-chiplet boot)

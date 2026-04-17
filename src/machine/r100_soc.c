@@ -264,23 +264,55 @@ static void r100_create_qspi_bridge(MemoryRegion *cfg_mr, int chiplet_id)
 
 /*
  * Create and map RBC (UCIe link) stub devices for a chiplet.
+ *
+ * Each RBC block is dual-mapped:
+ *   - config-space view: r100_rbc_bases[i] (0x1FF5...) inside cfg_mr
+ *   - private-alias view: 0x1E05... / 0x1E06... in sysmem (per-chiplet)
+ *
+ * BL2's wait_ucie_link_up_for_CP() reads its *own* chiplet's UCIe link
+ * status via the private alias (BLK_RBC_Vxx_BASE = 0x1E05xxxxxxxx in
+ * external/.../include/drivers/aw/ucie.h). Cross-chiplet reads go
+ * through the QSPI bridge to the config-space view. Both need to route
+ * to the same device instance so a linkup write stays coherent.
+ *
+ * The RBC block private-alias addresses differ from the config-space
+ * addresses only in the top byte (0x1E vs 0x1FF0): offsets from their
+ * respective window bases (PRIVATE_BASE / CFG_BASE) match. We compute
+ * the private base by substituting PRIVATE_BASE for CFG_BASE.
  */
-static void r100_create_rbc_blocks(MemoryRegion *cfg_mr, int chiplet_id)
+static void r100_create_rbc_blocks(MemoryRegion *cfg_mr, MemoryRegion *sysmem,
+                                   int chiplet_id, uint64_t chiplet_base)
 {
     int i;
 
     for (i = 0; i < R100_NUM_RBC_BLOCKS; i++) {
         DeviceState *dev;
         SysBusDevice *sbd;
-        uint64_t offset = r100_rbc_bases[i] - R100_CFG_BASE;
+        MemoryRegion *iomem;
+        MemoryRegion *alias;
+        uint64_t cfg_offset = r100_rbc_bases[i] - R100_CFG_BASE;
+        uint64_t priv_base = R100_PRIVATE_BASE + cfg_offset;
+        char name[64];
 
         dev = qdev_new(TYPE_R100_RBC);
         qdev_prop_set_uint32(dev, "chiplet-id", chiplet_id);
         qdev_prop_set_uint32(dev, "block-id", i);
         sbd = SYS_BUS_DEVICE(dev);
         sysbus_realize_and_unref(sbd, &error_fatal);
-        memory_region_add_subregion_overlap(cfg_mr, offset,
-                                            sysbus_mmio_get_region(sbd, 0), 1);
+
+        iomem = sysbus_mmio_get_region(sbd, 0);
+        memory_region_add_subregion_overlap(cfg_mr, cfg_offset, iomem, 1);
+
+        /* Private-alias mount: overlap priority 1 so it outranks the
+         * chiplet-private-window unimplemented-device catch-all (prio 0). */
+        alias = g_new(MemoryRegion, 1);
+        snprintf(name, sizeof(name), "r100.chiplet%d.rbc%d_priv",
+                 chiplet_id, i);
+        memory_region_init_alias(alias, NULL, name, iomem, 0,
+                                 R100_RBC_BLOCK_SIZE);
+        memory_region_add_subregion_overlap(sysmem,
+                                            chiplet_base + priv_base,
+                                            alias, 1);
     }
 }
 
@@ -450,8 +482,8 @@ static void r100_chiplet_init(MachineState *machine, int chiplet_id,
     /* --- QSPI bridge (inter-chiplet register access) --- */
     r100_create_qspi_bridge(cfg_mr, chiplet_id);
 
-    /* --- RBC stubs (UCIe link status) --- */
-    r100_create_rbc_blocks(cfg_mr, chiplet_id);
+    /* --- RBC stubs (UCIe link status) — config space + private alias --- */
+    r100_create_rbc_blocks(cfg_mr, sysmem, chiplet_id, chiplet_base);
 
     /* --- PCIe sub-controller catch-all RAM (for pmu_release_cm7) --- */
     r100_create_pcie_subctrl(cfg_mr, chiplet_id);
