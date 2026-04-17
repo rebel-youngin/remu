@@ -154,6 +154,18 @@ DECLARE_INSTANCE_CHECKER(R100DMAPl330State, R100_DMA_PL330, TYPE_R100_DMA_PL330)
  * it hangs on `while (!(cr0ack & EVENTQEN_MASK))`. We implement a tiny
  * register file that mirrors CR0 into CR0ACK and auto-clears the GBPA
  * UPDATE bit so the complete-poll exits.
+ *
+ * FreeRTOS's EL1 SMMU driver (external/.../q/sys/drivers/smmu/smmu.c)
+ * also posts CMD_SYNC entries to the command queue in DRAM and polls
+ * the entry slot waiting for the SMMU to overwrite it with the MSI
+ * data (0). Without any CMDQ processing the poll times out 1000 times
+ * a second and floods `[smmu] Failed to sync` into the HILS log. We
+ * cache the NS CMDQ base + size (from SMMU_CMDQ_BASE), and on every
+ * producer-side write to SMMU_CMDQ_PROD walk the newly-enqueued
+ * entries: for each CMD_SYNC with CS=SIG_IRQ we write a 32-bit 0 to
+ * the MSI address encoded in cmd[1] (which the FW points back at the
+ * CMD_SYNC slot itself), then advance SMMU_CMDQ_CONS to match PROD so
+ * the producer sees all commands consumed.
  * ======================================================================== */
 
 #define R100_SMMU_REG_SIZE      0x10000
@@ -165,6 +177,10 @@ struct R100SMMUState {
     MemoryRegion iomem;
     uint32_t regs[R100_SMMU_REG_COUNT];
     uint32_t chiplet_id;
+
+    /* Cached CMDQ geometry from the last SMMU_CMDQ_BASE write. */
+    uint64_t cmdq_base_pa;      /* PA of first entry in guest memory */
+    uint32_t cmdq_log2size;     /* log2(#entries); valid range 0..19 */
 };
 
 typedef struct R100SMMUState R100SMMUState;
