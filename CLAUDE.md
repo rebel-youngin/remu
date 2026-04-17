@@ -32,7 +32,7 @@ cli/                  Click-based CLI tool
 scripts/              Build and launch scripts
 tests/                Test binaries and test scripts
 docs/                 Architecture and roadmap docs
-external/             Read-only: q-sys, q-cp, kmd, umd, qemu
+external/             Read-only: ssw-bundle (q-sys, q-cp, kmd, umd, ...), qemu
 images/               FW binaries (bl1.bin, bl31_cp0.bin, freertos_cp0.bin, ...)
 build/qemu/           QEMU build output (gitignored)
 ```
@@ -62,10 +62,16 @@ When modifying device models, cross-reference these FW/driver sources:
 
 | What to check | File |
 |----------------|------|
-| SoC address map | `external/q-sys/.../autogen/g_sys_addrmap.h` |
-| Platform defs | `external/q-sys/bootloader/cp/tf-a/plat/rebel/rebel_h/include/platform_def.h` |
-| CMU polling patterns | `external/q-sys/bootloader/cp/tf-a/drivers/clk/clk_samsung/cmu.c` |
-| PMU registers | `external/q-sys/bootloader/cp/tf-a/plat/rebel/rebel_h/rebel_h_pmu.c` |
-| QSPI bridge protocol | `external/q-sys/bootloader/cp/tf-a/drivers/synopsys/qspi_bridge/qspi_bridge.c` |
-| PCI BAR layout | `external/kmd/rebellions/rebel/rebel.h` |
-| FW-host handshake | `external/kmd/rebellions/common/{fw_if.c,ring.c,queue.c}` |
+All FW/driver sources live inside `external/ssw-bundle` (initialized via
+`git submodule update --init --recursive`). Shorthand: `$BUNDLE` below is
+`external/ssw-bundle/products`.
+
+| What to check | File |
+|----------------|------|
+| SoC address map | `$BUNDLE/rebel/q/sys/.../autogen/g_sys_addrmap.h` |
+| Platform defs | `$BUNDLE/rebel/q/sys/bootloader/cp/tf-a/plat/rebel/rebel_h/include/platform_def.h` |
+| CMU polling patterns | `$BUNDLE/rebel/q/sys/bootloader/cp/tf-a/drivers/clk/clk_samsung/cmu.c` |
+| PMU registers | `$BUNDLE/rebel/q/sys/bootloader/cp/tf-a/plat/rebel/rebel_h/rebel_h_pmu.c` |
+| QSPI bridge protocol | `$BUNDLE/rebel/q/sys/bootloader/cp/tf-a/drivers/synopsys/qspi_bridge/qspi_bridge.c` |
+| PCI BAR layout | `$BUNDLE/common/kmd/rebellions/rebel/rebel.h` |
+| FW-host handshake | `$BUNDLE/common/kmd/rebellions/common/{fw_if.c,ring.c,queue.c}` |

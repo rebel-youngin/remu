@@ -4,7 +4,7 @@
  *
  * During BL1, _bl1_init_blk_rbc() calls load_ucie_image() → dma_load_image()
  * to copy UCIe PHY firmware from flash into each RBC's SRAM. The driver
- * (external/q-sys/bootloader/cp/tf-a/drivers/arm/pl330/pl330.c) then polls:
+ * (external/ssw-bundle/products/rebel/q/sys/bootloader/cp/tf-a/drivers/arm/pl330/pl330.c) then polls:
  *
  *   - ch_stat[0].csr (offset 0x100): lower 4 bits must be zero → channel idle
  *   - dbgstatus (offset 0xD00): bit 0 zero → debugger idle

@@ -1,9 +1,7 @@
 build/
 install/
 images/*.bin
-external/qemu/
-external/ssw-bundle/
-external/q-sys/
+external/
 tests/*.bin
 tests/*.o
 *.egg-info/

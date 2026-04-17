@@ -290,7 +290,7 @@ static void r100_create_rbc_blocks(MemoryRegion *cfg_mr, int chiplet_id)
  * The R100 board has a single serial-NOR flash that every chiplet's QSPI
  * controller sees at the same local address (FLASH_BASE_ADDR = 0x1F80000000).
  * The FW's flash_nor_read() driver does a plain memcpy from that address
- * (see external/q-sys/drivers/qspi_boot/rl_serial_flash.c:flash_nor_read),
+ * (see external/ssw-bundle/products/rebel/q/sys/drivers/qspi_boot/rl_serial_flash.c:flash_nor_read),
  * and BL1's print_ucie_link_speed() reads the HW-CFG struct at offset 0x5E000
  * right after the UCIe images are DMA-staged.
  *
