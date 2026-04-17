@@ -860,6 +860,34 @@ static void r100_soc_init(MachineState *machine)
     }
 
     /*
+     * --- HILS log-buffer tail (chiplet 0's FreeRTOS .logbuf drain) ---
+     *
+     * FreeRTOS's RLOG_x / FLOG_x macros accumulate into a 2 MB ring at
+     * physical 0x10000000 (see FreeRTOS.ld `.logbuf` at virt
+     * 0x10010000000, with the kernel's +0x10000000000 virtual offset).
+     * The in-FW drain path (terminal_task -> uart_putc) requires the
+     * scheduler to be running, which is blocked today by the open PSCI
+     * CPU_ON warm-boot item. r100-logbuf-tail bypasses the FW drain by
+     * polling the ring from the emulator side and writing formatted
+     * entries to its own chardev, so HILS logs become visible even
+     * while init_smp() is still busy-waiting on secondary cores.
+     *
+     * We bind it to serial_hd(R100_NUM_CHIPLETS) -- the 5th `-serial`
+     * slot. The CLI wires that to /tmp/remu_hils.log by default.
+     */
+    {
+        DeviceState *dev = qdev_new(TYPE_R100_LOGBUF);
+        Chardev *chr = serial_hd(R100_NUM_CHIPLETS);
+
+        qdev_prop_set_uint64(dev, "base", 0x10000000ULL);
+        qdev_prop_set_uint64(dev, "size", 0x00200000ULL);
+        if (chr) {
+            qdev_prop_set_chr(dev, "chardev", chr);
+        }
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    }
+
+    /*
      * --- Shared inter-chiplet mailbox RAM ---
      * TF-A's `mailbox_data[]` table pairs each IDX_MAILBOX_* instance
      * with an absolute base. ipm_samsung_write/receive dereference

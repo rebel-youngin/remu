@@ -168,7 +168,12 @@ def build(clean, jobs):
               help="Directory for per-chiplet UART log files. "
                    "Chiplet 0 uses stdio; 1-3 write to "
                    "remu_uart{1,2,3}.log. Default: /tmp.")
-def run(gdb, trace, chiplets, memory, uart_log_dir):
+@click.option("--hils-log", type=click.Path(dir_okay=False), default=None,
+              help="File to receive the FreeRTOS HILS ring tail "
+                   "(RLOG_*/FLOG_* messages from DRAM 0x10000000). "
+                   "Default: <uart-log-dir>/remu_hils.log. Pass 'stderr' "
+                   "to mux onto the controlling terminal instead.")
+def run(gdb, trace, chiplets, memory, uart_log_dir, hils_log):
     """Boot R100 firmware on the emulated SoC."""
     _check_qemu_bin()
 
@@ -197,6 +202,24 @@ def run(gdb, trace, chiplets, memory, uart_log_dir):
             "-serial", "chardev:uart%d" % n,
         ]
         click.echo("  Chiplet %d UART -> %s" % (n, log_path))
+
+    # 5th `-serial` slot (serial_hd(4)) is consumed by the in-machine
+    # r100-logbuf-tail device. It polls chiplet 0's DRAM .logbuf ring at
+    # 0x10000000 and drains RLOG_*/FLOG_* entries out of band so they
+    # surface even before FreeRTOS's own terminal_task starts draining.
+    if hils_log == "stderr":
+        cmd += ["-chardev", "stdio,id=hils,mux=off,signal=off",
+                "-serial", "chardev:hils"]
+        click.echo("  HILS ring tail -> stderr (chardev=stdio)")
+    else:
+        hils_path = Path(hils_log) if hils_log else (uart_log_dir / "remu_hils.log")
+        hils_path.parent.mkdir(parents=True, exist_ok=True)
+        cmd += [
+            "-chardev",
+            "file,id=hils,path=%s,mux=off" % hils_path,
+            "-serial", "chardev:hils",
+        ]
+        click.echo("  HILS ring tail -> %s" % hils_path)
 
     if gdb:
         cmd += ["-s", "-S"]

@@ -27,6 +27,7 @@
 #define TYPE_R100_DMA_PL330     "r100-dma-pl330"
 #define TYPE_R100_SMMU          "r100-smmu"
 #define TYPE_R100_PVT           "r100-pvt"
+#define TYPE_R100_LOGBUF        "r100-logbuf-tail"
 #define TYPE_R100_UNIMPL        "r100-unimpl"
 
 #define R100_RBC_BLOCK_SIZE     0x80000ULL  /* 512KB per RBC block */

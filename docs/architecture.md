@@ -136,6 +136,14 @@ FreeRTOS (DRAM @ 0x00200000)
   └─ q-cp tasks run: hq_mgr, cb_mgr, cs_mgr, proc_mgr, etc.
 ```
 
+### Log routing
+
+The R100 FW emits boot messages through two independent paths, and REMU captures both:
+
+1. **Direct UART (`printf_` / TF-A `NOTICE`/`INFO`)** — TF-A and FreeRTOS's `printf_` call into `uart_putc`, which polls `LSR.THRE|TEMT` and writes to `THR`. REMU wires a QEMU `serial-mm` (16550, `regshift=2`) at `PERI0_UART0_BASE` (`0x1FF9040000`) on each chiplet, with priority-10 overlap over the config-space container. Every chiplet has its own chardev: chiplet 0 goes to `mon:stdio`, chiplets 1-3 to `/tmp/remu_uart{1,2,3}.log`. The DW-APB UART extras (`DLF` at `0xC0`, `TFL` at `0x80`, etc.) fall into the cfg-space unimplemented catch-all, which is harmless — the FW's init path tolerates zero reads and dropped writes.
+
+2. **HILS ring buffer (`RLOG_*` / `FLOG_*`)** — FreeRTOS's rate-limited structured logging doesn't touch the UART directly. It writes 128-byte `struct rl_log` records (`{tick, type, cpu, func_id, task[16], logstr[100]}`) into a 2 MB ring in DRAM at physical `0x10000000` (16384 entries, see `FreeRTOS.ld` `.logbuf` at virt `0x10010000000`). On silicon a `terminal_task` later drains the ring onto the UART, but in REMU the scheduler is blocked today by the PSCI CPU_ON warm-boot gap, so `terminal_task` never runs. REMU adds a `r100-logbuf-tail` device that polls this ring from the emulator side on a 50 ms `QEMU_CLOCK_VIRTUAL` timer and writes each new entry as `[HILS <tick> cpu=N LEVEL task|func] <msg>` to its own chardev (CLI default `/tmp/remu_hils.log`, override with `--hils-log PATH` / `--hils-log stderr`).
+
 ### Device Model Design
 
 All device models follow the QEMU QOM (QEMU Object Model) pattern:
@@ -172,6 +180,7 @@ All device models follow the QEMU QOM (QEMU Object Model) pattern:
 | `r100_rbc.c` | RBC/UCIe | 6 per chiplet | Dual-mapped (cfg-space `0x1FF5xxxxxx` + private alias `0x1E05xxxxxx`); `global_reg_cmn_mcu_scratch_reg1 = 0xFFFFFFFF` (ZEBU link-up) + `lstatus_link_status=1` |
 | `r100_smmu.c` | SMMU-600 TCU | 1 per chiplet (primary only wired) | `CR0→CR0ACK` mirror + `GBPA.UPDATE` auto-clear so BL2 `smmu_early_init` polls terminate |
 | `r100_dma.c` | PL330 DMA | 1 per chiplet | Fake completion on csr/dbgstatus/dbgcmd polls |
+| `r100_logbuf.c` | HILS ring tail | 1 (chiplet 0 only) | Polls DRAM `.logbuf` ring at 0x10000000 on a 50 ms timer, drains `RLOG_*`/`FLOG_*` entries to own chardev |
 | `remu_addrmap.h` | — | — | All address constants (from `g_sys_addrmap.h`) |
 
 ## FW Source References
