@@ -138,6 +138,9 @@
 #define R100_WBUS_U_CMU_BASE        0x1FF4000000ULL
 #define R100_WBUS_D_CMU_BASE        0x1FF4600000ULL
 
+/* --- SMMU-600 TCU (Translation Control Unit) --- */
+#define R100_SMMU_TCU_BASE          0x1FF4200000ULL  /* TCU_OFFSET from rebel_h_baseoffset.h */
+
 /* --- EBUS blocks --- */
 #define R100_EBUS_U_CMU_BASE        0x1FF4800000ULL
 #define R100_EBUS_D_CMU_BASE        0x1FF4A00000ULL

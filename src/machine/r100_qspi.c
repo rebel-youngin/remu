@@ -68,6 +68,25 @@
 #define QSPI_BURST16_WORDS      16
 
 /*
+ * The FW driver's 24-bit address field loses bits [31:26] of the target
+ * address. Those 6 bits come from an "upper-address" register on the slave
+ * SPI controller, written via qspi_bridge_set_upper_addr() which maps to
+ *
+ *   DW_SPI_SYSREG_ADDRESS = 0x1E04310160  (qspi_bridge.h)
+ *
+ * encoded as 24-bit address field 0x0C4058 ((addr >> 2) & 0xFFFFFF). When
+ * the master stub sees a write with this address field, it latches the
+ * data into s->upper_addr instead of forwarding it to sysmem. Subsequent
+ * remote read/write instructions reconstruct a 32-bit low address as
+ *   (upper_addr & 0xFC000000) | (address << 2)
+ * and the low 28 bits are used as an offset inside the target chiplet's
+ * PRIVATE_BASE window. Without this, cross-chiplet accesses above the
+ * 64 MB 26-bit word window (RBC at 0x1E05..., etc.) land on unrelated
+ * offsets — the symptom was UCIe linkup timing out on chiplet 1.
+ */
+#define QSPI_UPPER_ADDR_FIELD   0x0C4058u
+
+/*
  * State machine for tracking multi-word DRX writes.
  *
  * The bridge driver pushes a 3-word (1-word write), 2-word (read) or
@@ -117,28 +136,46 @@ DECLARE_INSTANCE_CHECKER(R100QSPIBridgeState, R100_QSPI_BRIDGE,
                          TYPE_R100_QSPI_BRIDGE)
 
 /*
+ * Compose a target sysmem address from the current transfer state.
+ *
+ * The slave-side controller reconstructs a 32-bit word-address
+ *     full_addr = (upper_addr & 0xFC000000) | (address << 2)
+ * then interprets the bottom 28 bits as an offset inside its own 256 MB
+ * private-alias window (PRIVATE_BASE, 0x1E00000000). The top 4 bits of
+ * `full_addr` are a leftover of the FW driver's uint32_t cast of a
+ * 0x1E...-based absolute address and are discarded. Without the
+ * `& 0x0FFFFFFF` mask, reads past the 64 MB 26-bit direct-address window
+ * (RBC blocks at 0x1E05xx, etc.) miss the device alias entirely.
+ */
+static uint64_t qspi_compose_target(R100QSPIBridgeState *s,
+                                    uint32_t word_offset)
+{
+    uint64_t full_addr = (uint64_t)(s->upper_addr & 0xFC000000) |
+                         ((uint64_t)s->address << 2);
+
+    full_addr &= 0x0FFFFFFFULL;
+    full_addr += (uint64_t)word_offset << 2;
+
+    uint64_t target = (uint64_t)s->selected_slave * R100_CHIPLET_OFFSET +
+                      R100_PRIVATE_BASE + full_addr;
+
+    qemu_log_mask(LOG_UNIMP,
+                  "r100-qspi: compose upper=0x%08x addr24=0x%06x off=%u "
+                  "-> full=0x%"PRIx64" slave=%u target=0x%"PRIx64"\n",
+                  s->upper_addr, s->address, word_offset,
+                  full_addr, s->selected_slave, target);
+
+    return target;
+}
+
+/*
  * Perform a cross-chiplet read via QEMU's system address space.
- *
- * The target address is: slave_chiplet * CHIPLET_OFFSET + PRIVATE_BASE
- *                        + (upper_addr & 0xFC000000) | (address << 2)
- *
- * The R100 slave-side QSPI controller maps the 32-bit transaction address
- * into its own chiplet-private alias window (0x1E00000000) — the upper bits
- * truncated by the FW driver are restored implicitly. Without this prefix,
- * QSPI reads land in the slave's DRAM at low offsets instead of the SYSREG
- * the bridge protocol is meant to reach.
  */
 static uint32_t qspi_remote_read(R100QSPIBridgeState *s)
 {
-    uint64_t full_addr;
-    uint64_t target;
+    uint64_t target = qspi_compose_target(s, 0);
     uint32_t val = 0;
     MemTxResult result;
-
-    full_addr = (uint64_t)(s->upper_addr & 0xFC000000) |
-                ((uint64_t)s->address << 2);
-    target = (uint64_t)s->selected_slave * R100_CHIPLET_OFFSET +
-             R100_PRIVATE_BASE + full_addr;
 
     result = address_space_read(&address_space_memory, target,
                                 MEMTXATTRS_UNSPECIFIED,
@@ -164,14 +201,8 @@ static uint32_t qspi_remote_read(R100QSPIBridgeState *s)
 static void qspi_remote_write(R100QSPIBridgeState *s, uint32_t word_offset,
                               uint32_t data)
 {
-    uint64_t full_addr;
-    uint64_t target;
+    uint64_t target = qspi_compose_target(s, word_offset);
     MemTxResult result;
-
-    full_addr = (uint64_t)(s->upper_addr & 0xFC000000) |
-                ((uint64_t)s->address << 2);
-    target = (uint64_t)s->selected_slave * R100_CHIPLET_OFFSET +
-             R100_PRIVATE_BASE + full_addr + ((uint64_t)word_offset << 2);
 
     result = address_space_write(&address_space_memory, target,
                                  MEMTXATTRS_UNSPECIFIED,
@@ -279,6 +310,11 @@ static void r100_qspi_write(void *opaque, hwaddr addr, uint64_t val,
                 s->data_words_remaining = 1;
                 s->xfer_state = QSPI_STATE_WRITING;
             } else if (s->instruction == QSPI_INST_WRITE_16WORD) {
+                /*
+                 * Bulk image staging always uses upper_addr=0 because BL1
+                 * only targets iRAM (0x1E00010000..0x1E00050000) which fits
+                 * in the 26-bit word window. Leave the upper latch alone.
+                 */
                 s->data_words_remaining = QSPI_BURST16_WORDS;
                 s->xfer_state = QSPI_STATE_WRITING;
             } else {
@@ -290,7 +326,22 @@ static void r100_qspi_write(void *opaque, hwaddr addr, uint64_t val,
             break;
 
         case QSPI_STATE_WRITING:
-            qspi_remote_write(s, s->write_offset, (uint32_t)val);
+            if (s->instruction == QSPI_INST_WRITE &&
+                s->address == QSPI_UPPER_ADDR_FIELD) {
+                /*
+                 * qspi_bridge_set_upper_addr(): the FW writes bits [31:26]
+                 * of the next target address to the slave's internal
+                 * DW_SPI_SYSREG_ADDRESS register. Model it by latching
+                 * s->upper_addr so subsequent remote read/write instructions
+                 * can reconstruct addresses that exceed the 26-bit field.
+                 */
+                s->upper_addr = (uint32_t)val;
+                qemu_log_mask(LOG_UNIMP,
+                              "r100-qspi: latch upper_addr=0x%08x (slave %u)\n",
+                              s->upper_addr, s->selected_slave);
+            } else {
+                qspi_remote_write(s, s->write_offset, (uint32_t)val);
+            }
             s->write_offset++;
             if (--s->data_words_remaining == 0) {
                 s->xfer_state = QSPI_STATE_IDLE;

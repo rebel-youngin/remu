@@ -64,12 +64,14 @@ REMU uses two QEMU instances connected by shared memory:
 │  ┌────────────────────────────────────────────┐  │
 │  │ Device Models                              │  │
 │  │  CMU (20 blocks) — PLL lock stubs          │  │
-│  │  PMU — boot status, power states           │  │
-│  │  SYSREG — chiplet ID                       │  │
-│  │  HBM3 — training-complete                  │  │
+│  │  PMU — boot + arm_set_cpu_on on RVBAR      │  │
+│  │  SYSREG — chiplet ID (per-chiplet view)    │  │
+│  │  HBM3 — sparse regs, training-ready        │  │
 │  │  QSPI bridge — cross-chiplet register I/O  │  │
 │  │  RBC — UCIe link-up status                 │  │
-│  │  GIC600, 16550 UART, Generic Timer          │  │
+│  │  SMMU-600 TCU — CR0ACK / GBPA mirror       │  │
+│  │  Mailbox RAM — inter-chiplet handshake     │  │
+│  │  GIC600, per-chiplet 16550 UART, Timer     │  │
 │  └────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────┘
 ```
@@ -77,6 +79,17 @@ REMU uses two QEMU instances connected by shared memory:
 **Why two instances?** The FW runs bare-metal AArch64 at EL3/EL1 with a 40-bit physical address space starting at `0x1E00000000`. The host kmd runs inside a Linux kernel. These are fundamentally incompatible execution environments. A single QEMU with heterogeneous clusters (like Xilinx ZynqMP) would be far more complex to build and maintain.
 
 **Why a QEMU fork?** The machine type needs a custom memory map, custom device models, and custom boot loading. QEMU does not support out-of-tree device compilation, so the device models are symlinked into the QEMU source tree and compiled in-tree.
+
+### Per-Chiplet CPU Memory View
+
+On silicon, the 256 MB `PRIVATE_BASE` window (`0x1E00000000`) is a chiplet-local address-decoder alias: each chiplet's CPUs see their own private peripherals (SYSREMAP, CPMU, CP0/CP1 SYSREG, RBC, OTP, ...) at these addresses. The FW relies on this routing to read `CHIPLET_ID` from `SYSREG_SYSREMAP_PRIVATE+0x444` without having to know which chiplet it runs on, and to execute the same BL1/BL2 binary on all 4 chiplets.
+
+REMU models this by giving each chiplet's CPUs their own `MemoryRegion` container (built in `r100_build_chiplet_view()` in `r100_soc.c`). Each view:
+
+1. Aliases the entire shared `sysmem` at offset 0 (so DRAM, GIC, UART, config-space peripherals, etc. behave normally).
+2. Overlays a 256 MB subregion at `PRIVATE_WIN_BASE` with overlap priority 10 that aliases into `chiplet_id * CHIPLET_OFFSET + PRIVATE_WIN_BASE` — that chiplet's own slice of `sysmem`. The higher priority ensures this overlay wins over the flat `sysmem` alias.
+
+Each CPU's `"memory"` link is set to its chiplet's view before realisation, so all TLB walks and instruction fetches observe the chiplet-local routing. Consequently, secondary CPUs released from power-off must start at the unmodified `0x1E00028000` entry point (the private-alias BL2 base); adding `chiplet_id * CHIPLET_OFFSET` would put PC at an absolute cross-chiplet address and shift every PC-relative ADRP-resolved linker symbol by `CHIPLET_OFFSET`, corrupting expressions like `BL_CODE_END - BL2_BASE` in BL2's MMU setup.
 
 ### Per-Chiplet Memory Map
 
@@ -104,11 +117,14 @@ BL1 (iRAM @ 0x1E00010000)
   ├─ Load BL2 from flash (or preloaded in emulation)
   └─ Jump to BL2
 
-BL2 (iRAM @ 0x1E0004B000)
-  ├─ HBM3: Initialize memory controller (stub returns ready)
-  ├─ SMMU: Early init
-  ├─ Load BL31 + FreeRTOS to DRAM
-  └─ Release secondary cores via PMU
+BL2 (iRAM @ 0x1E00028000, same binary on all 4 chiplets)
+  ├─ CMU: Chiplet-local PLL init
+  ├─ HBM3: Initialize memory controller (sparse stub returns ready, ICON req RMW works)
+  ├─ Inter-chiplet HBM handshake via mailbox RAM (primary waits for N=1..3)
+  ├─ SMMU-600 TCU: Early init (stub CR0ACK mirror + GBPA.UPDATE auto-clear)
+  ├─ MMU: xlat_tables_v2 — per-chiplet mappings (private window + DRAM + flash + SMMU)
+  ├─ Load BL31 + FreeRTOS images (backed-up copies on secondary chiplets)
+  └─ Hand off to BL31 at BL31_BASE (DRAM @ 0)
 
 BL31 (DRAM @ 0x00000000)
   ├─ GIC: Configure interrupt controller
@@ -147,13 +163,14 @@ All device models follow the QEMU QOM (QEMU Object Model) pattern:
 
 | File | Device | Instances | Key Behavior |
 |------|--------|-----------|--------------|
-| `r100_soc.c` | Machine type | 1 | Creates chiplets, CPUs, GIC, UART |
+| `r100_soc.c` | Machine type | 1 | Creates chiplets, per-chiplet CPU views, CPUs, GIC, per-chiplet UARTs, mailbox RAM |
 | `r100_cmu.c` | CMU (Clock) | 20 per chiplet | PLL lock = instant, mux_busy = 0 |
-| `r100_pmu.c` | PMU (Power) | 1 per chiplet | Cold reset, all CPUs/clusters ON |
+| `r100_pmu.c` | PMU (Power) | 1 per chiplet | Cold reset, all CPUs/clusters ON; `CPU_CONFIGURATION` → `arm_set_cpu_on` at FW-written RVBAR; DCL config→status mirror |
 | `r100_sysreg.c` | SYSREG | 1 per chiplet | Returns chiplet ID (0-3) |
-| `r100_hbm.c` | HBM3 controller | 1 per chiplet | Returns training-complete |
-| `r100_qspi.c` | QSPI bridge | 1 per chiplet | Designware SSI protocol, cross-chiplet R/W |
+| `r100_hbm.c` | HBM3 controller | 1 per chiplet | Sparse write-back (6 MB window, default 0xFFFFFFFF), ICON req0/req1 RMW mirror |
+| `r100_qspi.c` | QSPI bridge | 1 per chiplet | Designware SSI, cross-chiplet R/W + upper-addr latch (28-bit offset) |
 | `r100_rbc.c` | RBC/UCIe | 6 per chiplet | Dual-mapped (cfg-space `0x1FF5xxxxxx` + private alias `0x1E05xxxxxx`); `global_reg_cmn_mcu_scratch_reg1 = 0xFFFFFFFF` (ZEBU link-up) + `lstatus_link_status=1` |
+| `r100_smmu.c` | SMMU-600 TCU | 1 per chiplet (primary only wired) | `CR0→CR0ACK` mirror + `GBPA.UPDATE` auto-clear so BL2 `smmu_early_init` polls terminate |
 | `r100_dma.c` | PL330 DMA | 1 per chiplet | Fake completion on csr/dbgstatus/dbgcmd polls |
 | `remu_addrmap.h` | — | — | All address constants (from `g_sys_addrmap.h`) |
 

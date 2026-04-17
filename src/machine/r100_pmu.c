@@ -217,13 +217,20 @@ static void r100_pmu_handle_cpu_config(R100PMUState *s, uint32_t cfg_off,
     }
 
     /*
-     * Translate the chiplet-local alias (`0x1E00xxxxxx`) into the flat
-     * QEMU address space. All chiplet-local RAM is cloned into a
-     * dedicated subregion at `chiplet_id * CHIPLET_OFFSET`; without
-     * this offset the released secondary vCPU would start fetching
-     * from chiplet 0's iRAM.
+     * BL1 writes RVBAR as a chiplet-local PRIVATE_BASE address
+     * (`0x1E00028000` for BL2). Each chiplet's CPUs use a dedicated
+     * memory view (built by r100_build_chiplet_view) where the 256 MB
+     * window at PRIVATE_WIN_BASE is aliased to that chiplet's own slice
+     * of sysmem. Starting the secondary at the unmodified `entry`
+     * therefore lands on the correct chiplet's iRAM backing via the
+     * private-window alias — matching silicon, where PC stays in the
+     * PRIVATE_BASE range so PC-relative ADRP symbol resolution works.
+     *
+     * Do NOT add `chiplet_id * CHIPLET_OFFSET` here. That would start
+     * the CPU at the absolute (cross-chiplet) address and shift every
+     * linker symbol by CHIPLET_OFFSET via ADRP, corrupting expressions
+     * like BL_CODE_END - BL2_BASE in bl2_el3_plat_arch_setup.
      */
-    entry += (uint64_t)s->chiplet_id * R100_CHIPLET_OFFSET;
 
     ret = arm_set_cpu_on(mpidr, entry, 0, 3, true);
     if (ret != QEMU_ARM_POWERCTL_RET_SUCCESS &&
@@ -250,6 +257,27 @@ static void r100_pmu_write(void *opaque, hwaddr addr, uint64_t val,
     }
 
     s->regs[reg_idx] = (uint32_t)val;
+
+    /*
+     * BL2's pmu_reset_dcluster() toggles each D-Cluster OFF then ON by
+     * writing DCL0/1_CONFIGURATION and spinning on DCL0/1_STATUS &
+     * DCL_STATUS_MASK until the low 4 bits reflect the new power state.
+     * On real hardware the CPMU sequencer mirrors the LOCAL_PWR bits
+     * into the status register; emulate that synchronously so the poll
+     * completes. See rebel_h_pmu.c:pmu_reset_dcluster().
+     */
+    switch (off) {
+    case R100_PMU_DCL0_CONFIG:
+        s->regs[R100_PMU_DCL0_STATUS >> 2] =
+            (uint32_t)val & R100_PMU_CPU_CFG_LOCAL_PWR_MASK;
+        return;
+    case R100_PMU_DCL1_CONFIG:
+        s->regs[R100_PMU_DCL1_STATUS >> 2] =
+            (uint32_t)val & R100_PMU_CPU_CFG_LOCAL_PWR_MASK;
+        return;
+    default:
+        break;
+    }
 
     /*
      * CPU_CONFIGURATION registers live at PMU offsets

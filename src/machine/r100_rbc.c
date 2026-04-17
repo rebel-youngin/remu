@@ -97,10 +97,18 @@ static uint64_t r100_rbc_read(void *opaque, hwaddr addr, unsigned size)
 
         switch (ucie_off) {
         case UCIE_REG_SCRATCH_REG1:
-            /* ZEBU link-up sentinel (checked as == 0xFFFFFFFF). */
+            qemu_log_mask(LOG_UNIMP,
+                          "r100-rbc: cl%u blk%u SCRATCH_REG1 read "
+                          "(off=0x%"HWADDR_PRIx") -> 0x%x\n",
+                          s->chiplet_id, s->block_id, addr,
+                          UCIE_SCRATCH_LINKUP);
             return UCIE_SCRATCH_LINKUP;
         case UCIE_REG_LINK_STATUS:
-            /* Non-ZEBU path: bit[15] = link up. */
+            qemu_log_mask(LOG_UNIMP,
+                          "r100-rbc: cl%u blk%u LINK_STATUS read "
+                          "(off=0x%"HWADDR_PRIx") -> 0x%x\n",
+                          s->chiplet_id, s->block_id, addr,
+                          s->regs[reg_idx] | UCIE_LINK_STATUS_UP);
             return s->regs[reg_idx] | UCIE_LINK_STATUS_UP;
         default:
             return s->regs[reg_idx];

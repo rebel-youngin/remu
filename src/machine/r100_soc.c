@@ -226,6 +226,29 @@ static void r100_create_hbm(MemoryRegion *cfg_mr, int chiplet_id)
 }
 
 /*
+ * Create and map the SMMU-600 TCU register block stub.
+ *
+ * BL2's smmu_early_init() programs the event-queue / strtab registers
+ * and then enables event queues via CR0, spinning on `CR0ACK & EVENTQEN`
+ * until the write is acknowledged. It also fences GBPA by setting the
+ * UPDATE bit and polling for it to clear. Without a device the polls
+ * run forever, so the primary chiplet never reaches load_cl0_cp_images
+ * and secondaries never see notify_cl0_cp_images_load_done.
+ */
+static void r100_create_smmu(MemoryRegion *cfg_mr, int chiplet_id)
+{
+    DeviceState *dev;
+    SysBusDevice *sbd;
+    uint64_t offset = R100_SMMU_TCU_BASE - R100_CFG_BASE;
+
+    dev = qdev_new(TYPE_R100_SMMU);
+    qdev_prop_set_uint32(dev, "chiplet-id", chiplet_id);
+    sbd = SYS_BUS_DEVICE(dev);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    memory_region_add_subregion(cfg_mr, offset, sysbus_mmio_get_region(sbd, 0));
+}
+
+/*
  * RBC block base addresses within config space (6 blocks per chiplet).
  */
 static const uint64_t r100_rbc_bases[] = {
@@ -476,6 +499,9 @@ static void r100_chiplet_init(MachineState *machine, int chiplet_id,
     /* --- HBM3 controller stub --- */
     r100_create_hbm(cfg_mr, chiplet_id);
 
+    /* --- SMMU-600 TCU stub (cr0/cr0ack mirror, gbpa update auto-clear) --- */
+    r100_create_smmu(cfg_mr, chiplet_id);
+
     /* --- PL330 DMA controller stub (used by BL1 UCIe FW load) --- */
     r100_create_dma_pl330(cfg_mr, chiplet_id);
 
@@ -510,11 +536,66 @@ static void r100_chiplet_init(MachineState *machine, int chiplet_id,
 }
 
 /*
+ * Build a per-chiplet "CPU view" MemoryRegion.
+ *
+ * On silicon, the 256 MB PRIVATE_BASE window (0x1E00000000) is a
+ * chiplet-local address-decoder alias — each chiplet's CPUs see their
+ * own private registers at that address. The FW reads CHIPLET_ID from
+ * SYSREG_SYSREMAP_PRIVATE+0x444 and SECOND_CHIPLET_CNT from
+ * CPMU_PRIVATE+0x840 via absolute PRIVATE_BASE addresses, relying on
+ * this chiplet-local routing to know which chiplet it runs on.
+ *
+ * In REMU every chiplet's per-chiplet device aliases live in the
+ * shared system_memory at `chiplet_base + 0x1E00000000`. Without
+ * per-CPU views, every CPU's read of 0x1E00220444 lands on chiplet 0's
+ * SYSREG instance, so BL2 on chiplets 1-3 reads CHIPLET_ID=0 and takes
+ * the IS_PRIMARY_CHIPLET path incorrectly.
+ *
+ * This builds a container MR for each chiplet that:
+ *   1. Aliases all of system_memory at offset 0 (shared peripherals,
+ *      DRAM, config-space views of other chiplets — all still work).
+ *   2. Overlays a 256 MB window at 0x1E00000000 that points to the
+ *      chiplet's own slice of system_memory at chiplet_base+0x1E00000000.
+ *      Overlap priority 10 makes this take precedence over the base
+ *      sysmem alias.
+ *
+ * The CPU "memory" link is set to this view, so its TLB walks hit the
+ * chiplet-local overlay. Same pattern as hw/arm/xlnx-versal.c giving
+ * APU/RPU clusters distinct views.
+ */
+static MemoryRegion *r100_build_chiplet_view(MemoryRegion *sysmem,
+                                             int chiplet_id)
+{
+    uint64_t chiplet_base = (uint64_t)chiplet_id * R100_CHIPLET_OFFSET;
+    MemoryRegion *view = g_new(MemoryRegion, 1);
+    MemoryRegion *sysmem_alias = g_new(MemoryRegion, 1);
+    MemoryRegion *priv_alias = g_new(MemoryRegion, 1);
+    char name[64];
+
+    snprintf(name, sizeof(name), "r100.chiplet%d.cpu_view", chiplet_id);
+    memory_region_init(view, NULL, name, UINT64_MAX);
+
+    snprintf(name, sizeof(name), "r100.chiplet%d.sysmem_alias", chiplet_id);
+    memory_region_init_alias(sysmem_alias, NULL, name, sysmem, 0, UINT64_MAX);
+    memory_region_add_subregion_overlap(view, 0, sysmem_alias, 0);
+
+    snprintf(name, sizeof(name), "r100.chiplet%d.priv_view", chiplet_id);
+    memory_region_init_alias(priv_alias, NULL, name, sysmem,
+                             chiplet_base + R100_PRIVATE_WIN_BASE,
+                             R100_PRIVATE_WIN_SIZE);
+    memory_region_add_subregion_overlap(view, R100_PRIVATE_WIN_BASE,
+                                        priv_alias, 10);
+
+    return view;
+}
+
+/*
  * Machine initialization: creates 4 chiplets, 32 CPUs, GIC, UART.
  */
 static void r100_soc_init(MachineState *machine)
 {
     MemoryRegion *sysmem = get_system_memory();
+    MemoryRegion *chiplet_views[R100_NUM_CHIPLETS];
     Object *cpuobj;
     DeviceState *gicdev;
     SysBusDevice *gicbusdev;
@@ -526,6 +607,16 @@ static void r100_soc_init(MachineState *machine)
         error_report("R100 SoC requires exactly %d CPUs (got %d)",
                      num_cpus, machine->smp.cpus);
         exit(1);
+    }
+
+    /*
+     * Build per-chiplet CPU memory views before CPU realization so that
+     * each cpuobj can set its "memory" link. The views alias system_memory,
+     * so mappings added later by r100_chiplet_init() become visible
+     * automatically through the sysmem alias.
+     */
+    for (chiplet = 0; chiplet < R100_NUM_CHIPLETS; chiplet++) {
+        chiplet_views[chiplet] = r100_build_chiplet_view(sysmem, chiplet);
     }
 
     /* --- Create CPUs --- */
@@ -567,6 +658,17 @@ static void r100_soc_init(MachineState *machine)
         /* Set timer frequency */
         object_property_set_int(cpuobj, "cntfrq", R100_CORE_TIMER_FREQ,
                                 &error_fatal);
+
+        /*
+         * Route this CPU's memory accesses through its chiplet's view so
+         * the chiplet-local PRIVATE_BASE window (CHIPLET_ID, SECOND_CHIPLET_CNT)
+         * resolves to this chiplet's own device instances. The secure
+         * address space automatically inherits from "memory" when
+         * "secure-memory" is unset (see target/arm/cpu.c realize).
+         */
+        object_property_set_link(cpuobj, "memory",
+                                 OBJECT(chiplet_views[chiplet]),
+                                 &error_fatal);
 
         /*
          * Only chiplet 0 / CP0 / core 0 starts powered on.
@@ -634,15 +736,89 @@ static void r100_soc_init(MachineState *machine)
     }
 
     /*
-     * --- 16550 UART (serial-mm) ---
+     * --- 16550 UARTs (serial-mm), one per chiplet ---
      * The R100 FW uses a TI 16550 driver (see uart_helper.h), not PL011.
      * Reads LSR (offset 0x14 = reg 5 << 2) — 32-bit-stride MMIO layout.
+     *
+     * PLAT_UART0_PERI0 expands to CHIPLET_ADDR(UART0_PERI0_OFFSET) so each
+     * chiplet N writes to N*CHIPLET_OFFSET + 0x1FF9040000. Give each
+     * chiplet its own SerialMM instance bound to a distinct chardev
+     * (serial_hd(N)) so the four chiplets' output is demuxed into
+     * separate streams. If the user didn't supply four -serial/-chardev
+     * options, the extra chiplets fall back to null. The IRQ output
+     * still routes through chiplet 0's GIC (SPI 33).
+     */
+    for (chiplet = 0; chiplet < R100_NUM_CHIPLETS; chiplet++) {
+        SerialMM *smm = SERIAL_MM(qdev_new(TYPE_SERIAL_MM));
+        MemoryRegion *uart_mr;
+        Chardev *chr = serial_hd(chiplet);
+
+        qdev_prop_set_uint8(DEVICE(smm), "regshift", 2);
+        qdev_prop_set_uint32(DEVICE(smm), "baudbase",
+                             (uint32_t)(R100_UART_CLOCK / 16));
+        if (chr) {
+            qdev_prop_set_chr(DEVICE(smm), "chardev", chr);
+        }
+        qdev_prop_set_uint8(DEVICE(smm), "endianness", DEVICE_LITTLE_ENDIAN);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(smm), &error_fatal);
+        if (chiplet == 0) {
+            sysbus_connect_irq(SYS_BUS_DEVICE(smm), 0,
+                               qdev_get_gpio_in(gicdev, 33));
+        }
+
+        uart_mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(smm), 0);
+
+        /* Priority 10 to outrank the cfg_mr catch-all + CMU stubs at
+         * chiplet N's cfg offset 0x9040000. */
+        memory_region_add_subregion_overlap(
+            sysmem,
+            (uint64_t)chiplet * R100_CHIPLET_OFFSET + R100_PERI0_UART0_BASE,
+            uart_mr, 10);
+    }
+
+    /*
+     * --- Shared inter-chiplet mailbox RAM ---
+     * TF-A's `mailbox_data[]` table pairs each IDX_MAILBOX_* instance
+     * with an absolute base. ipm_samsung_write/receive dereference
+     * `mailbox_data[inst].base` directly, so every chiplet view's
+     * sysmem_alias needs a plain RAM backing at the same physical
+     * addresses to make the ISSR handshake visible across chiplets:
+     *
+     *   Inbound (CL1/2/3 -> CL0), polled by CL0's BL2:
+     *     0x1FF9120000  CL0 PERI0 M7 (CL1)
+     *     0x1FF9130000  CL0 PERI0 M8 (CL2)
+     *     0x1FF9930000  CL0 PERI1 M8 (CL3)
+     *
+     *   Outbound (CL0 -> CL1/2/3), polled by secondary BL2:
+     *     0x3FF9120000  CL1 PERI0 M7 (= CL0 base + CHIPLET_OFFSET * 1)
+     *     0x5FF9120000  CL2 PERI0 M7 (= CL0 base + CHIPLET_OFFSET * 2)
+     *     0x7FF9120000  CL3 PERI0 M7 (= CL0 base + CHIPLET_OFFSET * 3)
+     *
+     * See external/.../tf-a/drivers/mailbox/mailbox.c:mailbox_data[].
+     * Priority 10 outranks each chiplet's cfg_mr catch-all.
      */
     {
-        serial_mm_init(sysmem, R100_PERI0_UART0_BASE, 2,
-                       qdev_get_gpio_in(gicdev, 33),
-                       (int)R100_UART_CLOCK / 16, serial_hd(0),
-                       DEVICE_LITTLE_ENDIAN);
+        static const struct {
+            uint64_t base;
+            const char *name;
+        } r100_mbox_slots[] = {
+            { 0x1FF9120000ULL, "r100.mbox_cl0_peri0_m7" },
+            { 0x1FF9130000ULL, "r100.mbox_cl0_peri0_m8" },
+            { 0x1FF9930000ULL, "r100.mbox_cl0_peri1_m8" },
+            { 0x3FF9120000ULL, "r100.mbox_cl1_peri0_m7" },
+            { 0x5FF9120000ULL, "r100.mbox_cl2_peri0_m7" },
+            { 0x7FF9120000ULL, "r100.mbox_cl3_peri0_m7" },
+        };
+
+        for (size_t i = 0; i < ARRAY_SIZE(r100_mbox_slots); i++) {
+            MemoryRegion *mr = g_new(MemoryRegion, 1);
+
+            memory_region_init_ram(mr, NULL, r100_mbox_slots[i].name,
+                                   0x10000, &error_fatal);
+            memory_region_add_subregion_overlap(sysmem,
+                                                r100_mbox_slots[i].base,
+                                                mr, 10);
+        }
     }
 }
 

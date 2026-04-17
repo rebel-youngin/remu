@@ -163,16 +163,40 @@ def build(clean, jobs):
               help="Number of chiplets (1-4). Default 4.")
 @click.option("--memory", "-m", default="1G",
               help="DRAM size per chiplet (e.g. 1G, 512M).")
-def run(gdb, trace, chiplets, memory):
+@click.option("--uart-log-dir", type=click.Path(file_okay=False),
+              default="/tmp",
+              help="Directory for per-chiplet UART log files. "
+                   "Chiplet 0 uses stdio; 1-3 write to "
+                   "remu_uart{1,2,3}.log. Default: /tmp.")
+def run(gdb, trace, chiplets, memory, uart_log_dir):
     """Boot R100 firmware on the emulated SoC."""
     _check_qemu_bin()
 
+    # Per-chiplet UART routing: chiplet 0 goes to stdio so boot output
+    # is live; chiplets 1-3 each get a dedicated file chardev to keep
+    # logs from interleaving with each other.
+    uart_log_dir = Path(uart_log_dir)
+    uart_log_dir.mkdir(parents=True, exist_ok=True)
+
+    # Drive chiplet 0's UART onto stdio (muxed with monitor) and the
+    # other three onto dedicated file chardevs. We manage all four
+    # serial bindings explicitly because QEMU's `-nographic` implicit
+    # `-serial mon:stdio` is suppressed once any other `-serial`
+    # option is present, which otherwise leaves chiplet 3 unbound.
     cmd = [
         str(QEMU_BIN),
         "-M", "r100-soc",
-        "-nographic",
-        "-serial", "stdio",
+        "-display", "none",
+        "-serial", "mon:stdio",
     ]
+    for n in range(1, 4):
+        log_path = uart_log_dir / ("remu_uart%d.log" % n)
+        cmd += [
+            "-chardev",
+            "file,id=uart%d,path=%s,mux=off" % (n, log_path),
+            "-serial", "chardev:uart%d" % n,
+        ]
+        click.echo("  Chiplet %d UART -> %s" % (n, log_path))
 
     if gdb:
         cmd += ["-s", "-S"]

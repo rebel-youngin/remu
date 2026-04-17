@@ -25,6 +25,7 @@
 #define TYPE_R100_QSPI_BRIDGE   "r100-qspi-bridge"
 #define TYPE_R100_RBC           "r100-rbc"
 #define TYPE_R100_DMA_PL330     "r100-dma-pl330"
+#define TYPE_R100_SMMU          "r100-smmu"
 #define TYPE_R100_UNIMPL        "r100-unimpl"
 
 #define R100_RBC_BLOCK_SIZE     0x80000ULL  /* 512KB per RBC block */
@@ -98,14 +99,21 @@ DECLARE_INSTANCE_CHECKER(R100SysregState, R100_SYSREG, TYPE_R100_SYSREG)
  * HBM3 controller stub
  * ======================================================================== */
 
-#define R100_HBM_REG_SIZE       0x10000
-#define R100_HBM_REG_COUNT      (R100_HBM_REG_SIZE / 4)
+/*
+ * HBM3 controller covers 16 memory channels at 0x40000 stride plus
+ * 16 PHY blocks at 0x10000 stride plus the ICON block, all in a
+ * contiguous 6MB window from 0x1FF7400000. See hbm3.h for the layout.
+ * The stub returns 0xFFFFFFFF for unwritten offsets (which satisfies
+ * dfi_init_complete and other "training ready" polls) and remembers
+ * individual writes in a sparse hash so ioctl-style RMW patterns work.
+ */
+#define R100_HBM_REG_SIZE       0x600000
 
 struct R100HBMState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
-    uint32_t regs[R100_HBM_REG_COUNT];
+    GHashTable *regs;     /* hwaddr -> uint32_t (sparse write-back store) */
     uint32_t chiplet_id;
 };
 
@@ -135,6 +143,31 @@ struct R100DMAPl330State {
 typedef struct R100DMAPl330State R100DMAPl330State;
 
 DECLARE_INSTANCE_CHECKER(R100DMAPl330State, R100_DMA_PL330, TYPE_R100_DMA_PL330)
+
+/* ========================================================================
+ * SMMU-600 TCU stub (Arm SMMU-v3 register block at TCU_OFFSET = 0x1FF4200000)
+ *
+ * BL2's smmu_early_init() programs the event queue / strtab / global
+ * bypass and enables event queues via CR0. Without an ack-mirror device
+ * it hangs on `while (!(cr0ack & EVENTQEN_MASK))`. We implement a tiny
+ * register file that mirrors CR0 into CR0ACK and auto-clears the GBPA
+ * UPDATE bit so the complete-poll exits.
+ * ======================================================================== */
+
+#define R100_SMMU_REG_SIZE      0x10000
+#define R100_SMMU_REG_COUNT     (R100_SMMU_REG_SIZE / 4)
+
+struct R100SMMUState {
+    SysBusDevice parent_obj;
+
+    MemoryRegion iomem;
+    uint32_t regs[R100_SMMU_REG_COUNT];
+    uint32_t chiplet_id;
+};
+
+typedef struct R100SMMUState R100SMMUState;
+
+DECLARE_INSTANCE_CHECKER(R100SMMUState, R100_SMMU, TYPE_R100_SMMU)
 
 /* ========================================================================
  * Unimplemented region (catch-all for unmapped config space reads)
