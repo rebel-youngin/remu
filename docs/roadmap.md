@@ -4,7 +4,7 @@
 
 **Goal**: TF-A BL1 → BL2 → BL31 → FreeRTOS boots on all 4 chiplets.
 
-**Status**: All 4 chiplets now complete BL2 through platform setup and reach the `BL2: Booting BL31` handoff. Each chiplet's CPUs see their own `0x1E00000000` private window via a dedicated QEMU memory view, so firmware reads of `SYSREG_SYSREMAP_PRIVATE+CHIPLET_ID_OFFSET` correctly return 0-3 and the `IS_PRIMARY_CHIPLET` branch is taken only on chiplet 0. Each chiplet prints to its own UART (chiplet 0 → stdio, 1-3 → `/tmp/remu_uartN.log`), making per-chiplet boot traces legible. Secondary chiplets are released by the primary's BL1 via QSPI-staged BL2 in iRAM + PMU `CPU_CONFIGURATION` write, start executing at the private-alias `0x1E00028000` entry point (no cross-chiplet offset added, so PC-relative ADRP symbol resolution in BL2 stays valid), synchronise HBM-init completion with chiplet 0 through shared mailbox RAM, and pass through `smmu_early_init()` thanks to an SMMU-600 TCU stub that mirrors `CR0` into `CR0ACK` and auto-clears the `GBPA[UPDATE]` poll bit. MMU enable (`xlat_tables_v2`) now completes cleanly on every chiplet. Next blocker is the BL2→BL31 handoff itself: `Entry point address = 0x0` is printed but no BL31 output follows — investigate whether BL31 was actually staged into DRAM and whether the next-image params propagate correctly through `bl2_plat_get_bl31_ep_info()`.
+**Status**: Chiplet 0 now executes BL1 → BL2 → BL31 through `bl31_main()` runtime-service init and prints `BL31: Preparing for EL3 exit to normal world` with `Entry point address = 0x200000, SPSR = 0x3c5` — the ERET into FreeRTOS EL1h. The last boot-path blocker was an UNDEF on the Samsung IMPDEF cache-flush SYS instruction `MSR S1_1_C15_C14_0, x0` that TF-A's `enable_mmu_direct_el3_bl31` (and `drivers/smmu/smmu.c`) issues right after turning on the EL3 MMU; `cortex-a72` doesn't model that encoding so BL31 trapped into `SynchronousExceptionSPx` and then nested-faulted in `plat_panic_handler` (SP_EL3 was 0). Fixed by registering the encoding as an `ARM_CP_NOP` cpreg on every CPU during `r100_soc_init()`. Each chiplet's CPUs see their own `0x1E00000000` private window via a dedicated QEMU memory view, so firmware reads of `SYSREG_SYSREMAP_PRIVATE+CHIPLET_ID_OFFSET` correctly return 0-3 and the `IS_PRIMARY_CHIPLET` branch is taken only on chiplet 0. Each chiplet prints to its own UART (chiplet 0 → stdio, 1-3 → `/tmp/remu_uartN.log`), making per-chiplet boot traces legible. Secondary chiplets are released by the primary's BL1 via QSPI-staged BL2 in iRAM + PMU `CPU_CONFIGURATION` write, start executing at the private-alias `0x1E00028000` entry point (no cross-chiplet offset added, so PC-relative ADRP symbol resolution in BL2 stays valid), synchronise HBM-init completion with chiplet 0 through shared mailbox RAM, and pass through `smmu_early_init()` thanks to an SMMU-600 TCU stub that mirrors `CR0` into `CR0ACK` and auto-clears the `GBPA[UPDATE]` poll bit. MMU enable (`xlat_tables_v2`) now completes cleanly on every chiplet. Next blocker: FreeRTOS (`q-sys`) doesn't produce output yet after BL31's `ERET` to `0x200000` — verify `freertos_cp0.bin` is the EL1 entry and that the BL31 runtime services / SPSR match what FreeRTOS expects.
 
 ### What's done
 
@@ -54,7 +54,20 @@ NOTICE:  BL2: Load CP1 BL31
 NOTICE:  BL2: Load CP1 FREERTOS
 NOTICE:  BL2: Backup flash images to Chiplet-0 DRAM
 NOTICE:  BL2: Booting BL31
-INFO:    Entry point address = 0x0     [BL31_BASE; next blocker — no BL31 output yet]
+INFO:    Entry point address = 0x0     [BL31_BASE]
+INFO:    SPSR = 0x3cd
+INFO:    BL31: Chiplet reset flag: 0x0 status: 0x0050
+INFO:    rebel_h: Preparing to jump to the next O/S
+NOTICE:  BL31: Chiplet-0 / Boot reason: Cold reset(POR)
+NOTICE:  BL31: v2.9.0(debug):v3.2.0-dev-272-...
+INFO:    GICv3 without legacy support detected.
+INFO:    ARM GICv3 driver initialized in EL3
+INFO:    Maximum SPI INTID supported: 255
+NOTICE:  BL31: multi chiplet detected, init TZPC for RBC
+INFO:    BL31: Initializing runtime services
+INFO:    BL31: Preparing for EL3 exit to normal world
+INFO:    Entry point address = 0x200000  [FreeRTOS; next blocker — no q-sys output yet]
+INFO:    SPSR = 0x3c5
 ```
 
 Chiplet N (N=1..3, `/tmp/remu_uartN.log`):
@@ -82,7 +95,8 @@ INFO:    Entry point address = 0x0
 - [x] Shared mailbox RAM for inter-chiplet HBM-init notifications so the primary's `wait_for_2nd_chiplet_hbm_init_done()` poll terminates
 - [x] SMMU-600 TCU stub so BL2's `smmu_early_init()` `CR0ACK` / `GBPA.UPDATE` polls terminate
 - [x] Fix PMU RVBAR translation that caused PC-relative ADRP corruption on secondary chiplets — don't add `chiplet_id * CHIPLET_OFFSET` to the entry; the per-chiplet CPU view already handles the routing. Without this, `BL_CODE_END - BL2_BASE` in `bl2_el3_plat_arch_setup` evaluated to `N * CHIPLET_OFFSET + 0xd000` and `mmap_add_region_check()` bailed out with `-ERANGE`
-- [ ] BL2 → BL31 handoff: all 4 chiplets print `BL2: Booting BL31` then `Entry point address = 0x0` (BL31_BASE) but no BL31 output follows — investigate whether BL31 is actually staged at DRAM[0] and whether the next-image params reach BL31 with `SCTLR_EL3 / SP_EL3` properly set
+- [x] BL2 → BL31 handoff: all 4 chiplets now execute BL31 past `enable_mmu_direct_el3_bl31`. The `ERET` from BL2 actually succeeded — BL31 was taking an `Unknown-reason` EL3 sync exception on the Samsung IMPDEF cache-flush instruction `MSR S1_1_C15_C14_0, x0` (encoded as `sys #1, C15, C14, #0`) that TF-A's `enable_mmu.S` issues right after enabling the EL3 MMU. `cortex-a72` doesn't model this IMPDEF encoding; `cortex-a73` (the R100 CP) does. Fixed by stubbing the SYS encoding as `ARM_CP_NOP` via `define_arm_cp_regs()` in `r100_soc_init()`
+- [ ] BL31 → FreeRTOS handoff: chiplet 0 BL31 prints `Entry point address = 0x200000, SPSR = 0x3c5` and `ERET`s to EL1, but no FreeRTOS banner follows. Verify `freertos_cp0.bin` is actually an EL1 image (not another TF-A image), that its reset vector at `0x200000` is sane, and check SCR_EL3 / GIC interrupt setup against what `q-sys` FreeRTOS expects. Likely needs a closer look at `bl31_plat_runtime_setup`/`bl31_plat_prepare_exit` and the FreeRTOS start-up assembly
 - [ ] Pre-load BL2/BL31/FreeRTOS to each secondary chiplet's iRAM/DRAM so BL1's cross-chiplet copy finds the data in place (alternatively: populate `flash.bin` with a real GPT image and let BL1 DMA-stage everything itself)
 - [ ] Build system: fix `sys/build.sh` path where `debug` COMMAND resets CLI flags, so `CHIPLET_COUNT=1` builds work (alternative to the DMA stub for single-chiplet boot)
 - [ ] Test GDB attach and multi-core debugging (`thread N` to switch vCPUs)

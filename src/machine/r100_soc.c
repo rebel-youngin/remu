@@ -29,8 +29,40 @@
 #include "sysemu/sysemu.h"
 #include "exec/address-spaces.h"
 #include "target/arm/cpu.h"
+#include "target/arm/cpregs.h"
 #include "qapi/qmp/qlist.h"
 #include "r100_soc.h"
+
+/*
+ * Samsung IMPDEF EL1/EL3 system instructions used by the R100 FW.
+ *
+ * The R100 CP is silicon-equivalent to Samsung Cortex-A73 (Exynos M-family
+ * parts). The cache-maintenance helpers in TF-A/BL31 and the SMMU driver
+ * flush L1/L2 via an IMPDEF SYS instruction encoded as
+ *   MSR S1_1_C15_C14_0, Xt        (op0=1, op1=1, CRn=15, CRm=14, op2=0)
+ * Refs:
+ *   external/.../tf-a/lib/xlat_tables_v2/aarch64/enable_mmu.S:156,161
+ *     (enable_mmu_direct_el3_bl31 cache invalidate pass after turning MMU on)
+ *   external/.../tf-a/drivers/smmu/smmu.c:834,838,845
+ *     (smmu_flush_all_cache / smmu_flush_l2_cache)
+ *
+ * QEMU's generic AArch64 decoder does not model this encoding, so the
+ * instruction UNDEFs at EL3. Without a handler, BL31 faults the first time
+ * it tries to invalidate caches right after enable_mmu_direct_el3_bl31 has
+ * turned on the EL3 MMU, and the CPU ends up trapped in the EL3 sync
+ * exception vector (a nested fault then manifests when the panic handler
+ * dereferences a zero SP_EL3).
+ *
+ * We model the register as a write-only NOP: the FW only ever writes to
+ * it, and the effect (cache flush) is a no-op on an emulator that does
+ * not model caches anyway.
+ */
+static const ARMCPRegInfo r100_samsung_impdef_regs[] = {
+    { .name = "S1_1_C15_C14_0_CACHE_INV",
+      .state = ARM_CP_STATE_AA64,
+      .opc0 = 1, .opc1 = 1, .crn = 15, .crm = 14, .opc2 = 0,
+      .access = PL1_W, .type = ARM_CP_NOP },
+};
 
 /*
  * Per-chiplet CMU block base addresses.
@@ -680,6 +712,9 @@ static void r100_soc_init(MachineState *machine)
         }
 
         qdev_realize(DEVICE(cpuobj), NULL, &error_fatal);
+
+        /* Install Samsung IMPDEF system-reg stubs (cache flush IMPDEF). */
+        define_arm_cp_regs(ARM_CPU(cpuobj), r100_samsung_impdef_regs);
     }
 
     /*
