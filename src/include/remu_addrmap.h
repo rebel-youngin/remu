@@ -156,6 +156,25 @@
 #define R100_DRAM_SYSREG_BASE       0x1FF7010000ULL
 #define R100_DRAM_CNTL_BASE         0x1FF7400000ULL
 
+/* --- QSPI NOR flash staging region ---
+ *
+ * The R100 board has a single serial-NOR flash connected via QSPI. The FW's
+ * flash_nor_read() driver memcpy's directly from (FLASH_BASE_ADDR + offset),
+ * so the flash must be visible to the CPU as plain memory. In silicon this
+ * is the DWC QSPI controller's memory-mapped "direct read" window; on each
+ * chiplet the same physical flash is visible at the same local address.
+ *
+ * Layout (see external/ssw-bundle/.../rebel_h_img_info.h):
+ *   0x00000 - 0x7FFFF : board/binning/HW-CFG/SW-CFG area (partition 0)
+ *   0x5E000           : NVMEM_FLASH_HW_CFG_ADDR (read by print_ucie_link_speed)
+ *   0x80000+          : GPT partition 1 (tboot_s, tboot_p0/p1, tboot_u/n, ...)
+ *
+ * A blank (zero-filled) flash is enough to unblock BL1: the hw-cfg magic-code
+ * check misses and the FW falls back to default UCIe speed.
+ */
+#define R100_FLASH_BASE             0x1F80000000ULL
+#define R100_FLASH_SIZE             0x0004000000ULL  /* 64 MB */
+
 /* --- PCIe block --- */
 #define R100_PCIE_INTMEM_BASE       0x1FF8000000ULL
 #define R100_PCIE_CMU_BASE          0x1FF8100000ULL

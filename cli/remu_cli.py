@@ -35,6 +35,10 @@ FW_IMAGES = [
     ("bl31_cp1.bin",      0x0014100000, "TF-A BL31 for CP1 (DRAM)"),
     ("freertos_cp0.bin",  0x0000200000, "FreeRTOS for CP0 (DRAM)"),
     ("freertos_cp1.bin",  0x0014200000, "FreeRTOS for CP1 (DRAM)"),
+    # Optional: raw NOR flash dump preloaded into the QSPI staging window.
+    # When absent the region is zero-filled, which is enough to progress past
+    # BL1 (HW-CFG magic-code check fails and UCIe falls back to default speed).
+    ("flash.bin",         0x1F80000000, "QSPI NOR flash dump (optional)"),
 ]
 
 

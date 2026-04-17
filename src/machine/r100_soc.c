@@ -285,6 +285,50 @@ static void r100_create_rbc_blocks(MemoryRegion *cfg_mr, int chiplet_id)
 }
 
 /*
+ * Create the QSPI NOR flash staging region.
+ *
+ * The R100 board has a single serial-NOR flash that every chiplet's QSPI
+ * controller sees at the same local address (FLASH_BASE_ADDR = 0x1F80000000).
+ * The FW's flash_nor_read() driver does a plain memcpy from that address
+ * (see external/q-sys/drivers/qspi_boot/rl_serial_flash.c:flash_nor_read),
+ * and BL1's print_ucie_link_speed() reads the HW-CFG struct at offset 0x5E000
+ * right after the UCIe images are DMA-staged.
+ *
+ * Without this region the first CPU-direct flash read faults into the
+ * unimplemented_device catch-all and stalls BL1. We model it as a single
+ * RAM backing store, aliased into each chiplet's local flash window so
+ * secondary chiplets see a coherent view.
+ *
+ * Zero-filled content is sufficient to progress past BL1: the magic-code
+ * check at offset 0x5E000 misses and print_ucie_link_speed() falls through
+ * to "UCIe speed: default". A real flash image can be preloaded by the CLI
+ * with a -device loader,file=...,addr=0x1F80000000.
+ */
+static void r100_create_flash(MemoryRegion *sysmem)
+{
+    MemoryRegion *flash = g_new(MemoryRegion, 1);
+    int chiplet_id;
+
+    memory_region_init_ram(flash, NULL, "r100.flash", R100_FLASH_SIZE,
+                           &error_fatal);
+    memory_region_add_subregion(sysmem, R100_FLASH_BASE, flash);
+
+    /* Alias the same flash at each secondary chiplet's local address so
+     * per-chiplet flash reads land on the same backing store. Chiplet 0 is
+     * already covered by the primary mapping above. */
+    for (chiplet_id = 1; chiplet_id < R100_NUM_CHIPLETS; chiplet_id++) {
+        MemoryRegion *alias = g_new(MemoryRegion, 1);
+        char name[64];
+        uint64_t base = (uint64_t)chiplet_id * R100_CHIPLET_OFFSET +
+                        R100_FLASH_BASE;
+
+        snprintf(name, sizeof(name), "r100.chiplet%d.flash_alias", chiplet_id);
+        memory_region_init_alias(alias, NULL, name, flash, 0, R100_FLASH_SIZE);
+        memory_region_add_subregion(sysmem, base, alias);
+    }
+}
+
+/*
  * Initialize a single chiplet: memory regions, CPUs, and peripheral stubs.
  */
 static void r100_chiplet_init(MachineState *machine, int chiplet_id,
@@ -523,6 +567,13 @@ static void r100_soc_init(MachineState *machine)
         sysbus_connect_irq(gicbusdev, cpu_idx + 3 * num_cpus,
                            qdev_get_gpio_in(cpudev, ARM_CPU_VFIQ));
     }
+
+    /* --- Shared QSPI NOR flash staging region ---
+     * Created once (not per-chiplet) since the physical flash is a single
+     * chip shared by every chiplet's QSPI controller. Aliased into each
+     * chiplet's local flash address inside r100_create_flash().
+     */
+    r100_create_flash(sysmem);
 
     /* --- Initialize all 4 chiplets --- */
     for (chiplet = 0; chiplet < R100_NUM_CHIPLETS; chiplet++) {

@@ -4,7 +4,7 @@
 
 **Goal**: TF-A BL1 → BL2 → BL31 → FreeRTOS boots on all 4 chiplets.
 
-**Status**: Real q-sys TF-A BL1 runs and prints boot log to UART. PL330 DMA stub unblocks the UCIe firmware load; boot proceeds through `load_and_enable_ucie_link_for_CP()` and into QSPI-bridged secondary-chiplet UCIe loads. Next stop is a read from the flash staging region (`0x1F8000000`), which is not yet modeled.
+**Status**: Real q-sys TF-A BL1 runs and prints boot log to UART. PL330 DMA stub unblocks the UCIe firmware load; boot proceeds through `load_and_enable_ucie_link_for_CP()` and into QSPI-bridged secondary-chiplet UCIe loads. The QSPI NOR flash staging region (`0x1F80000000`, 64 MB, zero-filled) is now modeled — HW-CFG lookup misses gracefully and BL1 falls through to "UCIe speed: default", then stages `tboot_n` and sets RVBAR for chiplets 1-3. Next blocker: secondary-chiplet CPU0 release (PMU `CPU_CONFIGURATION` write must map to QEMU `cpu_resume()`) and the flood of `r100-qspi: unknown instruction 0x83` operations once BL1 polls the secondary chiplets after reset release.
 
 ### What's done
 
@@ -21,6 +21,7 @@
 - Dual-mapped PMU and SYSREG devices at both config-space (`0x1FF0xxxxxx`) and private-alias (`0x1E00xxxxxx`) addresses via `memory_region_init_alias`
 - PCIe sub-controller stub (for `pmu_release_cm7` writes) and CSS600 CNTGEN stub (generic timer reset)
 - Chiplet-wide `unimplemented_device` fallbacks for config space and the 256MB private-alias window (OTP, RBC private aliases, etc.) — graceful handling of unmodeled registers
+- QSPI NOR flash staging region at `0x1F80000000` (64 MB RAM, shared and aliased into every chiplet's local flash window) — backs FW's direct `flash_nor_read()` memcpys and `nvmem_flash_hw_cfg_read()`; optional `images/flash.bin` preloaded via `-device loader`
 - CLI tool (`remu build`, `remu run`, `remu status`, `remu gdb`, `remu images`)
 - q-sys integration via `external/ssw-bundle`: submodules initialized, TF-A builds with CA73 errata + Spectre v4 workarounds disabled (see platform.mk)
 
@@ -35,15 +36,22 @@ NOTICE:  BL1: Chiplet reset flag: 0x0 status: 0x0010
 NOTICE:  BL1: Load tboot_p0
 INFO:    Release reset of CM7
 NOTICE:  BL1: pmu_release_cm7 complete
+NOTICE:  BL1: check QSPI bridge
+INFO:    BL1: QSPI bridge status check time 0, chiplet{1,2,3}
 NOTICE:  BL1: Load tboot_u
 NOTICE:  BL1: Detected secondary chiplet count: 3
-NOTICE:  BL1: ZEBU_CI: 0    [DMA stub unblocks; boot continues silently through RBC CMU + UCIe loads until a flash read at 0x1F8005E000]
+NOTICE:  BL1: ZEBU_CI: 0
+NOTICE:  UCIe speed: default           [flash HW-CFG magic miss → default]
+NOTICE:  BL1: Load tboot_n
+INFO:    Set RVBAR of chiplet: {1,2,3}, cluster: 0, cpu: 0, ep: 0x1E00028000
+NOTICE:  BL1: Release reset of CP0.cpu0 of chiplet-1   [hang — secondary cores not released]
 ```
 
 ### What remains
 
-- [ ] Back the flash staging region (`0x1F8000000` range) with a RAM model, and preload the UCIe PHY microcode + tboot images there so QSPI bridge load (`qspi_bridge_load_image`) and subsequent CPU reads of UCIe source data succeed
-- [ ] Pre-load BL2/BL31/FreeRTOS to each secondary chiplet's iRAM/DRAM so BL1's cross-chiplet copy finds the data in place
+- [x] Back the flash staging region (`0x1F80000000`, 64 MB) with a RAM model so `nvmem_flash_hw_cfg_read()` and `flash_nor_read()` memcpys succeed; optional `images/flash.bin` preload wired into the CLI
+- [ ] Extend the QSPI bridge instruction decoder — BL1 post-reset sequence emits `unknown instruction 0x83` in a tight loop on chiplets 1-3 after `Release reset of CP0.cpu0`
+- [ ] Pre-load BL2/BL31/FreeRTOS to each secondary chiplet's iRAM/DRAM so BL1's cross-chiplet copy finds the data in place (alternatively: populate `flash.bin` with a real GPT image and let BL1 DMA-stage everything itself)
 - [ ] Refine PMU for secondary core release — wire `CPU_CONFIGURATION` writes to QEMU `cpu_resume()` so chiplets 1-3 CPU0 actually start executing
 - [ ] Add per-chiplet UART instances (currently only chiplet 0 has UART mapped)
 - [ ] Build system: fix `sys/build.sh` path where `debug` COMMAND resets CLI flags, so `CHIPLET_COUNT=1` builds work (alternative to the DMA stub for single-chiplet boot)
