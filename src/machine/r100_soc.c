@@ -638,6 +638,17 @@ static void r100_chiplet_init(MachineState *machine, int chiplet_id,
  *      chiplet's own slice of system_memory at chiplet_base+0x1E00000000.
  *      Overlap priority 10 makes this take precedence over the base
  *      sysmem alias.
+ *   3. Overlays a chiplet-local view of SYSREG_CP0 at the config-space
+ *      address 0x1FF1010000. BL31's rebel_h_pm.c:set_rvbar() writes the
+ *      warm-boot entry for a PSCI CPU_ON target via this config-space
+ *      address (not via the private alias that BL1's QSPI path uses),
+ *      so without a chiplet-local route those writes land in the
+ *      unimplemented-device catch-all. The r100-pmu device reads the
+ *      RVBAR back from the private-alias copy when a CPU_CONFIGURATION
+ *      write releases the core; aliasing both addresses to the same
+ *      backing RAM keeps the two paths coherent and matches silicon,
+ *      where each chiplet's SYSREG_CP0 is decoded locally at the global
+ *      config address.
  *
  * The CPU "memory" link is set to this view, so its TLB walks hit the
  * chiplet-local overlay. Same pattern as hw/arm/xlnx-versal.c giving
@@ -650,6 +661,7 @@ static MemoryRegion *r100_build_chiplet_view(MemoryRegion *sysmem,
     MemoryRegion *view = g_new(MemoryRegion, 1);
     MemoryRegion *sysmem_alias = g_new(MemoryRegion, 1);
     MemoryRegion *priv_alias = g_new(MemoryRegion, 1);
+    MemoryRegion *cp0_cfg_alias = g_new(MemoryRegion, 1);
     char name[64];
 
     snprintf(name, sizeof(name), "r100.chiplet%d.cpu_view", chiplet_id);
@@ -665,6 +677,21 @@ static MemoryRegion *r100_build_chiplet_view(MemoryRegion *sysmem,
                              R100_PRIVATE_WIN_SIZE);
     memory_region_add_subregion_overlap(view, R100_PRIVATE_WIN_BASE,
                                         priv_alias, 10);
+
+    /*
+     * Chiplet-local alias of SYSREG_CP0 at its config-space address.
+     * The target RAM is created by r100_chiplet_init() at the chiplet's
+     * private-alias base (chiplet_base + R100_SYSREG_CP0_PRIVATE_BASE);
+     * memory_region_init_alias resolves the sysmem view lazily so
+     * order-of-init doesn't matter.
+     */
+    snprintf(name, sizeof(name), "r100.chiplet%d.sysreg_cp0_cfg_view",
+             chiplet_id);
+    memory_region_init_alias(cp0_cfg_alias, NULL, name, sysmem,
+                             chiplet_base + R100_SYSREG_CP0_PRIVATE_BASE,
+                             R100_SYSREG_CP0_SIZE);
+    memory_region_add_subregion_overlap(view, R100_CP0_SYSREG_BASE,
+                                        cp0_cfg_alias, 10);
 
     return view;
 }

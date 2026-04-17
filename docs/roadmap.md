@@ -4,7 +4,7 @@
 
 **Goal**: TF-A BL1 → BL2 → BL31 → FreeRTOS boots on all 4 chiplets.
 
-**Status**: Chiplet 0 now executes BL1 → BL2 → BL31 → FreeRTOS EL1 and drives the first few `q-sys` `driver_init()` stages (`pvt_init` at level 5 is the last one confirmed; the UCIe/RBC `TimeoutWindow` programming runs after it). The last boot-path blocker was an UNDEF on the Samsung IMPDEF cache-flush SYS instruction `MSR S1_1_C15_C14_0, x0` that TF-A's `enable_mmu_direct_el3_bl31` (and `drivers/smmu/smmu.c`) issues right after turning on the EL3 MMU; `cortex-a72` doesn't model that encoding so BL31 trapped into `SynchronousExceptionSPx` and then nested-faulted in `plat_panic_handler` (SP_EL3 was 0). Fixed by registering the encoding as an `ARM_CP_NOP` cpreg on every CPU during `r100_soc_init()`. Each chiplet's CPUs see their own `0x1E00000000` private window via a dedicated QEMU memory view, so firmware reads of `SYSREG_SYSREMAP_PRIVATE+CHIPLET_ID_OFFSET` correctly return 0-3 and the `IS_PRIMARY_CHIPLET` branch is taken only on chiplet 0. Each chiplet prints to its own UART (chiplet 0 → stdio, 1-3 → `/tmp/remu_uartN.log`), making per-chiplet boot traces legible. Secondary chiplets are released by the primary's BL1 via QSPI-staged BL2 in iRAM + PMU `CPU_CONFIGURATION` write, start executing at the private-alias `0x1E00028000` entry point (no cross-chiplet offset added, so PC-relative ADRP symbol resolution in BL2 stays valid), synchronise HBM-init completion with chiplet 0 through shared mailbox RAM, and pass through `smmu_early_init()` thanks to an SMMU-600 TCU stub that mirrors `CR0` into `CR0ACK` and auto-clears the `GBPA[UPDATE]` poll bit. After `ERET` into FreeRTOS at `0x200000`, the kernel initially hung in `pvt_init`'s `PVT_ENABLE_PROC_CONTROLLER` macro (`while (!ps_con_idle) ;` against an unmodelled `ROT_PVT_CON`); fixed by adding a 5-instance-per-chiplet PVT stub (`r100_pvt.c`) that returns the reset value `0x3` on `PVT_CON_STATUS` reads and `0x1` on per-sensor `_valid` reads. FreeRTOS logs (`[smmu] Failed to sync`, UCIe `CL0_V10/V11/H00/H01 TimeoutWindow req=...`) accumulate in the HILS ring buffer at `0x10000000` and are now drained live onto `/tmp/remu_hils.log` by the `r100-logbuf-tail` device — independent of the in-FW `terminal_task` (which still can't run because the scheduler is blocked behind the next item). Next blockers: (1) `init_smp()` spins waiting for secondary CPUs to flip their per-core "up" flag — FreeRTOS's `psci_cpu_on()` reaches BL31's SMC handler (which prints `cpuid: 1, cpu_on requested`), the target CPU starts at `0x1E00010000` (BL1 reset vector) but never routes through BL31's `psci_entrypoint`/warm-boot path into `secondary_prep_c`; (2) The SMMU stub doesn't ack command-queue `CMD_SYNC`, so the "Failed to sync" warning is FreeRTOS's own fallback path — extend the SMMU stub to auto-advance `SMMU_CMDQ_CONS` on each write and signal completion.
+**Status**: Chiplet 0 now reaches FreeRTOS's `terminal_task` shell (`REBELLIONS$ ` prompt) with all four CP0 cores online. After BL1 → BL2 → BL31 → FreeRTOS EL1, `init_smp()` issues `psci_cpu_on()` for cores 1-3; BL31 services the SMC, each secondary CPU boots into BL31's warm-boot entry and `ERET`s to `secondary_prep_c` at EL1, flips its "up" flag, and prints `core N is online`. FreeRTOS then completes `hw_init: done`, registers the CP interface, configures thermal thresholds, registers post-processing tasks, and presents the shell prompt. The PSCI fix was a memory-model gap rather than a PMU-logic change: BL31's `rebel_h_pm.c:set_rvbar()` writes the warm-boot entry to the SYSREG_CP0 **config-space** address (`0x1FF1010000 + RVBARADDR0_LOW + cpuid*8`), but REMU previously only mounted SYSREG_CP0 at the chiplet-local **private-alias** address (`0x1E01010000`), so those writes vanished into the unimplemented-device catch-all and `r100_pmu_read_rvbar()` read back 0, causing us to skip `arm_set_cpu_on()`. Fixed by overlaying a chiplet-local alias of the private-alias SYSREG_CP0 RAM at the config-space address inside each chiplet's CPU view — matching silicon, where each chiplet's decoder routes `0x1FF1010000` to its own SYSREG_CP0 instance. The earlier blockers are unchanged: per-chiplet CPU memory views so each chiplet reads its own `CHIPLET_ID` via the 256 MB `0x1E00000000` private window; per-chiplet UARTs so boot traces are legible; the Samsung IMPDEF `MSR S1_1_C15_C14_0, x0` cache-flush stubbed as `ARM_CP_NOP` (otherwise BL31 UNDEFs right after `enable_mmu_direct_el3_bl31`); secondary chiplets released via QSPI-staged BL2 + PMU `CPU_CONFIGURATION`, starting at the private-alias `0x1E00028000` entry so PC-relative ADRP stays valid; shared mailbox RAM for inter-chiplet HBM-init; SMMU-600 TCU stub for BL2's `smmu_early_init()` (CR0/CR0ACK mirror + GBPA.UPDATE auto-clear); 5-instance-per-chiplet PVT stub so `pvt_init()`'s `PVT_ENABLE_{PROC,VOLT,TEMP}_CONTROLLER` idle-polls exit; HILS ring tail (`r100-logbuf-tail`) drains `RLOG_*/FLOG_*` entries from the 2 MB `.logbuf` ring at `0x10000000` onto its own chardev. Next blocker: the SMMU stub doesn't ack command-queue `CMD_SYNC`, so FreeRTOS's EL1 SMMU driver loops on `[smmu] Failed to sync` (visible in the HILS log). Extend `r100_smmu.c` to auto-advance `SMMU_CMDQ_CONS` to match `SMMU_CMDQ_PROD` on each producer-side write and mark the sync complete.
 
 ### What's done
 
@@ -18,8 +18,9 @@
 - SYSREG stub: per-chiplet ID (0-3) via SYSREMAP registers
 - HBM3 stub: training-complete status
 - QSPI bridge: Designware SSI protocol, cross-chiplet register access; supports 1-word read (`0x70`), 1-word write (`0x80`), and 16-word burst write (`0x83`) — the last used by BL1 `qspi_bridge_load_image()` to stage `tboot_n` into secondary chiplets' iRAM. Latches the upper-address write (`DW_SPI_SYSREG_ADDRESS`, 24-bit field `0x0C4058`) into `s->upper_addr`; subsequent reads/writes rebuild the 28-bit offset into the slave chiplet's `PRIVATE_BASE` window (`addr & 0x0FFFFFFF`) so RBC accesses above the 64 MB 26-bit window reach the right block
-- Per-chiplet SYSREG_CP0 RAM region (64 KB at private-alias `0x1E01010000`) backing BL1's `plat_set_cpu_rvbar()` writes; the PMU reads RVBARADDR0_LOW/HIGH back when a CPU release is triggered
-- PMU secondary core release: `CPU_CONFIGURATION` writes decode cluster/cpu, update `CPU_STATUS`, and call `arm_set_cpu_on(mpidr, entry)` with the unmodified `PRIVATE_BASE`-relative RVBAR; the chiplet's CPU view redirects `0x1E00028000` to that chiplet's own iRAM, so PC stays in the private-alias range and ADRP-based linker-symbol resolution remains correct
+- Per-chiplet SYSREG_CP0 RAM region (64 KB) backing BL1's `plat_set_cpu_rvbar()` writes **and** BL31's `rebel_h_pm.c:set_rvbar()` writes. Mounted at two addresses within each chiplet's CPU view: private-alias `0x1E01010000` (QSPI-driven BL1 path) and config-space `0x1FF1010000` (BL31's direct on-CPU path for PSCI CPU_ON). The config-space address is added as an overlay in `r100_build_chiplet_view()` pointing to the same backing RAM, mirroring the chiplet-local decoder used on silicon. The PMU reads RVBARADDR0_LOW/HIGH back from the private-alias copy when a CPU release is triggered — both paths converge on the same storage
+- PMU secondary core release (PSCI path): FreeRTOS's `init_smp()` → `psci_cpu_on(mpidr, secondary_prep_c)` → BL31 `rebel_h_pwr_domain_on()` → `set_rvbar(cpuid, bl31_warm_entrypoint)` (writes to SYSREG_CP0 config-space; now reaches the chiplet's SYSREG_CP0 RAM via the CPU-view overlay) + `pmu_cpu_on(cpuid)` (writes `CPU_ON_WITH_INITIATE_WAKEUP` to PMU `CPU_CONFIGURATION`). The PMU write handler decodes cluster/cpu, mirrors `CPU_STATUS` so BL31's post-write poll exits, reads back the just-written RVBAR, and calls `arm_set_cpu_on(mpidr, bl31_warm_entrypoint, target_el=3)`. The secondary CPU starts at EL3 inside BL31's warm-boot trampoline, restores context, and `ERET`s to `secondary_prep_c` at EL1. All 4 CP0 cores on chiplet 0 come online; `init_smp()` completes
+- PMU cold-boot release (BL1 path): `CPU_CONFIGURATION` writes for the initial BL2 hand-off decode cluster/cpu, update `CPU_STATUS`, and call `arm_set_cpu_on(mpidr, entry)` with the unmodified `PRIVATE_BASE`-relative RVBAR (`0x1E00028000`); the chiplet's CPU view redirects that PC to the chiplet's own iRAM, so ADRP-based linker-symbol resolution remains correct
 - PMU D-Cluster power-state mirror: writes to `DCL{0,1}_CONFIGURATION` are reflected into `DCL{0,1}_STATUS` synchronously so BL2's `pmu_reset_dcluster()` poll on `DCL_STATUS_MASK` completes
 - SMMU-600 TCU stub (`r100_smmu.c`) at `0x1FF4200000`: mirrors `SMMU_CR0` writes into `SMMU_CR0ACK` (masked), and auto-clears the `UPDATE` bit on `SMMU_GBPA` writes so BL2's `smmu_early_init()` `while (!(cr0ack & EVENTQEN))` / `while (gbpa & UPDATE)` polls terminate
 - PVT monitor stubs (`r100_pvt.c`), 5 instances per chiplet (ROT, DCL0_PVT0/1, DCL1_PVT0/1) at their silicon base addresses (`0x1FF0260000`, `0x1FF2120000`, etc.). Returns reset value `0x3` on `PVT_CON_STATUS` (+0x1C) reads so FreeRTOS's `PVT_ENABLE_{PROC,VOLT,TEMP}_CONTROLLER` idle-polls exit on the first iteration; returns `1` on per-sensor `ps_valid/vs_valid/ts_valid` status reads (offsets `0x400+r*0x40+0x0C`, `0x800+r*0x80+0x40`, `0x2800+r*0x40+0x0C`) so `PVT_WAIT_UNTIL_VALID` doesn't burn 10 k cycles per sensor. All other reads/writes fall through to a 64 KB read-write-back register file
@@ -68,8 +69,21 @@ INFO:    Maximum SPI INTID supported: 255
 NOTICE:  BL31: multi chiplet detected, init TZPC for RBC
 INFO:    BL31: Initializing runtime services
 INFO:    BL31: Preparing for EL3 exit to normal world
-INFO:    Entry point address = 0x200000  [FreeRTOS; next blocker — no q-sys output yet]
+INFO:    Entry point address = 0x200000  [FreeRTOS EL1 entry]
 INFO:    SPSR = 0x3c5
+core 1 is up                  [FreeRTOS secondary_prep_c on CPU 1]
+INFO:    cpuid: 1, cpu_on requested
+core 1 is online
+core 2 is up
+INFO:    cpuid: 2, cpu_on requested
+core 2 is online
+core 3 is up
+INFO:    cpuid: 3, cpu_on requested
+core 3 is online
+
+Hello world FreeRTOS_CP
+hw_init: done
+REBELLIONS$                   [terminal_task shell prompt; SMMU CMD_SYNC is the next blocker]
 ```
 
 Chiplet N (N=1..3, `/tmp/remu_uartN.log`):
@@ -89,13 +103,20 @@ INFO:    Entry point address = 0x0
 HILS ring tail (chiplet 0 `.logbuf` drain, `/tmp/remu_hils.log`):
 
 ```
-[HILS 1418670490 cpu=0 ERR     func=255] [smmu] Failed to sync
-[HILS 1419404308 cpu=0 ERR     func=255] [smmu] Failed to sync
+[HILS 1437856628 cpu=0 ERR     func=255] [smmu] Failed to sync        [next blocker]
 ...
-[HILS 3626711927 cpu=0 INFO    func=255] [CL0_V10 (C0S0)] TimeoutWindow req=50000000 ns prog=50069504 ns (tick=190 window=65535 rbcm_clk=250
-[HILS 3627009710 cpu=0 INFO    func=255] [CL0_V11 (C0S1)] TimeoutWindow req=50000000 ns prog=50069504 ns (...
-[HILS 3627109506 cpu=0 INFO    func=255] [CL0_H00 (C0E0)] TimeoutWindow req=50000000 ns prog=50069504 ns (...
-[HILS 3627211772 cpu=0 INFO    func=255] [CL0_H01 (C0E1)] TimeoutWindow req=50000000 ns prog=50069504 ns (...
+[HILS 3781785235 cpu=0 INFO    func=255] [CL0_V10 (C0S0)] TimeoutWindow req=50000000 ns prog=50069504 ns (tick=190 window=65535 rbcm_clk=250
+[HILS 3782091158 cpu=0 INFO    func=255] [CL0_V11 (C0S1)] TimeoutWindow req=50000000 ns prog=50069504 ns (...
+[HILS 3782185759 cpu=0 INFO    func=255] [CL0_H00 (C0E0)] TimeoutWindow req=50000000 ns prog=50069504 ns (...
+[HILS 3782260205 cpu=0 INFO    func=255] [CL0_H01 (C0E1)] TimeoutWindow req=50000000 ns prog=50069504 ns (...
+[HILS 3815956830 cpu=0 DBG     func=255] chiplet count is 4
+[HILS 3816124457 cpu=0 INFO    func=255] chiplet id 0
+[HILS 3816523357 cpu=0 DBG     func=255] cp interface is registered
+[HILS 3816868665 cpu=0 INFO    func=255] ATS is disabled by capability
+[HILS 3816900241 cpu=0 DBG     func=255] sw_init: done
+[HILS 3829837318 cpu=0 INFO    func=255] Thermal thresholds configured: Exit=75°C, T0=92°C, T1=102°C, Cat=112°C
+[HILS 3844762407 cpu=0 DBG     func=255] register postproc task id 3
+[HILS 3853264575 cpu=0 INFO    func=255] failed to restore pcie event log
 ```
 
 ### What remains
@@ -113,7 +134,7 @@ HILS ring tail (chiplet 0 `.logbuf` drain, `/tmp/remu_hils.log`):
 - [x] BL31 → FreeRTOS handoff: the `ERET` into EL1h at `0x200000` was correct all along — FreeRTOS just doesn't emit anything to the UART on its own. Its `printf_` impl buffers to a RAM ring at `0x10000000` (HILS logbuf) and a later task flushes it to the DW-APB UART. Confirmed by GDB breakpoint at `0x200000` (CPU0 hits it with CPSR=0x3c5) and by reading `[smmu] Failed to sync` ASCII out of `0x10000000` via QMP `xp`
 - [x] PVT monitor stub (`r100_pvt.c`): FreeRTOS's `driver_init` level-5 `pvt_init()` calls `PVT_ENABLE_{PROC,VOLT,TEMP}_CONTROLLER` which does `while (!PVT_IS_*_CON_IDLE(regs)) ;`, polling `PVT_CON_STATUS` (+0x1C, reset value `0x3`) and the per-sensor `_valid` status bits. Without a stub the poll runs forever because unmapped MMIO returns 0. The stub returns `0x3` for `PVT_CON_STATUS` and `1` for sensor-validity reads, lets everything else fall through to a RAM-backed register file. Mounted at the 5 instance bases (`ROT_PVT_CON_BASE` + the 4 DCL PVT bases) on every chiplet
 - [x] FreeRTOS UART routing — HILS ring tail: `r100-logbuf-tail` (`src/machine/r100_logbuf.c`) polls chiplet 0's 2 MB `.logbuf` ring at physical `0x10000000` on a 50 ms QEMU virtual-clock timer and drains newly-populated `struct rl_log` entries (`tick`, `type`, `cpu`, `func_id`, `task[16]`, `logstr[100]` @ 128 B stride, `RL_LOG_ENTRY_CNT=16384`) onto a dedicated chardev. The CLI wires the 5th `-serial` slot (`serial_hd(4)`) to `/tmp/remu_hils.log` by default (override with `--hils-log PATH` or `--hils-log stderr`). Confirmed surfacing FreeRTOS `[smmu] Failed to sync` retries and UCIe `CL0_V10/V11/H00/H01 (Cnn) TimeoutWindow req=... prog=...` INFO messages during boot, independent of the in-FW `terminal_task` drain (which still can't run because of the next item). `printf_`-based output (e.g. `core 1 is up`) continues to reach the chiplet's 16550 UART directly via `uart_putc` → `serial-mm`, so no DW-APB register model is required for Phase 1 visibility; option (b) — a full DW-APB UART register file at `PERI0_UART0_BASE` — remains a nice-to-have for interrupt-driven `uart_isr` / `uart_rx` parity
-- [ ] PSCI CPU_ON warm-boot path: FreeRTOS's `init_smp()` issues `psci_cpu_on(mpidr=1, entry_point=secondary_prep_c)` via SMC, BL31 logs `cpuid: 1, cpu_on requested`, but the secondary CPU starts at `0x1E00010000` (BL1 reset vector) instead of being routed through BL31's `psci_entrypoint` into the warm-boot code that restores EL state and jumps to `secondary_prep_c`. The QEMU `arm_set_cpu_on()` path needs the right entry address; revisit `r100_pmu.c:r100_pmu_cpu_on()` to use the PSCI-stored warm-boot entry instead of the BL1-era RVBAR, or add a tiny warm-boot trampoline to BL31's `bl31_warm_entrypoint` in iRAM
+- [x] PSCI CPU_ON warm-boot path: the PMU's RVBAR read path was correct, but BL31's `rebel_h_pm.c:set_rvbar()` writes to the SYSREG_CP0 **config-space** address `0x1FF1010000 + RVBARADDR0_LOW + cpuid*8`, not the private-alias `0x1E01010000` that BL1's QSPI path uses. That address wasn't mounted, so the writes disappeared and `r100_pmu_read_rvbar()` read back 0. Fixed in `r100_build_chiplet_view()` by overlaying the chiplet's private-alias SYSREG_CP0 RAM at `R100_CP0_SYSREG_BASE` within each chiplet's CPU view — mirrors silicon's chiplet-local config-space decoder and keeps both write paths coherent. All 4 CP0 cores on chiplet 0 now come online; FreeRTOS reaches the `REBELLIONS$ ` shell prompt
 - [ ] SMMU command-queue `CMD_SYNC` acknowledgement: FreeRTOS's SMMU driver at EL1 issues command-queue inserts + `CMD_SYNC` and currently loops to `[smmu] Failed to sync` repeatedly. Extend `r100_smmu.c` to auto-advance `SMMU_CMDQ_CONS` to match `SMMU_CMDQ_PROD` on every producer-write and mark the CMDQ_SYNC_STATUS as complete
 - [ ] Pre-load BL2/BL31/FreeRTOS to each secondary chiplet's iRAM/DRAM so BL1's cross-chiplet copy finds the data in place (alternatively: populate `flash.bin` with a real GPT image and let BL1 DMA-stage everything itself)
 - [ ] Build system: fix `sys/build.sh` path where `debug` COMMAND resets CLI flags, so `CHIPLET_COUNT=1` builds work (alternative to the DMA stub for single-chiplet boot)
@@ -163,7 +184,7 @@ HILS ring tail (chiplet 0 `.logbuf` drain, `/tmp/remu_hils.log`):
 |------------|---------|---------|---------|
 | CMU (20 blocks x4) | PLL-lock stub | Same | Same |
 | PMU (x4) | Boot-status + RBC/boot-mode defaults + CPU_CONFIGURATION → `arm_set_cpu_on/off` (RVBAR routed via private-alias view) + DCL status mirror | Full register bank | Same |
-| SYSREG_CP0 (x4) | RAM (RVBAR capture) | Add CP1 + TZPC enforcement | Same |
+| SYSREG_CP0 (x4) | RAM (RVBAR capture) — dual-mounted at private-alias `0x1E01010000` (BL1/QSPI) and config-space `0x1FF1010000` (BL31/PSCI `set_rvbar`) via per-chiplet CPU-view overlay | Add CP1 + TZPC enforcement | Same |
 | GIC600 | QEMU built-in | Same | Same |
 | UART | Per-chiplet 16550 (serial-mm) on dedicated chardevs + HILS ring tail (polls chiplet 0 `.logbuf` at 0x10000000, drains RLOG_*/FLOG_* to own chardev) | Same | Same |
 | Timer | QEMU built-in + CSS600_CNTGEN stub | Same | Same |
