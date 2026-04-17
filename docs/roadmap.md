@@ -2,9 +2,9 @@
 
 ## Phase 1: FW Boot (current)
 
-**Goal**: TF-A BL1 → BL2 → BL31 → FreeRTOS boots on all 4 chiplets.
+**Goal**: TF-A BL1 → BL2 → BL31 → FreeRTOS boots on all 4 chiplets, with **both** CP0 and CP1 clusters online on every chiplet.
 
-**Status**: Chiplet 0 reaches FreeRTOS's `terminal_task` shell (`REBELLIONS$`) with all four CP0 cores online. BL1 → BL2 → BL31 → FreeRTOS completes; `init_smp()` issues `psci_cpu_on()` for cores 1-3, each secondary CPU lands on BL31's warm-boot entry and `ERET`s to `secondary_prep_c` at EL1; `hw_init: done`. The HILS ring shows zero `[smmu] Failed to sync` retries and no post-prompt `spi tx available timeout error`. Secondary chiplets boot through BL2 but pause at BL31 entry because their BL31/FreeRTOS images aren't pre-loaded (see "What remains").
+**Status**: Chiplet 0's CP0 cluster reaches FreeRTOS's `terminal_task` shell (`REBELLIONS$`) with all four CP0 cores online. BL1 → BL2 → BL31 → FreeRTOS completes; `init_smp()` issues `psci_cpu_on()` for cores 1-3, each secondary CPU lands on BL31's warm-boot entry and `ERET`s to `secondary_prep_c` at EL1; `hw_init: done`. The HILS ring shows zero `[smmu] Failed to sync` retries and no post-prompt `spi tx available timeout error`. Secondary chiplets boot through BL2 but pause at BL31 entry because their BL31/FreeRTOS images aren't pre-loaded. CP1 clusters (16 of the 32 vCPUs: 4 cores × 4 chiplets) stay powered off — the FW is built with `-p zebu_ci` so BL2 prints `ZEBU_CI: skip CP1 reset release` and never hits the CP1 release path (see "CP1 boot — remaining work" below).
 
 ### Device models (`src/machine/`)
 
@@ -62,19 +62,43 @@ Chiplets 1-3 (`/tmp/remu_uart{1,2,3}.log`) reach `BL2: Booting BL31` and stop at
 
 HILS ring tail (`/tmp/remu_hils.log`) surfaces UCIe `TimeoutWindow` programming, chiplet count / ID registration, `cp interface is registered`, `Thermal thresholds configured`, post-proc task registration. Zero `[smmu] Failed to sync` entries (previously 12+ per boot). A single non-fatal `failed to restore pcie event log` remains (empty flash on first boot).
 
-### What remains
+### CP1 boot — remaining work
 
-- [ ] Pre-load BL2/BL31/FreeRTOS into each secondary chiplet's iRAM/DRAM so BL1's cross-chiplet copy lands on real data (alternative: populate `flash.bin` with a GPT image and let BL1 DMA-stage from flash).
+Each chiplet has two independent clusters (CP0 and CP1), each running its own BL31 + FreeRTOS. On silicon, BL2 on each chiplet's CP0.cpu0 releases that chiplet's CP1.cpu0 via three MMIO writes (`rebel_h_bl2_setup.c:865-871`, guarded by `#ifndef ZEBU_CI`):
+
+```c
+plat_set_cpu_rvbar(CHIPLET_ID, CLUSTER_CP1, CPU0, GPT_DEST_ADDR_BL31_CP1);  /* 0x14100000 */
+plat_pmu_cl_on(CHIPLET_ID, CLUSTER_CP1);                                    /* CPUSEQ + NONCPU_CONFIG + L2_CONFIG + status polls */
+plat_pmu_cpu_on(CHIPLET_ID, CLUSTER_CP1, CPU0);                             /* CPU0_CONFIG + PERCLUSTER_OFFSET*1 */
+```
+
+CP1.cpu0 then boots `bl31_cp1.bin` → `freertos_cp1.bin`, which runs its own `init_smp()` issuing PSCI CPU_ON SMCs to *its own* BL31_CP1 for CP1.cpu{1,2,3} — same mechanism CP0 uses, just landing at `CPU0_CONFIGURATION + PERCLUSTER_OFFSET*1 + PERCPU_OFFSET*cpuid`. Under `__TARGET_CP=1`, `rebel_h_pm.c:set_rvbar()` writes `SYSREG_CP1_OFFSET` (`0x1FF1810000` = `SYSREG_CP0_OFFSET + PER_SYSREG_CP*1`) instead of `SYSREG_CP0_OFFSET`.
+
+To bring CP1 up in REMU (blocker for Phase 2):
+
+- [ ] **FW build**: either switch `-p zebu_ci` → `-p zebu`/`-p silicon` and stub any extra hardware-training loops those paths hit, or locally drop the `#ifndef ZEBU_CI` guard around the CP1 release block in `rebel_h_bl2_setup.c` so we can keep using the zebu_ci image set.
+- [ ] **Images**: ship `bl31_cp1.bin` + `freertos_cp1.bin` (already listed as `[--]` in `remu status`), wire them into the CLI as `-device loader,file=bl31_cp1.bin,addr=0x14100000` + `...,addr=0x14200000` — replicated at `chiplet * CHIPLET_OFFSET + base` for secondaries.
+- [ ] **SYSREG_CP1 RAM** (`src/machine/r100_soc.c`): mount a 64 KB region per chiplet at `chiplet_base + 0x1E01810000` (private alias) and overlay the config-space address `chiplet_base + 0x1FF1810000` in each chiplet's CPU view — one-liner following the existing SYSREG_CP0 template so CP1 RVBAR writes land on readable RAM.
+- [ ] **PMU** (`src/machine/r100_pmu.c`): drop the `if (cluster != 0) return 0` short-circuit in `r100_pmu_read_rvbar()` and compute `base = SYSREG_CP0_PRIVATE + cluster * PER_SYSREG_CP`. The existing `r100_pmu_handle_cpu_config()` decoder already computes MPIDR `(chiplet<<16)|(cluster<<8)|cpu` for cluster ∈ {0,1} and calls `arm_set_cpu_on()` — it just needs a non-zero RVBAR to return.
+
+Cluster-level `CP0_NONCPU_CONFIGURATION` / `CP0_L2_CONFIGURATION` writes don't need a write-through mirror: `r100_pmu_set_defaults()` already pre-seeds both status registers to ON at reset, so BL2's `plat_pmu_cl_on` polls pass on the first iteration.
+
+### Other remaining items
+
+- [ ] Pre-load BL2/BL31/FreeRTOS (both CP0 and CP1) into each secondary chiplet's iRAM/DRAM so BL1's cross-chiplet copy lands on real data (alternative: populate `flash.bin` with a GPT image and let BL1 DMA-stage from flash).
 - [ ] Fix `sys/build.sh` where `debug` command resets CLI flags, so `CHIPLET_COUNT=1` builds work.
-- [ ] Test GDB attach and multi-core debugging (`thread N` across all 32 vCPUs).
+- [ ] Test GDB attach and multi-core debugging (`thread N` across all 32 vCPUs, including CP1 halves).
 
 ### Success criteria
 
-- All 4 chiplets print FreeRTOS startup banner on their UART
+- All 4 chiplets print FreeRTOS startup banner on their UART (both CP0 and CP1 `Hello world FreeRTOS_CP`)
 - Chiplet 0 discovers 3 secondary chiplets via QSPI bridge ✓
-- GDB can step through FW code on any chiplet's vCPU
+- All 32 vCPUs (4 chiplets × 2 clusters × 4 cores) reach the FreeRTOS shell or its equivalent on their respective cluster
+- GDB can step through FW code on any chiplet's CP0 or CP1 vCPU
 
 ## Phase 2: Host Drivers
+
+**Prerequisite**: Phase 1 complete — including the CP1 cluster release on every chiplet (see "CP1 boot — remaining work" above). `q-cp` tasks on CP1 service a non-trivial slice of the host-facing FW interface, so opening the PCIe endpoint without CP1 online would hit missing task-registration paths.
 
 **Goal**: kmd loads in an x86_64 QEMU guest, probes virtual PCI device, handshakes with FW, umd opens device.
 
@@ -111,8 +135,9 @@ HILS ring tail (`/tmp/remu_hils.log`) surfaces UCIe `TimeoutWindow` programming,
 | Peripheral | Phase 1 | Phase 2 | Phase 3 |
 |------------|---------|---------|---------|
 | CMU (20 blocks x4) | PLL-lock stub | Same | Same |
-| PMU (x4) | Boot-status + `CPU_CONFIGURATION` → `arm_set_cpu_on/off` (covers BL1 cold + BL31 PSCI warm); DCL status mirror | Full register bank | Same |
-| SYSREG_CP0 (x4) | RAM (RVBAR), dual-mounted at private-alias + config-space via per-chiplet CPU view | Add CP1 + TZPC enforcement | Same |
+| PMU (x4) | Boot-status + `CPU_CONFIGURATION` → `arm_set_cpu_on/off` for CP0 only today (BL1 cold + BL31 PSCI warm); DCL status mirror. Phase 1 completion requires dropping the `r100_pmu_read_rvbar()` `cluster!=0` short-circuit so CP1 release fans out the same way | TZPC enforcement | Same |
+| SYSREG_CP0 (x4) | RAM (RVBAR), dual-mounted at private-alias + config-space via per-chiplet CPU view | Same | Same |
+| SYSREG_CP1 (x4) | **Not yet modelled** — Phase 1 closer: RAM, dual-mounted at `0x1E01810000` / `0x1FF1810000` (CP0 template, `+PER_SYSREG_CP`) so BL2 CP1 RVBAR writes land | Same | Same |
 | GIC600 | QEMU built-in | Same | Same |
 | UART | Per-chiplet 16550 on dedicated chardevs + HILS ring tail | Same | Same |
 | Timer | QEMU built-in + CSS600 CNTGEN stub | Same | Same |

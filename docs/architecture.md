@@ -127,18 +127,33 @@ BL2 (iRAM @ 0x1E00028000, same binary on all 4 chiplets)
   ├─ Inter-chiplet HBM handshake via mailbox RAM (primary waits for N=1..3)
   ├─ SMMU-600 TCU: Early init (stub CR0ACK mirror + GBPA.UPDATE auto-clear)
   ├─ MMU: xlat_tables_v2 — per-chiplet mappings (private window + DRAM + flash + SMMU)
-  ├─ Load BL31 + FreeRTOS images (backed-up copies on secondary chiplets)
-  └─ Hand off to BL31 at BL31_BASE (DRAM @ 0)
+  ├─ Load BL31 + FreeRTOS images (CP0 + CP1, backed-up copies on secondary chiplets)
+  ├─ Release CP1.cpu0 via plat_pmu_cl_on + plat_pmu_cpu_on    [#ifndef ZEBU_CI]
+  └─ Hand off to BL31_CP0 at BL31_BASE (DRAM @ 0)
 
-BL31 (DRAM @ 0x00000000)
-  ├─ GIC: Configure interrupt controller
-  ├─ TrustZone: Configure TZPC for all SFR blocks
-  └─ Jump to FreeRTOS (EL3 → EL1)
+BL31_CP0 (DRAM @ 0x00000000)           BL31_CP1 (DRAM @ 0x14100000)
+  ├─ GIC: shared with CP0                ├─ GIC: shared
+  ├─ TZPC for CP0                         ├─ TZPC for CP1
+  └─ ERET → FreeRTOS_CP0 (EL1)            └─ ERET → FreeRTOS_CP1 (EL1)
 
-FreeRTOS (DRAM @ 0x00200000)
-  ├─ Scheduler starts (5 priority levels, 1ms tick, 32KB heap)
-  └─ q-cp tasks run: hq_mgr, cb_mgr, cs_mgr, proc_mgr, etc.
+FreeRTOS_CP0 (DRAM @ 0x00200000)        FreeRTOS_CP1 (DRAM @ 0x14200000)
+  ├─ init_smp() PSCI CPU_ON cpu1..3        ├─ init_smp() PSCI CPU_ON cpu1..3
+  │     → BL31_CP0 warm-boot → EL1         │     → BL31_CP1 warm-boot → EL1
+  └─ q-cp tasks (hq_mgr, cs_mgr, ...)     └─ q-cp tasks (CP1 half)
 ```
+
+### CP0 / CP1 cluster split
+
+Each chiplet has two independent 4-core clusters (CP0 and CP1), each running its own `bl31_cp{0,1}.bin` → `freertos_cp{0,1}.bin` — built from the same TF-A source with `CP=0` vs `CP=1` (`__TARGET_CP`), differing mainly in where `rebel_h_pm.c:set_rvbar()` writes RVBAR (`SYSREG_CP0_OFFSET` vs `SYSREG_CP1_OFFSET = SYSREG_CP0_OFFSET + PER_SYSREG_CP*1`) and which `PERCLUSTER_OFFSET` the PSCI CPU_ON handler uses.
+
+The release sequence is asymmetric:
+
+- **CP0.cpu0** of the primary chiplet is the boot ROM target — started by QEMU at reset with its `rvbar` property.
+- **CP0.cpu0** of chiplets 1-3 is released cross-chiplet by BL1 on the primary via the QSPI bridge (`plat_pmu_cpu_on` with `IMAGE_BL1` branch → `qspi_bridge_write_1word` to each slave's `CPMU_PRIVATE + CPU0_CONFIGURATION`).
+- **CP1.cpu0** of each chiplet is released by BL2 on the *same* chiplet's CP0.cpu0 via direct MMIO (same `plat_pmu_cl_on` / `plat_pmu_cpu_on` helpers, non-`IMAGE_BL1` branch). This is the `#ifndef ZEBU_CI` path in `rebel_h_bl2_setup.c:865-871`.
+- **CP0/CP1.cpu{1,2,3}** are released by their respective FreeRTOS via `init_smp() → psci_cpu_on()` into `BL31_CP{0,1}`'s warm-boot entry — a pure PSCI SMC path, no MMIO from the FreeRTOS side.
+
+The PMU device handles all four release variants uniformly: `CPU_CONFIGURATION + cluster*PERCLUSTER_OFFSET + cpu*PERCPU_OFFSET` writes decode cluster/cpu, the stub reads RVBAR back from the matching SYSREG_CP{0,1} backing, and `arm_set_cpu_on(mpidr, RVBAR, target_el=3)` releases the vCPU to either BL2 (cold) or `bl31_warm_entrypoint` (PSCI warm).
 
 ### Log routing
 
@@ -177,8 +192,8 @@ All device models follow the QEMU QOM (QEMU Object Model) pattern:
 |------|--------|-----------|--------------|
 | `r100_soc.c` | Machine type | 1 | Creates chiplets, per-chiplet CPU views, CPUs, GIC, per-chiplet UARTs, mailbox RAM |
 | `r100_cmu.c` | CMU (Clock) | 20 per chiplet | PLL lock = instant, mux_busy = 0 |
-| `r100_pmu.c` | PMU (Power) | 1 per chiplet | Cold reset, all CPUs/clusters ON; `CPU_CONFIGURATION` → `arm_set_cpu_on(mpidr, RVBAR, target_el=3)` at FW-written RVBAR (covers both BL1's QSPI-driven cold-boot release and BL31's PSCI CPU_ON warm-boot release); DCL config→status mirror |
-| `r100_sysreg.c` | SYSREG | 1 per chiplet | Returns chiplet ID (0-3) |
+| `r100_pmu.c` | PMU (Power) | 1 per chiplet | Cold reset, all CPUs/clusters ON; `CPU_CONFIGURATION` → `arm_set_cpu_on(mpidr, RVBAR, target_el=3)` at FW-written RVBAR (covers BL1's QSPI-driven cold-boot release, BL2's direct CP1 release, and BL31's PSCI CPU_ON warm-boot release); DCL config→status mirror. CP1 RVBAR lookup currently short-circuited (Phase 1 closer) |
+| `r100_sysreg.c` | SYSREG | 1 per chiplet | Returns chiplet ID (0-3); CP0 RAM dual-mounted at `0x1E01010000`/`0x1FF1010000`. CP1 RAM (`0x1E01810000`/`0x1FF1810000`) not yet mounted |
 | `r100_hbm.c` | HBM3 controller | 1 per chiplet | Sparse write-back (6 MB window, default 0xFFFFFFFF), ICON req0/req1 RMW mirror |
 | `r100_qspi.c` | QSPI bridge | 1 per chiplet | Designware SSI, cross-chiplet R/W + upper-addr latch (28-bit offset) |
 | `r100_qspi_boot.c` | QSPI_ROT (DWC_SSI master) | 1 per chiplet | Dual-mapped (cfg-space `0x1FF0500000` + private alias `0x1E00500000`); DW SSI status always idle (`TFNF\|TFE\|RFNE`, `BUSY=0`), `TXFLR=0`, DRX reads return `0x82` (`FLASH_READY\|WRITE_ENABLE_LATCH`) so every `qspi_boot.c:tx_available()` and `check_read_*_status()` poll exits on iteration 0; covers BL1 flash-load and BL31 `NOR_FLASH_SVC_*` SMC paths |
