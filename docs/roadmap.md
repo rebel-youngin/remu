@@ -4,32 +4,54 @@
 
 **Goal**: TF-A BL1 → BL2 → BL31 → FreeRTOS boots on all 4 chiplets.
 
-**Status**: Machine type boots, UART output verified. Awaiting real FW images.
+**Status**: Real q-sys TF-A BL1 runs and prints boot log to UART. Stopped at UCIe firmware DMA load inside `_bl1_init_blk_rbc()`.
 
 ### What's done
 
-- `r100-soc` machine type: 4 chiplets, 32 CA73 vCPUs, GICv3, PL011 UART
+- `r100-soc` machine type: 4 chiplets, 32 vCPUs, GICv3, 16550 UART
+  - CPU is `cortex-a72` with MIDR overridden to Cortex-A73 r1p1 (0x411FD091) so TF-A's `get_cpu_ops_ptr` accepts it and CA73 errata workarounds skip
+- UART: QEMU `serial-mm` (16550, regshift=2) matching FW's `console_16550_register` driver
 - CMU stubs (20 blocks per chiplet): PLL lock/mux_busy return instantly
-- PMU stub: cold reset status, all CPUs/clusters/DCLs powered on
+- PMU stub: OM_STAT=NORMAL_BOOT, RST_STAT=PINRESET, all CPU/cluster/DCL/RBC status registers seeded to powered-on
 - SYSREG stub: per-chiplet ID (0-3) via SYSREMAP registers
 - HBM3 stub: training-complete status
-- QSPI bridge: Designware SSI protocol, cross-chiplet register access
+- QSPI bridge: Designware SSI protocol, cross-chiplet register access (with `PRIVATE_BASE` prefix for slave-side addressing)
 - RBC stubs: UCIe LTSM ACTIVE for all 6 blocks per chiplet
+- Dual-mapped PMU and SYSREG devices at both config-space (`0x1FF0xxxxxx`) and private-alias (`0x1E00xxxxxx`) addresses via `memory_region_init_alias`
+- PCIe sub-controller stub (for `pmu_release_cm7` writes) and CSS600 CNTGEN stub (generic timer reset)
+- Chiplet-wide `unimplemented_device` fallbacks for config space and the 256MB private-alias window (OTP, RBC private aliases, etc.) — graceful handling of unmodeled registers
 - CLI tool (`remu build`, `remu run`, `remu status`, `remu gdb`, `remu images`)
-- Build verified on QEMU 9.2.0, UART test binary prints "REMU OK"
+- q-sys integration via `external/ssw-bundle`: submodules initialized, TF-A builds with CA73 errata + Spectre v4 workarounds disabled (see platform.mk)
+
+### Observed boot trace
+
+```
+NOTICE:  BL1: check QSPI bridge
+INFO:    BL1: QSPI bridge status check time 0, chiplet{1,2,3}
+NOTICE:  BL1: Boot mode: NORMAL_BOOT (5)
+NOTICE:  BL1: Boot reason: Cold reset(POR) (0x00010000)
+NOTICE:  BL1: Chiplet reset flag: 0x0 status: 0x0010
+NOTICE:  BL1: Load tboot_p0
+INFO:    Release reset of CM7
+NOTICE:  BL1: pmu_release_cm7 complete
+NOTICE:  BL1: Load tboot_u
+NOTICE:  BL1: Detected secondary chiplet count: 3
+NOTICE:  BL1: ZEBU_CI: 0    [stops here — UCIe FW DMA load pending]
+```
 
 ### What remains
 
-- [ ] Build q-sys FW with `-p zebu` and test full BL1 → FreeRTOS boot
-- [ ] Identify and stub additional registers that the FW reads during boot
-- [ ] Add per-chiplet UART instances (currently only chiplet 0 has UART)
-- [ ] Refine PMU for secondary core release (PSCI / CPU power-on wakeup)
+- [ ] Stub the DMA controller (PL330 at `DMA_ROT_OFFSET`) so `dma_load_image()` reports completion — unblocks UCIe firmware load inside `_bl1_init_blk_rbc()`
+- [ ] Pre-load BL2/BL31/FreeRTOS to each secondary chiplet's iRAM/DRAM so BL1's cross-chiplet copy finds the data in place
+- [ ] Refine PMU for secondary core release — wire `CPU_CONFIGURATION` writes to QEMU `cpu_resume()` so chiplets 1-3 CPU0 actually start executing
+- [ ] Add per-chiplet UART instances (currently only chiplet 0 has UART mapped)
+- [ ] Build system: fix `sys/build.sh` path where `debug` COMMAND resets CLI flags, so `CHIPLET_COUNT=1` builds work (alternative to the DMA stub for single-chiplet boot)
 - [ ] Test GDB attach and multi-core debugging (`thread N` to switch vCPUs)
 
 ### Success criteria
 
 - All 4 chiplets print FreeRTOS startup banner on UART
-- Chiplet 0 discovers 3 secondary chiplets via QSPI bridge
+- Chiplet 0 discovers 3 secondary chiplets via QSPI bridge ✓
 - GDB can step through FW code on any chiplet's vCPU
 
 ## Phase 2: Host Drivers
@@ -69,12 +91,14 @@
 | Peripheral | Phase 1 | Phase 2 | Phase 3 |
 |------------|---------|---------|---------|
 | CMU (20 blocks x4) | PLL-lock stub | Same | Same |
-| PMU (x4) | Boot-status stub | Full register bank | Same |
+| PMU (x4) | Boot-status + RBC/boot-mode defaults | Full register bank | Same |
 | GIC600 | QEMU built-in | Same | Same |
-| UART | QEMU built-in | Same | Same |
-| Timer | QEMU built-in | Same | Same |
-| QSPI bridge | Cross-chiplet R/W | Same | Same |
-| RBC/UCIe (6 x4) | Link-ready stub | Same | Same |
+| UART | 16550 (serial-mm) | Per-chiplet instances | Same |
+| Timer | QEMU built-in + CSS600_CNTGEN stub | Same | Same |
+| QSPI bridge | Cross-chiplet R/W via `PRIVATE_BASE` prefix | Same | Same |
+| RBC/UCIe (6 x4) | Link-ready stub + PMU RBC status=ON | Same | Same |
+| DMA (PL330) | Not yet stubbed (next blocker) | Stub | Behavioral model |
+| PCIe sub-controller | RAM stub (pmu_release_cm7) | Real model | Same |
 | PCIe/doorbell | N/A | Shared mem bridge | Same |
 | DNC (16 x4) | N/A | Return-success | Behavioral model |
 | HDMA (x4) | N/A | Memcpy | Scatter-gather |

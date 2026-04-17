@@ -22,6 +22,8 @@
 #include "hw/arm/armv7m.h"
 #include "hw/intc/arm_gicv3.h"
 #include "hw/char/pl011.h"
+#include "hw/char/serial-mm.h"
+#include "hw/misc/unimp.h"
 #include "hw/qdev-properties-system.h"
 #include "hw/loader.h"
 #include "sysemu/sysemu.h"
@@ -94,36 +96,97 @@ static void r100_create_cmu(MemoryRegion *cfg_mr, int chiplet_id,
 
 /*
  * Create and map a PMU stub device for a chiplet.
+ *
+ * Maps the device at two locations:
+ *   - config-space view: R100_ROT_PMU_BASE (within cfg_mr)
+ *   - private-alias view: R100_CPMU_PRIVATE_BASE in sysmem (per-chiplet)
+ *
+ * BL1 reads boot-mode/log/flag registers via the private alias
+ * (CPMU_PRIVATE in rebel_h_bootmgr.h), and BL2/BL31 use the config-space
+ * view via QSPI bridge for cross-chiplet access.
  */
-static void r100_create_pmu(MemoryRegion *cfg_mr, int chiplet_id,
-                            int secondary_count)
+static void r100_create_pmu(MemoryRegion *cfg_mr, MemoryRegion *sysmem,
+                            int chiplet_id, int secondary_count,
+                            uint64_t chiplet_base)
 {
     DeviceState *dev;
     SysBusDevice *sbd;
-    uint64_t offset = R100_ROT_PMU_BASE - R100_CFG_BASE;
+    MemoryRegion *iomem;
+    MemoryRegion *alias;
+    uint64_t cfg_offset = R100_ROT_PMU_BASE - R100_CFG_BASE;
+    char name[64];
 
     dev = qdev_new(TYPE_R100_PMU);
     qdev_prop_set_uint32(dev, "chiplet-id", chiplet_id);
     qdev_prop_set_uint32(dev, "secondary-chiplet-count", secondary_count);
     sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
-    memory_region_add_subregion(cfg_mr, offset, sysbus_mmio_get_region(sbd, 0));
+
+    iomem = sysbus_mmio_get_region(sbd, 0);
+    memory_region_add_subregion(cfg_mr, cfg_offset, iomem);
+
+    /* Private alias: 0x1E00230000 + chiplet_base, points at the same iomem.
+     * Use overlap with priority 0 so it takes precedence over the
+     * lower-priority private-window RAM catch-all. */
+    alias = g_new(MemoryRegion, 1);
+    snprintf(name, sizeof(name), "r100.chiplet%d.pmu_priv", chiplet_id);
+    memory_region_init_alias(alias, NULL, name, iomem, 0, R100_PMU_REG_SIZE);
+    memory_region_add_subregion_overlap(sysmem,
+                                        chiplet_base + R100_CPMU_PRIVATE_BASE,
+                                        alias, 0);
 }
 
 /*
  * Create and map a SYSREG/SYSREMAP stub device for chiplet ID detection.
+ *
+ * Same dual-mapping pattern as PMU: config-space view + private alias.
+ * BL1 reads SYSREG_SYSREMAP_PRIVATE for the local chiplet ID, while
+ * the QSPI bridge accesses other chiplets via the config-space view.
  */
-static void r100_create_sysreg(MemoryRegion *cfg_mr, int chiplet_id)
+static void r100_create_sysreg(MemoryRegion *cfg_mr, MemoryRegion *sysmem,
+                               int chiplet_id, uint64_t chiplet_base)
 {
     DeviceState *dev;
     SysBusDevice *sbd;
-    uint64_t offset = R100_ROT_SYSREMAP_BASE - R100_CFG_BASE;
+    MemoryRegion *iomem;
+    MemoryRegion *alias;
+    uint64_t cfg_offset = R100_ROT_SYSREMAP_BASE - R100_CFG_BASE;
+    char name[64];
 
     dev = qdev_new(TYPE_R100_SYSREG);
     qdev_prop_set_uint32(dev, "chiplet-id", chiplet_id);
     sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
-    memory_region_add_subregion(cfg_mr, offset, sysbus_mmio_get_region(sbd, 0));
+
+    iomem = sysbus_mmio_get_region(sbd, 0);
+    memory_region_add_subregion(cfg_mr, cfg_offset, iomem);
+
+    alias = g_new(MemoryRegion, 1);
+    snprintf(name, sizeof(name), "r100.chiplet%d.sysremap_priv", chiplet_id);
+    memory_region_init_alias(alias, NULL, name, iomem, 0,
+                             R100_SYSREG_REG_SIZE);
+    memory_region_add_subregion_overlap(sysmem,
+                                        chiplet_base + R100_SYSREMAP_PRIVATE_BASE,
+                                        alias, 0);
+}
+
+/*
+ * Create a stub RAM region for the PCIe sub-controller block.
+ * pmu_release_cm7() writes to several registers in this block during BL1
+ * (PCIE_GLOBAL_MASK, PCIE_GLOBAL_PEND, PCIE_SFR_APP_CTRL_SIGNALS,
+ * PCIE_SFR_PHY_RESET_OVRD). Read-back values aren't currently checked,
+ * so a plain RAM region suffices.
+ */
+static void r100_create_pcie_subctrl(MemoryRegion *cfg_mr, int chiplet_id)
+{
+    MemoryRegion *mr = g_new(MemoryRegion, 1);
+    uint64_t offset = R100_PCIE_SUBCTRL_BASE - R100_CFG_BASE;
+    char name[64];
+
+    snprintf(name, sizeof(name), "r100.chiplet%d.pcie_subctrl", chiplet_id);
+    memory_region_init_ram(mr, NULL, name, R100_PCIE_SUBCTRL_SIZE,
+                           &error_fatal);
+    memory_region_add_subregion(cfg_mr, offset, mr);
 }
 
 /*
@@ -246,11 +309,21 @@ static void r100_chiplet_init(MachineState *machine, int chiplet_id,
     memory_region_add_subregion(sysmem, chiplet_base + R100_SH_MEM_BASE,
                                 sh_mem);
 
-    /* --- Config space container (covers 0x1FF0000000 - 0x1FFB900000) --- */
+    /* --- Config space container (covers 0x1FF0000000 - 0x1FFB900000) ---
+     * Also drop a chiplet-wide unimplemented_device underneath so that
+     * any MMIO offset we haven't explicitly stubbed (NBUS/SBUS/EBUS
+     * SYSREGs, etc.) returns 0 + LOG_UNIMP instead of "rejected" faults.
+     */
     cfg_mr = g_new(MemoryRegion, 1);
     snprintf(name, sizeof(name), "r100.chiplet%d.cfg", chiplet_id);
     memory_region_init(cfg_mr, NULL, name, R100_CFG_SIZE);
-    memory_region_add_subregion(sysmem, chiplet_base + R100_CFG_BASE, cfg_mr);
+    memory_region_add_subregion_overlap(sysmem,
+                                        chiplet_base + R100_CFG_BASE,
+                                        cfg_mr, 0);
+    snprintf(name, sizeof(name), "r100.chiplet%d.cfg-unimpl", chiplet_id);
+    create_unimplemented_device(g_strdup(name),
+                                chiplet_base + R100_CFG_BASE,
+                                R100_CFG_SIZE);
 
     /* --- CMU stubs (one per block) --- */
     for (i = 0; i < R100_NUM_CMU_BLOCKS; i++) {
@@ -258,12 +331,30 @@ static void r100_chiplet_init(MachineState *machine, int chiplet_id,
                         r100_cmu_names[i]);
     }
 
-    /* --- PMU stub --- */
-    r100_create_pmu(cfg_mr, chiplet_id,
-                    chiplet_id == 0 ? (R100_NUM_CHIPLETS - 1) : 0);
+    /*
+     * --- Private alias window (unimplemented-device catch-all) ---
+     * Covers the full chiplet-private 256 MB window at PRIVATE_BASE
+     * (0x1E00000000). SYSREG_ROT_PRIVATE, SYSREMAP, PMU, OTP, GPIO, RBC,
+     * CMU_RBC_* etc. all live here. Specific device aliases (PMU,
+     * SYSREMAP) layer on top via overlap with higher priority.
+     * unimplemented_device is lazy-allocated unlike RAM, so the 256 MB
+     * region has no memory cost.
+     */
+    {
+        char nm[64];
+        snprintf(nm, sizeof(nm), "r100.chiplet%d.priv_win-unimpl", chiplet_id);
+        create_unimplemented_device(g_strdup(nm),
+                                    chiplet_base + R100_PRIVATE_WIN_BASE,
+                                    R100_PRIVATE_WIN_SIZE);
+    }
 
-    /* --- SYSREG (chiplet ID) --- */
-    r100_create_sysreg(cfg_mr, chiplet_id);
+    /* --- PMU stub (config space + private alias) --- */
+    r100_create_pmu(cfg_mr, sysmem, chiplet_id,
+                    chiplet_id == 0 ? (R100_NUM_CHIPLETS - 1) : 0,
+                    chiplet_base);
+
+    /* --- SYSREG (chiplet ID) — config space + private alias --- */
+    r100_create_sysreg(cfg_mr, sysmem, chiplet_id, chiplet_base);
 
     /* --- HBM3 controller stub --- */
     r100_create_hbm(cfg_mr, chiplet_id);
@@ -273,6 +364,25 @@ static void r100_chiplet_init(MachineState *machine, int chiplet_id,
 
     /* --- RBC stubs (UCIe link status) --- */
     r100_create_rbc_blocks(cfg_mr, chiplet_id);
+
+    /* --- PCIe sub-controller catch-all RAM (for pmu_release_cm7) --- */
+    r100_create_pcie_subctrl(cfg_mr, chiplet_id);
+
+    /*
+     * --- CSS600 generic counter region (4KB RAM) ---
+     * generic_delay_timer_init/reset_counter writes to CNTCR/CNTCVL/CNTCVU.
+     * QEMU CPU has its own generic timer; this stub just accepts the writes.
+     */
+    {
+        MemoryRegion *cntgen = g_new(MemoryRegion, 1);
+        char nm[64];
+        snprintf(nm, sizeof(nm), "r100.chiplet%d.css600_cntgen", chiplet_id);
+        memory_region_init_ram(cntgen, NULL, nm,
+                               R100_CSS600_CNTGEN_SIZE, &error_fatal);
+        memory_region_add_subregion(cfg_mr,
+                                    R100_CSS600_CNTGEN_BASE - R100_CFG_BASE,
+                                    cntgen);
+    }
 
     /*
      * TODO Phase 2: Add DNC, HDMA, doorbell/mailbox stubs
@@ -314,6 +424,19 @@ static void r100_soc_init(MachineState *machine)
         object_property_set_int(cpuobj, "mp-affinity",
                                 (chiplet << 16) | (cluster << 8) | core,
                                 &error_fatal);
+
+        /*
+         * Override MIDR to report Cortex-A73 r1p1 (0x411FD091). The R100 FW's
+         * TF-A is built with cortex_a73 cpu_ops only, and asserts at
+         * reset_handler if get_cpu_ops_ptr returns NULL (MIDR mismatch).
+         * QEMU has no cortex-a73 model — cortex-a72 is the closest match.
+         *
+         * r1p1 (variant=1, revision=1) is past the range of all CA73 errata
+         * workarounds. Otherwise the workarounds (e.g. 852427) try to access
+         * implementation-defined system registers like S3_0_C15_C0_1 that
+         * cortex-a72 doesn't model, triggering an UNDEF exception.
+         */
+        object_property_set_int(cpuobj, "midr", 0x411FD091, &error_fatal);
 
         /* Set reset vector to BL1 base within this chiplet's iRAM */
         object_property_set_int(cpuobj, "rvbar",
@@ -384,20 +507,15 @@ static void r100_soc_init(MachineState *machine)
     }
 
     /*
-     * --- PL011 UART ---
-     * Map at chiplet 0's PERI0_UART0 address for console output.
-     * Use memory_region_add_subregion_overlap with priority 10 so the
-     * UART takes precedence over the config space container.
+     * --- 16550 UART (serial-mm) ---
+     * The R100 FW uses a TI 16550 driver (see uart_helper.h), not PL011.
+     * Reads LSR (offset 0x14 = reg 5 << 2) — 32-bit-stride MMIO layout.
      */
     {
-        DeviceState *uart = qdev_new(TYPE_PL011);
-        qdev_prop_set_chr(uart, "chardev", serial_hd(0));
-        SysBusDevice *uart_sbd = SYS_BUS_DEVICE(uart);
-        sysbus_realize_and_unref(uart_sbd, &error_fatal);
-        memory_region_add_subregion_overlap(sysmem, R100_PERI0_UART0_BASE,
-                                            sysbus_mmio_get_region(uart_sbd, 0),
-                                            10);
-        sysbus_connect_irq(uart_sbd, 0, qdev_get_gpio_in(gicdev, 33));
+        serial_mm_init(sysmem, R100_PERI0_UART0_BASE, 2,
+                       qdev_get_gpio_in(gicdev, 33),
+                       (int)R100_UART_CLOCK / 16, serial_hd(0),
+                       DEVICE_LITTLE_ENDIAN);
     }
 }
 

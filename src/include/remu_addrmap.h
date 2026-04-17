@@ -185,8 +185,44 @@
 #define R100_CMU_BLOCK_SIZE         0x10000ULL    /* 64KB per CMU block */
 
 /* ========================================================================
+ * Per-chiplet "private alias" window (PRIVATE_BASE in q-sys headers).
+ * Re-maps the same SYSREMAP and PMU device instances at chiplet-local
+ * addresses just above iRAM. Used by FW via macros like CPMU_PRIVATE
+ * and SYSREG_SYSREMAP_PRIVATE.
+ * ======================================================================== */
+
+#define R100_PRIVATE_BASE               0x1E00000000ULL
+#define R100_SYSREMAP_PRIVATE_BASE      0x1E00220000ULL  /* SYSREG_SYSREMAP private alias */
+#define R100_CPMU_PRIVATE_BASE          0x1E00230000ULL  /* PMU private alias */
+
+/*
+ * Catch-all RAM window for the per-chiplet "private" alias region.
+ * Covers SYSREG_ROT_PRIVATE, SYSREG_SYSREMAP_PRIVATE, CPMU_PRIVATE,
+ * OTP_CON_PRIVATE, OTP_CON_CPU_PRIVATE, GPIO_ROT_PRIVATE, etc. The specific
+ * device aliases (PMU, SYSREMAP) are layered on top via overlap regions.
+ */
+#define R100_PRIVATE_WIN_BASE           0x1E00000000ULL
+#define R100_PRIVATE_WIN_SIZE           0x0010000000ULL  /* 256 MB (full chiplet private alias) */
+
+/* ========================================================================
+ * PCIe sub-controller block (catch-all for pmu_release_cm7 writes)
+ * ======================================================================== */
+
+#define R100_PCIE_SUBCTRL_BASE          0x1FF8180000ULL
+#define R100_PCIE_SUBCTRL_SIZE          0x0000010000ULL  /* 64KB */
+
+/* ARM CSS600 generic counter generator (CSS600_CNTGEN). FW writes CNTCR,
+ * CNTCVL, CNTCVU to enable/reset the system counter. Reads/writes only. */
+#define R100_CSS600_CNTGEN_BASE         0x1FFB809000ULL
+#define R100_CSS600_CNTGEN_SIZE         0x0000001000ULL
+
+/* ========================================================================
  * PMU register offsets (relative to PMU base)
  * ======================================================================== */
+
+#define R100_PMU_OM_STAT                0x0000  /* boot-mode select; bits[2:0] */
+#define R100_PMU_OM_MASK                0x7
+#define R100_PMU_BOOT_MODE_NORMAL       0x5     /* NORMAL_BOOT in rebel_h_bootmgr.h */
 
 #define R100_PMU_RST_STAT               0x0404
 #define R100_PMU_RESET_MASK             0x040C
@@ -207,8 +243,27 @@
 #define R100_PMU_DCL1_CONFIG            0x42A0
 #define R100_PMU_DCL1_STATUS            0x42A4
 
+/* RBC (UCIe) per-block CONFIG/STATUS within PMU. STATUS=CONFIG+4. */
+#define R100_PMU_RBCH00_CONFIG          0x42C0
+#define R100_PMU_RBCH00_STATUS          0x42C4
+#define R100_PMU_RBCH01_CONFIG          0x42E0
+#define R100_PMU_RBCH01_STATUS          0x42E4
+#define R100_PMU_RBCV00_CONFIG          0x4300
+#define R100_PMU_RBCV00_STATUS          0x4304
+#define R100_PMU_RBCV01_CONFIG          0x4320
+#define R100_PMU_RBCV01_STATUS          0x4324
+#define R100_PMU_RBCV10_CONFIG          0x4340
+#define R100_PMU_RBCV10_STATUS          0x4344
+#define R100_PMU_RBCV11_CONFIG          0x4360
+#define R100_PMU_RBCV11_STATUS          0x4364
+
 /* PMU status values */
-#define R100_PMU_COLD_RESET             0x0
+/*
+ * RST_STAT is a bitmask of reset reasons. The FW's FSB() macro spins
+ * until at least one bit is set. PINRESET (bit 16) indicates POR/cold
+ * boot — see rebel_h_pmu.h.
+ */
+#define R100_PMU_COLD_RESET             (1U << 16)  /* PINRESET */
 #define R100_PMU_CHIPLET_RESET          0x1
 #define R100_PMU_CPU_STATUS_ON          0xF
 #define R100_PMU_CL_STATUS_ON           0xF

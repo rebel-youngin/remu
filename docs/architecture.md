@@ -59,7 +59,7 @@ REMU uses two QEMU instances connected by shared memory:
              │ shared memory    │ eventfd
 ┌────────────┴──────────────────┴──────────────────┐
 │  FW QEMU (aarch64, bare-metal)                   │
-│  32x CA73 vCPUs (cortex-a72 model)               │
+│  32x CA73 vCPUs (cortex-a72 w/ MIDR=A73 r1p1)    │
 │  TF-A BL1 → BL2 → BL31 → FreeRTOS              │
 │  ┌────────────────────────────────────────────┐  │
 │  │ Device Models                              │  │
@@ -69,7 +69,7 @@ REMU uses two QEMU instances connected by shared memory:
 │  │  HBM3 — training-complete                  │  │
 │  │  QSPI bridge — cross-chiplet register I/O  │  │
 │  │  RBC — UCIe link-up status                 │  │
-│  │  GIC600, PL011 UART, Generic Timer         │  │
+│  │  GIC600, 16550 UART, Generic Timer          │  │
 │  └────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────┘
 ```
@@ -135,7 +135,7 @@ All device models follow the QEMU QOM (QEMU Object Model) pattern:
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| QEMU CPU model | `cortex-a72` | Functionally closest to CA73 available in QEMU |
+| QEMU CPU model | `cortex-a72` + MIDR override to 0x411FD091 (CA73 r1p1) | Functionally closest to CA73 in QEMU; r1p1 MIDR skips CA73 errata workarounds that probe IMP_DEF sysregs cortex-a72 doesn't model |
 | GIC model | Single GICv3 for all 32 CPUs | Simpler than per-chiplet GIC; sufficient for Phase 1 |
 | QSPI bridge | Address-space read/write | Uses QEMU's `address_space_read/write` for cross-chiplet access |
 | UART priority | `memory_region_add_subregion_overlap` prio=10 | UART must take precedence over config space container |

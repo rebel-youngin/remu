@@ -2,6 +2,10 @@ build/
 install/
 images/*.bin
 external/qemu/
+external/ssw-bundle/
+external/q-sys/
+tests/*.bin
+tests/*.o
 *.egg-info/
 __pycache__/
 *.pyc

@@ -23,6 +23,12 @@
 
 static void r100_pmu_set_defaults(R100PMUState *s)
 {
+    /*
+     * Boot-mode register at PMU offset 0. FW reads (val & OM_MASK) and
+     * compares to NORMAL_BOOT (0x5) — see rebel_h_bootmgr.h:BOOT_MODE_VAL.
+     */
+    s->regs[R100_PMU_OM_STAT >> 2] = R100_PMU_BOOT_MODE_NORMAL;
+
     /* Cold reset */
     s->regs[R100_PMU_RST_STAT >> 2] = R100_PMU_COLD_RESET;
 
@@ -54,6 +60,14 @@ static void r100_pmu_set_defaults(R100PMUState *s)
     /* D-Clusters on */
     s->regs[R100_PMU_DCL0_STATUS >> 2] = R100_PMU_DCL_STATUS_ON;
     s->regs[R100_PMU_DCL1_STATUS >> 2] = R100_PMU_DCL_STATUS_ON;
+
+    /* All RBC blocks powered on (FW polls these in pmu_enable_blk_rbc). */
+    s->regs[R100_PMU_RBCH00_STATUS >> 2] = R100_PMU_LOCAL_PWR_ON;
+    s->regs[R100_PMU_RBCH01_STATUS >> 2] = R100_PMU_LOCAL_PWR_ON;
+    s->regs[R100_PMU_RBCV00_STATUS >> 2] = R100_PMU_LOCAL_PWR_ON;
+    s->regs[R100_PMU_RBCV01_STATUS >> 2] = R100_PMU_LOCAL_PWR_ON;
+    s->regs[R100_PMU_RBCV10_STATUS >> 2] = R100_PMU_LOCAL_PWR_ON;
+    s->regs[R100_PMU_RBCV11_STATUS >> 2] = R100_PMU_LOCAL_PWR_ON;
 
     /* CPU configurations: set to powered on with automatic wakeup */
     for (int i = 0; i < R100_NUM_CORES_PER_CLUSTER; i++) {

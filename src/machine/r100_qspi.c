@@ -95,8 +95,15 @@ DECLARE_INSTANCE_CHECKER(R100QSPIBridgeState, R100_QSPI_BRIDGE,
 
 /*
  * Perform a cross-chiplet read via QEMU's system address space.
- * The target address is: slave_chiplet * CHIPLET_OFFSET + full_addr
- * where full_addr = (upper_addr & 0xFC000000) | (address << 2)
+ *
+ * The target address is: slave_chiplet * CHIPLET_OFFSET + PRIVATE_BASE
+ *                        + (upper_addr & 0xFC000000) | (address << 2)
+ *
+ * The R100 slave-side QSPI controller maps the 32-bit transaction address
+ * into its own chiplet-private alias window (0x1E00000000) — the upper bits
+ * truncated by the FW driver are restored implicitly. Without this prefix,
+ * QSPI reads land in the slave's DRAM at low offsets instead of the SYSREG
+ * the bridge protocol is meant to reach.
  */
 static uint32_t qspi_remote_read(R100QSPIBridgeState *s)
 {
@@ -107,7 +114,8 @@ static uint32_t qspi_remote_read(R100QSPIBridgeState *s)
 
     full_addr = (uint64_t)(s->upper_addr & 0xFC000000) |
                 ((uint64_t)s->address << 2);
-    target = (uint64_t)s->selected_slave * R100_CHIPLET_OFFSET + full_addr;
+    target = (uint64_t)s->selected_slave * R100_CHIPLET_OFFSET +
+             R100_PRIVATE_BASE + full_addr;
 
     result = address_space_read(&address_space_memory, target,
                                 MEMTXATTRS_UNSPECIFIED,
@@ -134,7 +142,8 @@ static void qspi_remote_write(R100QSPIBridgeState *s, uint32_t data)
 
     full_addr = (uint64_t)(s->upper_addr & 0xFC000000) |
                 ((uint64_t)s->address << 2);
-    target = (uint64_t)s->selected_slave * R100_CHIPLET_OFFSET + full_addr;
+    target = (uint64_t)s->selected_slave * R100_CHIPLET_OFFSET +
+             R100_PRIVATE_BASE + full_addr;
 
     result = address_space_write(&address_space_memory, target,
                                  MEMTXATTRS_UNSPECIFIED,

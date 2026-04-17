@@ -30,7 +30,7 @@ IMAGES_DIR = REMU_ROOT / "images"
 # R100 firmware image definitions: (filename, load_address, description)
 FW_IMAGES = [
     ("bl1.bin",           0x1E00010000, "TF-A BL1 (iRAM)"),
-    ("bl2.bin",           0x1E0004B000, "TF-A BL2 (iRAM)"),
+    ("bl2.bin",           0x1E00028000, "TF-A BL2 (iRAM, GPT_DEST_ADDR_TBOOT_N)"),
     ("bl31_cp0.bin",      0x0000000000, "TF-A BL31 for CP0 (DRAM)"),
     ("bl31_cp1.bin",      0x0014100000, "TF-A BL31 for CP1 (DRAM)"),
     ("freertos_cp0.bin",  0x0000200000, "FreeRTOS for CP0 (DRAM)"),
