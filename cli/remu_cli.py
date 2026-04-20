@@ -27,6 +27,25 @@ MACHINE_SRC = REMU_ROOT / "src" / "machine"
 INCLUDE_SRC = REMU_ROOT / "src" / "include"
 IMAGES_DIR = REMU_ROOT / "images"
 
+# q-sys (CP firmware) build paths
+SSW_SYS = REMU_ROOT / "external" / "ssw-bundle" / "products" / "rebel" / "q" / "sys"
+SSW_SYS_BUILD = SSW_SYS / "build.sh"
+SSW_SYS_BINARIES = SSW_SYS / "binaries"
+
+# Toolchain defaults — overridable via env (COMPILER_PATH_ARM64 etc.)
+DEFAULT_COMPILER_PATH_ARM64 = "/mnt/data/tools/arm-gnu-toolchain-13.2.Rel1-x86_64-aarch64-none-elf/bin"
+DEFAULT_COMPILER_PATH_ARM32 = "/mnt/data/query-setup/tools/arm-gnu-toolchain-13.2.Rel1-x86_64-arm-none-eabi/bin"
+
+# Maps q-sys output paths → remu image names (CA73 side only).
+FW_INSTALL_MAP = [
+    ("BootLoader_CP/bl1.bin",              "bl1.bin"),
+    ("BootLoader_CP/bl2.bin",              "bl2.bin"),
+    ("BootLoader_CP/bl31.bin",             "bl31_cp0.bin"),
+    ("FreeRTOS_CP/freertos_kernel.bin",    "freertos_cp0.bin"),
+    ("FreeRTOS_CP1/bl31.bin",              "bl31_cp1.bin"),
+    ("FreeRTOS_CP1/freertos_kernel.bin",   "freertos_cp1.bin"),
+]
+
 # R100 firmware image definitions: (filename, load_address, description)
 FW_IMAGES = [
     ("bl1.bin",           0x1E00010000, "TF-A BL1 (iRAM)"),
@@ -151,6 +170,134 @@ def build(clean, jobs):
     _run(["ninja", "-j", str(nj)], cwd=QEMU_BUILD)
 
     click.secho("\nBuild complete: %s" % QEMU_BIN, fg="green")
+
+
+# ── fw-build ─────────────────────────────────────────────────────────────────
+
+# q-sys build.sh targets that have real build_* functions. Note: the `rtos`
+# alias advertised in build.sh --help has no corresponding build_rtos in
+# scripts/, so we don't expose it here.
+FW_COMPONENTS = ["all", "tf-a", "cp0", "cp1", "cm", "boot", "bootrom", "cmrt"]
+FW_PLATFORMS = ["silicon", "zebu", "zebu_ci", "zebu_vdk"]
+FW_MODES = ["debug", "release", "profile"]
+
+# Minimum component set for a CA73-only boot (no RoT/CMRT/PCIe-CM7).
+FW_CA73_SEQUENCE = ["tf-a", "cp0", "cp1"]
+
+# Per-component expected outputs (relative to q-sys binaries/). build.sh
+# always runs generate_gpt after each invocation, and GPT packs *all*
+# partitions — so a per-component build exits non-zero on the GPT step
+# even though the component's own .bin files were produced. We ignore the
+# exit code and validate via these output paths instead.
+FW_COMPONENT_OUTPUTS = {
+    "tf-a":    ["BootLoader_CP/bl1.bin",
+                "BootLoader_CP/bl2.bin",
+                "BootLoader_CP/bl31.bin"],
+    "cp0":     ["FreeRTOS_CP/freertos_kernel.bin"],
+    "cp1":     ["FreeRTOS_CP1/bl31.bin",
+                "FreeRTOS_CP1/freertos_kernel.bin"],
+    "cm":      ["FreeRTOS_PCIE/freertos_kernel.bin"],
+    "boot":    ["BootLoader_CP/fboot_n.bin"],
+    "bootrom": ["BootLoader_CP/fboot_n.bin"],
+    "cmrt":    [],  # varies; skip strict validation
+    "all":     [],
+}
+
+
+def _fw_env():
+    """Build an env dict with toolchain paths; error out if any are missing."""
+    env = os.environ.copy()
+    env.setdefault("COMPILER_PATH_CMAKE", shutil.which("cmake") or "cmake")
+    env.setdefault("COMPILER_PATH_ARM64", DEFAULT_COMPILER_PATH_ARM64)
+    env.setdefault("COMPILER_PATH_ARM32", DEFAULT_COMPILER_PATH_ARM32)
+
+    for key in ("COMPILER_PATH_ARM64", "COMPILER_PATH_ARM32"):
+        bin_dir = Path(env[key])
+        if not bin_dir.is_dir():
+            click.secho(
+                "Toolchain not found: %s=%s" % (key, bin_dir), fg="red")
+            click.echo("Override with env, e.g. %s=/path/to/toolchain/bin" % key)
+            raise SystemExit(1)
+    return env
+
+
+def _install_fw():
+    """Copy q-sys output binaries into images/ under remu-expected names."""
+    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for src_rel, dest_name in FW_INSTALL_MAP:
+        src = SSW_SYS_BINARIES / src_rel
+        dest = IMAGES_DIR / dest_name
+        if src.is_file():
+            shutil.copy2(src, dest)
+            click.secho("  %s -> %s" % (src_rel, dest.name), fg="green")
+            copied += 1
+        else:
+            click.secho("  [--] %s missing (not built)" % src_rel, dim=True)
+    if copied == 0:
+        click.secho("No images copied.", fg="yellow")
+
+
+@cli.command("fw-build")
+@click.option("--component", "-c", "components", multiple=True,
+              type=click.Choice(FW_COMPONENTS),
+              help="Build target(s). Repeatable. Default: tf-a + cp0 + cp1 "
+                   "(minimum CA73 boot set).")
+@click.option("--platform", "-p", default="silicon",
+              type=click.Choice(FW_PLATFORMS),
+              help="Target platform. Default 'silicon'.")
+@click.option("--mode", "-m", default="debug",
+              type=click.Choice(FW_MODES))
+@click.option("--chiplets", "-cl", type=int, default=4,
+              help="Chiplet count (1 or 4). Default 4.")
+@click.option("--clean", is_flag=True, help="Clean before build.")
+@click.option("--install/--no-install", default=True,
+              help="Copy resulting binaries into images/ (default on).")
+def fw_build(components, platform, mode, chiplets, clean, install):
+    """Build R100 firmware from q-sys (external/ssw-bundle)."""
+    if not SSW_SYS_BUILD.is_file():
+        click.secho("q-sys not found at %s" % SSW_SYS, fg="red")
+        click.echo("Initialize: git submodule update --init --recursive")
+        raise SystemExit(1)
+
+    targets = list(components) if components else list(FW_CA73_SEQUENCE)
+    env = _fw_env()
+
+    click.echo("q-sys fw-build: targets=%s platform=%s mode=%s chiplets=%d" %
+               (",".join(targets), platform, mode, chiplets))
+    click.echo("  ARM64: %s" % env["COMPILER_PATH_ARM64"])
+    click.echo("  ARM32: %s" % env["COMPILER_PATH_ARM32"])
+
+    for i, target in enumerate(targets):
+        click.echo()
+        click.secho("[%d/%d] %s" % (i + 1, len(targets), target), fg="cyan")
+        cmd = ["bash", str(SSW_SYS_BUILD), target,
+               "-p", platform, "-m", mode, "-cl", str(chiplets)]
+        if clean:
+            cmd.append("-c")
+        # Ignore exit code: build.sh always runs generate_gpt last, which
+        # fails when intermediate artifacts are missing (e.g. cp1_bl31.sign
+        # during a tf-a-only build). The per-component clean_ step deletes
+        # the component's own outputs before rebuild, so existence of the
+        # expected files after the run is sufficient proof of success.
+        completed = _run(cmd, cwd=SSW_SYS, env=env, check=False)
+
+        expected = FW_COMPONENT_OUTPUTS.get(target, [])
+        missing = [rel for rel in expected
+                   if not (SSW_SYS_BINARIES / rel).is_file()]
+        if missing:
+            click.secho("fw-build(%s) failed: missing outputs %s (exit=%d)" %
+                        (target, missing, completed.returncode), fg="red")
+            raise SystemExit(completed.returncode or 1)
+
+        if completed.returncode != 0:
+            click.secho("  build.sh exit=%d (GPT assembly incomplete — "
+                        "expected for partial builds)" %
+                        completed.returncode, fg="yellow")
+
+    if install:
+        click.echo("\nInstalling images into %s ..." % IMAGES_DIR)
+        _install_fw()
 
 
 # ── run ──────────────────────────────────────────────────────────────────────

@@ -204,21 +204,43 @@ static void r100_create_sysreg(MemoryRegion *cfg_mr, MemoryRegion *sysmem,
 
 /*
  * Create a stub RAM region for the PCIe sub-controller block.
- * pmu_release_cm7() writes to several registers in this block during BL1
- * (PCIE_GLOBAL_MASK, PCIE_GLOBAL_PEND, PCIE_SFR_APP_CTRL_SIGNALS,
- * PCIE_SFR_PHY_RESET_OVRD). Read-back values aren't currently checked,
- * so a plain RAM region suffices.
+ *
+ * pmu_release_cm7() writes PCIE_GLOBAL_MASK, PCIE_GLOBAL_PEND,
+ * PCIE_SFR_APP_CTRL_SIGNALS, and PCIE_SFR_PHY_RESET_OVRD during BL1 —
+ * pure writes with no read-back check, so RAM semantics suffice.
+ *
+ * On -p silicon BL1 then calls cm7_wait_phy_sram_init_done(), which polls
+ * four PHY{0..3}_SRAM_INIT_DONE registers for bit [0] to be set by the CM7
+ * PCIe sub-controller firmware (common/headers/fw/pcie/cm7_pcie_common.c).
+ * Remu doesn't run CM7 FW, so we seed bit [0] at reset; the poll exits on
+ * iteration 0. The cm7_notify_load_done path uses separate SFR_PHY_CFG_*
+ * registers that are RMW'd then checked via cm7_check_load_done() — plain
+ * RAM already gives correct semantics there.
  */
 static void r100_create_pcie_subctrl(MemoryRegion *cfg_mr, int chiplet_id)
 {
+    /* PHY{0..3}_SRAM_INIT_DONE offsets within PCIE_SUBCTRL (see
+     * cm7_pcie_common.h: PCIE_PHY{0..3}_CFG_REG). */
+    static const uint32_t phy_sram_init_done_off[] = {
+        0x215C, /* PHY0 */
+        0x112C, /* PHY1 */
+        0x1130, /* PHY2 */
+        0x1134, /* PHY3 */
+    };
     MemoryRegion *mr = g_new(MemoryRegion, 1);
     uint64_t offset = R100_PCIE_SUBCTRL_BASE - R100_CFG_BASE;
     char name[64];
+    uint32_t *ram;
 
     snprintf(name, sizeof(name), "r100.chiplet%d.pcie_subctrl", chiplet_id);
     memory_region_init_ram(mr, NULL, name, R100_PCIE_SUBCTRL_SIZE,
                            &error_fatal);
     memory_region_add_subregion(cfg_mr, offset, mr);
+
+    ram = memory_region_get_ram_ptr(mr);
+    for (size_t i = 0; i < ARRAY_SIZE(phy_sram_init_done_off); i++) {
+        ram[phy_sram_init_done_off[i] / sizeof(uint32_t)] = 0x00000001;
+    }
 }
 
 /*

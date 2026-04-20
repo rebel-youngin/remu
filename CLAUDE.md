@@ -16,12 +16,20 @@ remu build              # or: cd cli && pip install -e . && remu build
 remu run                # boot with FW images from images/
 remu run --gdb          # wait for GDB on :1234
 remu status             # show environment status
+remu fw-build -p silicon   # build q-sys FW (tf-a + cp0 + cp1) → images/
 ```
 
 Manual build:
 ```
 cd build/qemu && ninja -j$(nproc)
 ```
+
+`remu fw-build` wraps `external/ssw-bundle/.../q/sys/build.sh`. Components are
+repeatable (`-c tf-a -c cp0 -c cp1`, default covers the CA73 boot set);
+platform is `silicon` / `zebu` / `zebu_ci` / `zebu_vdk`; `--install` (default
+on) copies the 6 CA73 binaries into `images/`. Toolchains are taken from
+`COMPILER_PATH_ARM64` / `COMPILER_PATH_ARM32` env vars, with defaults under
+`/mnt/data/tools/...`.
 
 ## Project layout
 
@@ -51,7 +59,7 @@ build/qemu/           QEMU build output (gitignored)
 - **CPU**: 8x CA73 per chiplet (2 clusters x 4 cores) = 32 total
 - **CHIPLET_OFFSET**: `0x2000000000` between chiplets
 - **Boot**: TF-A BL1 → BL2 → BL31 → FreeRTOS (q-sys), then q-cp tasks
-- **FW build flag**: `-p zebu` to skip PHY/QSPI hardware training
+- **FW build flag**: `-p silicon` runs full PHY/QSPI training paths (default for `remu fw-build`); `-p zebu_ci` skips CP1 + most training loops for a faster boot
 - **UART**: PL011 at `0x1FF9040000` (PERI0_UART0), 250MHz clock
 - **GIC**: GICv3 distributor at `0x1FF3800000`, redistributor at `0x1FF3840000`
 - **Timer**: 500MHz generic timer (`CORE_TIMER_FREQ`)
