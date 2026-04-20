@@ -623,24 +623,70 @@ static void r100_chiplet_init(MachineState *machine, int chiplet_id,
     r100_create_sysreg(cfg_mr, sysmem, chiplet_id, chiplet_base);
 
     /*
-     * --- SYSREG_CP0 RAM (private alias only, 64 KB) ---
+     * --- SYSREG_CP{0,1} backing RAM ---
+     *
      * BL1's plat_set_cpu_rvbar() writes each secondary CP0.cpu0's reset
-     * vector to RVBARADDR0_LOW/HIGH inside this block, via the QSPI
-     * bridge. The PMU device later reads the stored value when a
-     * CPU_CONFIGURATION write releases that core. A plain RAM region
-     * is sufficient — the FW only ever writes RVBAR (and a few TZPC
-     * regs that no currently-modelled path reads back).
+     * vector to RVBARADDR0_LOW/HIGH inside SYSREG_CP0, via the QSPI
+     * bridge (which targets the private alias). BL2's direct-MMIO path
+     * for CP1 release writes to the absolute cross-chiplet-form config
+     * address `CHIPLET_OFFSET * chiplet + SYSREG_CP0_OFFSET + PER_SYSREG_CP
+     * * cluster`, and BL31's PSCI warm-boot path writes to the chiplet-
+     * local config address. The PMU device then reads RVBAR back from
+     * the matching per-cluster backing when a CPU_CONFIGURATION write
+     * releases that core.
+     *
+     * Three separate access paths, one backing RAM per cluster per
+     * chiplet. We triple-mount each RAM:
+     *
+     *   1. At the private-alias sysmem address (for QSPI bridge writes
+     *      and any private-alias direct access).
+     *   2. Inside the chiplet's cfg_mr at the SYSREG config-space offset
+     *      (so absolute `chiplet_N * OFFSET + SYSREG_CP{0,1}_OFFSET`
+     *      writes from BL2 running on chiplet N land on chiplet N's own
+     *      RAM, not the unimpl catch-all).
+     *   3. In the per-chiplet CPU view at the chiplet-local SYSREG
+     *      config-space address (r100_build_chiplet_view handles this —
+     *      needed for BL31 PSCI set_rvbar which uses the local form).
+     *
+     * Overlap priority 1 inside cfg_mr outranks the chiplet-wide
+     * unimpl catch-all at priority 0.
      */
     {
-        MemoryRegion *mr = g_new(MemoryRegion, 1);
-        char nm[64];
-        snprintf(nm, sizeof(nm), "r100.chiplet%d.sysreg_cp0", chiplet_id);
-        memory_region_init_ram(mr, NULL, nm, R100_SYSREG_CP0_SIZE,
-                               &error_fatal);
-        memory_region_add_subregion_overlap(sysmem,
-                                            chiplet_base +
-                                                R100_SYSREG_CP0_PRIVATE_BASE,
-                                            mr, 0);
+        static const struct {
+            const char *tag;
+            uint64_t priv_base;
+            uint64_t cfg_base;
+        } sysreg_cp[] = {
+            { "sysreg_cp0",
+              R100_SYSREG_CP0_PRIVATE_BASE, R100_CP0_SYSREG_BASE },
+            { "sysreg_cp1",
+              R100_SYSREG_CP1_PRIVATE_BASE, R100_CP1_SYSREG_BASE },
+        };
+        size_t k;
+
+        for (k = 0; k < ARRAY_SIZE(sysreg_cp); k++) {
+            MemoryRegion *mr = g_new(MemoryRegion, 1);
+            MemoryRegion *cfg_alias = g_new(MemoryRegion, 1);
+            char nm[64];
+
+            snprintf(nm, sizeof(nm), "r100.chiplet%d.%s",
+                     chiplet_id, sysreg_cp[k].tag);
+            memory_region_init_ram(mr, NULL, nm, R100_SYSREG_CP0_SIZE,
+                                   &error_fatal);
+            memory_region_add_subregion_overlap(sysmem,
+                                                chiplet_base +
+                                                    sysreg_cp[k].priv_base,
+                                                mr, 0);
+
+            snprintf(nm, sizeof(nm), "r100.chiplet%d.%s_cfg",
+                     chiplet_id, sysreg_cp[k].tag);
+            memory_region_init_alias(cfg_alias, NULL, nm, mr, 0,
+                                     R100_SYSREG_CP0_SIZE);
+            memory_region_add_subregion_overlap(
+                cfg_mr,
+                sysreg_cp[k].cfg_base - R100_CFG_BASE,
+                cfg_alias, 1);
+        }
     }
 
     /* --- HBM3 controller stub --- */
@@ -738,6 +784,7 @@ static MemoryRegion *r100_build_chiplet_view(MemoryRegion *sysmem,
     MemoryRegion *sysmem_alias = g_new(MemoryRegion, 1);
     MemoryRegion *priv_alias = g_new(MemoryRegion, 1);
     MemoryRegion *cp0_cfg_alias = g_new(MemoryRegion, 1);
+    MemoryRegion *cp1_cfg_alias = g_new(MemoryRegion, 1);
     char name[64];
 
     snprintf(name, sizeof(name), "r100.chiplet%d.cpu_view", chiplet_id);
@@ -768,6 +815,20 @@ static MemoryRegion *r100_build_chiplet_view(MemoryRegion *sysmem,
                              R100_SYSREG_CP0_SIZE);
     memory_region_add_subregion_overlap(view, R100_CP0_SYSREG_BASE,
                                         cp0_cfg_alias, 10);
+
+    /*
+     * Chiplet-local alias of SYSREG_CP1 at its config-space address.
+     * BL2's plat_set_cpu_rvbar(CLUSTER_CP1, ...) writes the CP1 warm-boot
+     * entry through this address; the PMU device reads it back from the
+     * matching private-alias RAM on the CP1 CPU_CONFIGURATION release.
+     */
+    snprintf(name, sizeof(name), "r100.chiplet%d.sysreg_cp1_cfg_view",
+             chiplet_id);
+    memory_region_init_alias(cp1_cfg_alias, NULL, name, sysmem,
+                             chiplet_base + R100_SYSREG_CP1_PRIVATE_BASE,
+                             R100_SYSREG_CP0_SIZE);
+    memory_region_add_subregion_overlap(view, R100_CP1_SYSREG_BASE,
+                                        cp1_cfg_alias, 10);
 
     return view;
 }

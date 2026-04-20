@@ -239,6 +239,17 @@
 #define R100_CPMU_PRIVATE_BASE          0x1E00230000ULL  /* PMU private alias */
 #define R100_SYSREG_CP0_PRIVATE_BASE    0x1E01010000ULL  /* SYSREG_CP0 private alias (RVBAR etc.) */
 #define R100_SYSREG_CP0_SIZE            0x10000ULL       /* 64KB */
+/*
+ * SYSREG_CP1 mirrors SYSREG_CP0 at a fixed +0x800000 offset (both in the
+ * config-space and private-alias windows). BL2 on each chiplet releases
+ * its own CP1.cpu0 via rebel_h_pm.c:set_rvbar(), which writes RVBAR to
+ * SYSREG_CP0_OFFSET + PER_SYSREG_CP*1. The PMU device reads the RVBAR
+ * back from the matching private alias when CPU_CONFIGURATION triggers
+ * the release.
+ */
+#define R100_PER_SYSREG_CP              0x00800000ULL
+#define R100_SYSREG_CP1_PRIVATE_BASE    (R100_SYSREG_CP0_PRIVATE_BASE + \
+                                         R100_PER_SYSREG_CP)
 
 /*
  * Catch-all RAM window for the per-chiplet "private" alias region.

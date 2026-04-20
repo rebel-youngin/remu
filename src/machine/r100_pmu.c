@@ -108,32 +108,33 @@ static uint64_t r100_pmu_read(void *opaque, hwaddr addr, unsigned size)
 
 /*
  * Read back the 64-bit RVBAR previously written to this chiplet's
- * SYSREG_CP0 by BL1 (`plat_set_cpu_rvbar`). Returns 0 if the backing
- * RAM region is unmapped or access fails — callers treat 0 as "no
- * override" and skip the release.
+ * SYSREG_CP{0,1} by the FW. Returns 0 if the backing RAM region is
+ * unmapped or access fails — callers treat 0 as "no override" and
+ * skip the release.
  *
- * The SYSREG_CP0 device lives at `chiplet_id * CHIPLET_OFFSET +
- * SYSREG_CP0_PRIVATE_BASE` in our flat sysmem; the QSPI bridge writes
- * land there when BL1 targets the secondary chiplet's private alias.
+ * Three release paths converge here, all routed through the same
+ * backing RAM via dual-mount aliases:
+ *   - BL1 cold-boot:   plat_set_cpu_rvbar() via QSPI bridge → writes to
+ *                      the target chiplet's SYSREG_CP0 private alias.
+ *   - BL2 CP1 release: plat_set_cpu_rvbar(CLUSTER_CP1, ...) direct MMIO
+ *                      → writes to SYSREG_CP1 config-space address,
+ *                      overlaid onto the private-alias RAM by the
+ *                      per-chiplet CPU view.
+ *   - BL31 PSCI CPU_ON: rebel_h_pm.c:set_rvbar() direct MMIO → same
+ *                       dual-mount config-space address.
+ *
+ * SYSREG_CP1 sits at +R100_PER_SYSREG_CP from SYSREG_CP0 on silicon
+ * (see platform_def.h). Both blocks are 64 KB and share the
+ * RVBARADDR0_{LOW,HIGH} register layout.
  */
 static uint64_t r100_pmu_read_rvbar(R100PMUState *s, uint32_t cluster,
                                     uint32_t cpu)
 {
     uint64_t base = (uint64_t)s->chiplet_id * R100_CHIPLET_OFFSET +
-                    R100_SYSREG_CP0_PRIVATE_BASE;
+                    R100_SYSREG_CP0_PRIVATE_BASE +
+                    (uint64_t)cluster * R100_PER_SYSREG_CP;
     uint32_t lo = 0, hi = 0;
     MemTxResult r;
-
-    /*
-     * CLUSTER_CP1 is located 0x800000 beyond CP0 in the FW's direct
-     * MMIO path, but BL1's QSPI release always targets CP0. Keep the
-     * CP1 case as a no-op for now; BL2 does the intra-chiplet CP1
-     * release via direct MMIO which lands at the SYSREG_CP1 alias and
-     * is out of scope for this secondary-release path.
-     */
-    if (cluster != 0) {
-        return 0;
-    }
 
     r = address_space_read(&address_space_memory,
                            base + R100_SYSREG_RVBARADDR0_LOW +

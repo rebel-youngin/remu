@@ -46,7 +46,17 @@ FW_INSTALL_MAP = [
     ("FreeRTOS_CP1/freertos_kernel.bin",   "freertos_cp1.bin"),
 ]
 
+# R100 chiplet offset (must match R100_CHIPLET_OFFSET in remu_addrmap.h).
+R100_CHIPLET_OFFSET = 0x2000000000
+R100_NUM_CHIPLETS = 4
+
 # R100 firmware image definitions: (filename, load_address, description)
+#
+# These base addresses are all chiplet-0 absolute addresses. BL1/BL2 live in
+# iRAM inside the chiplet-local PRIVATE window and are replicated on each
+# chiplet by the existing QSPI-bridge cross-chiplet copy path. BL31/FreeRTOS
+# for CP0 live in chiplet 0's DRAM. BL31/FreeRTOS for CP1 need to exist in
+# every chiplet's DRAM — see FW_PER_CHIPLET_IMAGES below.
 FW_IMAGES = [
     ("bl1.bin",           0x1E00010000, "TF-A BL1 (iRAM)"),
     ("bl2.bin",           0x1E00028000, "TF-A BL2 (iRAM, GPT_DEST_ADDR_TBOOT_N)"),
@@ -58,6 +68,16 @@ FW_IMAGES = [
     # When absent the region is zero-filled, which is enough to progress past
     # BL1 (HW-CFG magic-code check fails and UCIe falls back to default speed).
     ("flash.bin",         0x1F80000000, "QSPI NOR flash dump (optional)"),
+]
+
+# Images that must also be staged at each secondary chiplet's DRAM base.
+# Each chiplet runs its own CP1.cpu0 starting at CP1_BL31_BASE, and the
+# per-chiplet CPU view routes the CP1 DRAM accesses to that chiplet's own
+# copy. Chiplet 0 is already covered by FW_IMAGES above; duplicate for
+# chiplets 1..R100_NUM_CHIPLETS-1 at chiplet_id * CHIPLET_OFFSET + base.
+FW_PER_CHIPLET_IMAGES = [
+    ("bl31_cp1.bin",     0x0014100000, "TF-A BL31 for CP1 (DRAM, chiplet-local)"),
+    ("freertos_cp1.bin", 0x0014200000, "FreeRTOS for CP1 (DRAM, chiplet-local)"),
 ]
 
 
@@ -382,6 +402,20 @@ def run(gdb, trace, chiplets, memory, uart_log_dir, hils_log):
         if path.is_file():
             cmd += ["-device", "loader,file=%s,addr=0x%x" % (path, addr)]
             found += 1
+
+    # CP1 images also need to land in each secondary chiplet's DRAM so that
+    # chiplet N's CP1.cpu0 (released by its own BL2) finds bl31_cp1.bin at
+    # its chiplet-local `CP1_BL31_BASE` entry point. Chiplet 0 is already
+    # covered by FW_IMAGES; replicate at chiplet_id * CHIPLET_OFFSET + base
+    # for chiplets 1..N-1.
+    for chiplet_id in range(1, R100_NUM_CHIPLETS):
+        for fname, base, _desc in FW_PER_CHIPLET_IMAGES:
+            path = IMAGES_DIR / fname
+            if path.is_file():
+                addr = chiplet_id * R100_CHIPLET_OFFSET + base
+                cmd += ["-device",
+                        "loader,file=%s,addr=0x%x" % (path, addr)]
+                found += 1
 
     if found == 0:
         click.secho("Warning: no firmware images in %s/" % IMAGES_DIR,
