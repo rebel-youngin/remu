@@ -4,9 +4,9 @@
 
 **Goal**: TF-A BL1 → BL2 → BL31 → FreeRTOS boots on all 4 chiplets, with **both** CP0 and CP1 clusters online on every chiplet.
 
-**Status (`-p zebu_ci` baseline)**: Chiplet 0's CP0 cluster reaches FreeRTOS's `terminal_task` shell (`REBELLIONS$`) with all four CP0 cores online. BL1 → BL2 → BL31 → FreeRTOS completes; `init_smp()` issues `psci_cpu_on()` for cores 1-3, each secondary CPU lands on BL31's warm-boot entry and `ERET`s to `secondary_prep_c` at EL1; `hw_init: done`. The HILS ring shows zero `[smmu] Failed to sync` retries and no post-prompt `spi tx available timeout error`. Secondary chiplets boot through BL2 but pause at BL31 entry because their BL31/FreeRTOS images aren't pre-loaded. CP1 clusters (16 of the 32 vCPUs: 4 cores × 4 chiplets) stay powered off — `-p zebu_ci` makes BL2 print `ZEBU_CI: skip CP1 reset release` and never hits the CP1 release path (see "CP1 boot — remaining work" below).
+**Status**: `remu fw-build -p silicon` is the target FW configuration and produces the full CA73 image set (BL1/BL2/BL31 + FreeRTOS for both CP0 and CP1). BL1 completes on all four chiplets — past `QSPI bridge check`, `Load tboot_p0`, `pmu_release_cm7`, `cm7_wait_phy_sram_init_done` (unblocked by seeding `PHY{0..3}_SRAM_INIT_DONE` bit [0] in the `PCIE_SUBCTRL` RAM stub), `Load tboot_p1/u/n`, secondary-chiplet release, and BL1 → BL2 handoff. BL2 then fails in `HBM3 init` at 6400 Mbps with `CH[0] Unrepairable PKG` → `HBM Boot on chiplet{N} FAIL` on all four chiplets; the silicon DBI lane-repair scan reads default values from `r100_hbm.c`. See "Other remaining items" for the open work list.
 
-**Status (`-p silicon` exploration)**: `remu fw-build -p silicon` produces the full CA73 image set. BL1 completes on all four chiplets — past `QSPI bridge check`, `Load tboot_p0`, `pmu_release_cm7`, `cm7_wait_phy_sram_init_done` (unblocked by seeding `PHY{0..3}_SRAM_INIT_DONE` bit [0] in the `PCIE_SUBCTRL` RAM stub), `Load tboot_p1/u/n`, secondary-chiplet release, and BL1 → BL2 handoff. BL2 then fails in `HBM3 init` at 6400 Mbps with `CH[0] Unrepairable PKG` → `HBM Boot on chiplet{N} FAIL` on all four chiplets — the silicon DBI lane-repair scan reads default values from the stub. Tracked under "Other remaining items".
+> Historical: an earlier `-p zebu_ci` configuration reached the `REBELLIONS$` shell on chiplet 0's CP0 cluster (BL1 → BL2 → BL31 → FreeRTOS all four CP0 cores online, secondaries paused at BL31 entry, CP1 powered off via the `ZEBU_CI: skip CP1 reset release` guard). The zebu profiles are still accepted by `remu fw-build -p zebu_ci` / `-p zebu` / `-p zebu_vdk` but are no longer on the critical path — all new work targets silicon.
 
 ### Device models (`src/machine/`)
 
@@ -19,7 +19,7 @@
 | `r100_hbm.c` | HBM3 | Sparse `GHashTable` write-back (6 MB window, default `0xFFFFFFFF`); ICON `test_instruction_req0/req1` RMW mirror. |
 | `r100_qspi.c` | QSPI bridge | DW SSI inter-chiplet register access: `0x70` (1-word read), `0x80` (1-word write), `0x83` (16-word burst write, used by BL1 `qspi_bridge_load_image()` to stage `tboot_n`); latches `DW_SPI_SYSREG_ADDRESS` upper-addr, rebuilds 28-bit offset into the slave chiplet's `PRIVATE_BASE`. |
 | `r100_qspi_boot.c` | QSPI_ROT (DWC_SSI master) | Status register permanently idle (`TFNF\|TFE\|RFNE`, `BUSY=0`), `TXFLR=0`, DRX reads return `0x82` (`FLASH_READY\|WRITE_ENABLE_LATCH`) so `qspi_boot.c:tx_available()` / `check_read_*_status()` exit on iteration 0; covers BL1 flash-load and BL31 `NOR_FLASH_SVC_*` SMC paths. Dual-mapped (`0x1FF0500000` / `0x1E00500000`). |
-| `r100_rbc.c` | RBC/UCIe | 6 blocks / chiplet (V00/V01/V10/V11/H00/H01); dual-mapped cfg-space (`0x1FF5xxxxxx`) + private alias (`0x1E05xxxxxx`); ZEBU link-up sentinel `global_reg_cmn_mcu_scratch_reg1 = 0xFFFFFFFF` + `lstatus_link_status = 1`. |
+| `r100_rbc.c` | RBC/UCIe | 6 blocks / chiplet (V00/V01/V10/V11/H00/H01); dual-mapped cfg-space (`0x1FF5xxxxxx`) + private alias (`0x1E05xxxxxx`); link-up sentinel `global_reg_cmn_mcu_scratch_reg1 = 0xFFFFFFFF` + `lstatus_link_status = 1`. |
 | `r100_smmu.c` | SMMU-600 TCU | `CR0 → CR0ACK` mirror + `GBPA.UPDATE` auto-clear (BL2 `smmu_early_init`); CMDQ walker: on each `CMDQ_PROD` write, walks `(old_cons, new_prod]` in guest DRAM, writes 32-bit 0 to the `MSI_ADDRESS` of every `CMD_SYNC` with `CS=SIG_IRQ` (FreeRTOS `smmu_sync()` points MSI back at the sync slot), and advances `CMDQ_CONS=PROD`. |
 | `r100_pvt.c` | PVT monitor | 5 instances / chiplet (ROT + 4 DCL); `PVT_CON_STATUS=0x3` (idle), per-sensor `_valid=1`, rest is RAM. |
 | `r100_dma.c` | PL330 DMA | Fake completion on `ch_stat[0].csr` / `dbgstatus` / `dbgcmd` polls. |
@@ -34,39 +34,39 @@ Additional RAM stubs created inline in `r100_soc.c`: PCIe sub-controller (`pmu_r
 - CLI: `remu build` / `remu run` / `remu status` / `remu gdb` / `remu images`.
 - q-sys integration via `external/ssw-bundle`; TF-A builds with CA73 errata + Spectre v4 workarounds disabled (`platform.mk`).
 
-### Observed boot trace
+### Observed boot trace (`-p silicon`)
 
 Chiplet 0 (stdio):
 
 ```
+NOTICE:  BL1: check QSPI bridge
 NOTICE:  BL1: Boot mode: NORMAL_BOOT (5)
+NOTICE:  BL1: Boot reason: Cold reset(POR)
+NOTICE:  BL1: Load tboot_p0
+INFO:    Release reset of CM7
+NOTICE:  BL1: pmu_release_cm7 complete
+NOTICE:  BL1: Load tboot_p1
+NOTICE:  BL1: check QSPI bridge
+NOTICE:  BL1: Load tboot_u
 NOTICE:  BL1: Detected secondary chiplet count: 3
+NOTICE:  BL1: ZEBU_CI: 0
 NOTICE:  BL1: Load tboot_n
 NOTICE:  BL1: Release reset of CP0.cpu0 of chiplet-{1,2,3}
 NOTICE:  BL1: Booting BL2
 NOTICE:  BL2: Detected secondary chiplet count: 3
-NOTICE:  BL2: Load CP0 BL31 / FREERTOS
-NOTICE:  BL2: Backup flash images to Chiplet-0 DRAM
-NOTICE:  BL2: Booting BL31
-NOTICE:  BL31: Chiplet-0 / Boot reason: Cold reset(POR)
-INFO:    ARM GICv3 driver initialized in EL3
-INFO:    BL31: Preparing for EL3 exit to normal world
-INFO:    Entry point address = 0x200000      [FreeRTOS EL1]
-core 1 is up / INFO: cpuid: 1, cpu_on requested / core 1 is online
-core 2 is up / ... / core 2 is online
-core 3 is up / ... / core 3 is online
-Hello world FreeRTOS_CP
-hw_init: done
-REBELLIONS$
+NOTICE:  BL2: Init CMU of chiplet-0
+NOTICE:  BL2: Init HBM of chiplet-0
+NOTICE:  HBM3 6400Mbps
+   ... EXTEST + DBI lane-repair scan ...
+ERROR:   CH[0] Unrepairable PKG
+ERROR:   HBM Boot on chiplet0 FAIL
 ```
 
-Chiplets 1-3 (`/tmp/remu_uart{1,2,3}.log`) reach `BL2: Booting BL31` and stop at `Entry point address = 0x0` (no BL31 image staged yet).
+Chiplets 1-3 (`/tmp/remu_uart{1,2,3}.log`) each reach their own `BL2: Init HBM of chiplet-{1,2,3}` and stop with the same `Unrepairable PKG` verdict — the four chiplets are running the same BL2 code path in parallel against the common `r100_hbm.c` stub.
 
-HILS ring tail (`/tmp/remu_hils.log`) surfaces UCIe `TimeoutWindow` programming, chiplet count / ID registration, `cp interface is registered`, `Thermal thresholds configured`, post-proc task registration. Zero `[smmu] Failed to sync` entries (previously 12+ per boot). A single non-fatal `failed to restore pcie event log` remains (empty flash on first boot).
+### CP1 boot — remaining REMU work
 
-### CP1 boot — remaining work
-
-Each chiplet has two independent clusters (CP0 and CP1), each running its own BL31 + FreeRTOS. On silicon, BL2 on each chiplet's CP0.cpu0 releases that chiplet's CP1.cpu0 via three MMIO writes (`rebel_h_bl2_setup.c:865-871`, guarded by `#ifndef ZEBU_CI`):
+Each chiplet has two independent clusters (CP0 and CP1), each running its own BL31 + FreeRTOS. On silicon, BL2 on each chiplet's CP0.cpu0 releases that chiplet's CP1.cpu0 via three MMIO writes (`rebel_h_bl2_setup.c:865-871`):
 
 ```c
 plat_set_cpu_rvbar(CHIPLET_ID, CLUSTER_CP1, CPU0, GPT_DEST_ADDR_BL31_CP1);  /* 0x14100000 */
@@ -74,23 +74,24 @@ plat_pmu_cl_on(CHIPLET_ID, CLUSTER_CP1);                                    /* C
 plat_pmu_cpu_on(CHIPLET_ID, CLUSTER_CP1, CPU0);                             /* CPU0_CONFIG + PERCLUSTER_OFFSET*1 */
 ```
 
-CP1.cpu0 then boots `bl31_cp1.bin` → `freertos_cp1.bin`, which runs its own `init_smp()` issuing PSCI CPU_ON SMCs to *its own* BL31_CP1 for CP1.cpu{1,2,3} — same mechanism CP0 uses, just landing at `CPU0_CONFIGURATION + PERCLUSTER_OFFSET*1 + PERCPU_OFFSET*cpuid`. Under `__TARGET_CP=1`, `rebel_h_pm.c:set_rvbar()` writes `SYSREG_CP1_OFFSET` (`0x1FF1810000` = `SYSREG_CP0_OFFSET + PER_SYSREG_CP*1`) instead of `SYSREG_CP0_OFFSET`.
+CP1.cpu0 then boots `bl31_cp1.bin` → `freertos_cp1.bin`, which runs its own `init_smp()` issuing PSCI CPU_ON SMCs to *its own* BL31_CP1 for CP1.cpu{1,2,3} — same mechanism CP0 uses, just landing at `CPU0_CONFIGURATION + PERCLUSTER_OFFSET*1 + PERCPU_OFFSET*cpuid`. Under `__TARGET_CP=1`, `rebel_h_pm.c:set_rvbar()` writes `SYSREG_CP1_OFFSET` (`0x1FF1810000` = `SYSREG_CP0_OFFSET + PER_SYSREG_CP*1`).
 
-To bring CP1 up in REMU (blocker for Phase 2):
+`remu fw-build -p silicon` already produces `bl31_cp1.bin` + `freertos_cp1.bin` and installs them into `images/` — the release path is unconditional under silicon. REMU-side work remaining to exercise CP1:
 
-- [ ] **FW build**: either switch `-p zebu_ci` → `-p zebu`/`-p silicon` and stub any extra hardware-training loops those paths hit, or locally drop the `#ifndef ZEBU_CI` guard around the CP1 release block in `rebel_h_bl2_setup.c` so we can keep using the zebu_ci image set.
-- [ ] **Images**: ship `bl31_cp1.bin` + `freertos_cp1.bin` (already listed as `[--]` in `remu status`), wire them into the CLI as `-device loader,file=bl31_cp1.bin,addr=0x14100000` + `...,addr=0x14200000` — replicated at `chiplet * CHIPLET_OFFSET + base` for secondaries.
+- [ ] **Per-chiplet CP1 image loaders** in the `remu run` command: currently `FW_IMAGES` maps CP1 binaries at chiplet-0 addresses only. Replicate `-device loader,addr=CHIPLET_OFFSET*n + base` for each secondary chiplet.
 - [ ] **SYSREG_CP1 RAM** (`src/machine/r100_soc.c`): mount a 64 KB region per chiplet at `chiplet_base + 0x1E01810000` (private alias) and overlay the config-space address `chiplet_base + 0x1FF1810000` in each chiplet's CPU view — one-liner following the existing SYSREG_CP0 template so CP1 RVBAR writes land on readable RAM.
 - [ ] **PMU** (`src/machine/r100_pmu.c`): drop the `if (cluster != 0) return 0` short-circuit in `r100_pmu_read_rvbar()` and compute `base = SYSREG_CP0_PRIVATE + cluster * PER_SYSREG_CP`. The existing `r100_pmu_handle_cpu_config()` decoder already computes MPIDR `(chiplet<<16)|(cluster<<8)|cpu` for cluster ∈ {0,1} and calls `arm_set_cpu_on()` — it just needs a non-zero RVBAR to return.
 
 Cluster-level `CP0_NONCPU_CONFIGURATION` / `CP0_L2_CONFIGURATION` writes don't need a write-through mirror: `r100_pmu_set_defaults()` already pre-seeds both status registers to ON at reset, so BL2's `plat_pmu_cl_on` polls pass on the first iteration.
+
+This work is gated behind the BL2 HBM3 blocker below — no point wiring CP1 until BL2 gets past HBM init.
 
 ### Other remaining items
 
 - [ ] Pre-load BL2/BL31/FreeRTOS (both CP0 and CP1) into each secondary chiplet's iRAM/DRAM so BL1's cross-chiplet copy lands on real data (alternative: populate `flash.bin` with a GPT image and let BL1 DMA-stage from flash).
 - [ ] Fix `sys/build.sh` where `debug` command resets CLI flags, so `CHIPLET_COUNT=1` builds work.
 - [ ] Test GDB attach and multi-core debugging (`thread N` across all 32 vCPUs, including CP1 halves).
-- [ ] **HBM3 silicon init path** (new blocker on `-p silicon`): BL2 runs real HBM PHY training at 6400Mbps with EXTEST + DBI lane-repair scan; the stub in `r100_hbm.c` returns default values that BL2 reads as "Unrepairable PKG" → `HBM Boot on chiplet{N} FAIL` on all four chiplets. Either add DBI/repair sentinels to the HBM stub or build with `HBM_TEST=0` / a profile that skips the training loop.
+- [ ] **HBM3 init** (current BL2 blocker): BL2 runs real HBM PHY training at 6400 Mbps with EXTEST + DBI lane-repair scan; the stub in `r100_hbm.c` returns default values that BL2 reads as "Unrepairable PKG" → `HBM Boot on chiplet{N} FAIL` on all four chiplets. Either add DBI/repair sentinels to the HBM stub or build with `HBM_TEST=0` to skip the training loop.
 
 ### Success criteria
 
@@ -101,7 +102,7 @@ Cluster-level `CP0_NONCPU_CONFIGURATION` / `CP0_L2_CONFIGURATION` writes don't n
 
 ## Phase 2: Host Drivers
 
-**Prerequisite**: Phase 1 complete — including the CP1 cluster release on every chiplet (see "CP1 boot — remaining work" above). `q-cp` tasks on CP1 service a non-trivial slice of the host-facing FW interface, so opening the PCIe endpoint without CP1 online would hit missing task-registration paths.
+**Prerequisite**: Phase 1 complete — including the CP1 cluster release on every chiplet (see "CP1 boot — remaining REMU work" above). `q-cp` tasks on CP1 service a non-trivial slice of the host-facing FW interface, so opening the PCIe endpoint without CP1 online would hit missing task-registration paths.
 
 **Goal**: kmd loads in an x86_64 QEMU guest, probes virtual PCI device, handshakes with FW, umd opens device.
 

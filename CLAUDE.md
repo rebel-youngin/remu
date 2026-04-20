@@ -59,7 +59,7 @@ build/qemu/           QEMU build output (gitignored)
 - **CPU**: 8x CA73 per chiplet (2 clusters x 4 cores) = 32 total
 - **CHIPLET_OFFSET**: `0x2000000000` between chiplets
 - **Boot**: TF-A BL1 → BL2 → BL31 → FreeRTOS (q-sys), then q-cp tasks
-- **FW build flag**: `-p silicon` runs full PHY/QSPI training paths (default for `remu fw-build`); `-p zebu_ci` skips CP1 + most training loops for a faster boot
+- **FW build**: `remu fw-build -p silicon` (default). The zebu / zebu_ci / zebu_vdk profiles are still accepted by `-p <name>` but are deprecated — see `docs/roadmap.md` Phase 1 Status
 - **UART**: PL011 at `0x1FF9040000` (PERI0_UART0), 250MHz clock
 - **GIC**: GICv3 distributor at `0x1FF3800000`, redistributor at `0x1FF3840000`
 - **Timer**: 500MHz generic timer (`CORE_TIMER_FREQ`)

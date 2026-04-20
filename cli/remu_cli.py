@@ -463,8 +463,8 @@ def status():
 
     if not any_found:
         click.echo()
-        click.secho("  No firmware images found. Build q-sys with "
-                     "'-p zebu' and copy binaries here.", fg="yellow")
+        click.secho("  No firmware images found. Run: "
+                     "remu fw-build -p silicon", fg="yellow")
 
     # Device models
     click.echo()
