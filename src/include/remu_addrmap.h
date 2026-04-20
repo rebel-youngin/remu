@@ -305,6 +305,17 @@
 #define R100_SYSREG_PERCPU_RVBAR_OFF    0x8
 #define R100_PMU_CP0_NONCPU_CONFIG      0x2400
 #define R100_PMU_CP0_NONCPU_STATUS      0x2404
+/*
+ * FW computes the per-cluster NONCPU register address as
+ * CP0_NONCPU_CONFIG/STATUS + PERNONCPU_OFFSET (0x40) * cluster, so CP1
+ * NONCPU_CONFIG = 0x2440 and CP1 NONCPU_STATUS = 0x2444. Needed by
+ * BL2's plat_pmu_cl_on(cluster=CP1) which polls 0x2444 & 0xF == 0xF.
+ */
+#define R100_PMU_PERNONCPU_OFFSET       0x0040
+#define R100_PMU_CP1_NONCPU_CONFIG      (R100_PMU_CP0_NONCPU_CONFIG + \
+                                         R100_PMU_PERNONCPU_OFFSET)
+#define R100_PMU_CP1_NONCPU_STATUS      (R100_PMU_CP0_NONCPU_STATUS + \
+                                         R100_PMU_PERNONCPU_OFFSET)
 #define R100_PMU_CP0_L2_CONFIG          0x2600
 #define R100_PMU_CP0_L2_STATUS          0x2604
 #define R100_PMU_CP1_L2_CONFIG          0x2620

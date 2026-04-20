@@ -830,6 +830,58 @@ static MemoryRegion *r100_build_chiplet_view(MemoryRegion *sysmem,
     memory_region_add_subregion_overlap(view, R100_CP1_SYSREG_BASE,
                                         cp1_cfg_alias, 10);
 
+    /*
+     * Per-chiplet GIC redistributor aliases.
+     *
+     * On silicon each chiplet has its own GIC instance with 8 redistributor
+     * frames (CP0.cpu0..CP1.cpu3). The FW therefore hardcodes the same MMIO
+     * addresses on every chiplet:
+     *   R100_GIC_REDIST_CP0_BASE (0x1FF3840000) — CP0 cluster, 4 frames
+     *   R100_GIC_REDIST_CP1_BASE (0x1FF38C0000) — CP1 cluster, 4 frames
+     *
+     * REMU has a single flat GICv3 with 32 redistributor frames laid out
+     * contiguously from R100_GIC_REDIST_CP0_BASE in cpu_index order. Without
+     * remapping, a secondary chiplet's BL31 CP1 calls
+     * gicv3_rdistif_probe(0x1FF38C0000), reads back chiplet 0 CP1.cpu0's
+     * GICR_TYPER (MPIDR mismatch), and el3_panic()s.
+     *
+     * Remap each chiplet's view so that the two cluster-local redistributor
+     * bases resolve to the 4 frames belonging to that chiplet's CPUs:
+     *   chiplet N CP0 view  0x1FF3840000 -> frames [N*8 .. N*8+3]
+     *   chiplet N CP1 view  0x1FF38C0000 -> frames [N*8+4 .. N*8+7]
+     * For chiplet 0 the aliases are the identity mapping.
+     *
+     * We remap only the 4-frame cluster slice (0x80000 each), not the whole
+     * GIC window, so the distributor at R100_GIC_DIST_BASE still resolves
+     * through sysmem_alias to the single shared distributor.
+     */
+    {
+        uint64_t frame_sz = 0x20000ULL;
+        uint64_t cluster_sz = R100_NUM_CORES_PER_CLUSTER * frame_sz;
+        uint64_t chiplet_sz = R100_NUM_CORES_PER_CHIPLET * frame_sz;
+        MemoryRegion *cp0_rdist_alias = g_new(MemoryRegion, 1);
+        MemoryRegion *cp1_rdist_alias = g_new(MemoryRegion, 1);
+
+        snprintf(name, sizeof(name), "r100.chiplet%d.cp0_rdist_view",
+                 chiplet_id);
+        memory_region_init_alias(cp0_rdist_alias, NULL, name, sysmem,
+                                 R100_GIC_REDIST_CP0_BASE +
+                                     (uint64_t)chiplet_id * chiplet_sz,
+                                 cluster_sz);
+        memory_region_add_subregion_overlap(view, R100_GIC_REDIST_CP0_BASE,
+                                            cp0_rdist_alias, 10);
+
+        snprintf(name, sizeof(name), "r100.chiplet%d.cp1_rdist_view",
+                 chiplet_id);
+        memory_region_init_alias(cp1_rdist_alias, NULL, name, sysmem,
+                                 R100_GIC_REDIST_CP0_BASE +
+                                     (uint64_t)chiplet_id * chiplet_sz +
+                                     cluster_sz,
+                                 cluster_sz);
+        memory_region_add_subregion_overlap(view, R100_GIC_REDIST_CP1_BASE,
+                                            cp1_rdist_alias, 10);
+    }
+
     return view;
 }
 
@@ -873,11 +925,24 @@ static void r100_soc_init(MachineState *machine)
         cpuobj = object_new(machine->cpu_type);
 
         /*
-         * Set MPIDR: Aff2=chiplet, Aff1=cluster, Aff0=core
-         * This allows the FW to identify which chiplet/cluster/core it is.
+         * MPIDR encoding: chiplet in bits [24:25], Aff1=cluster, Aff0=core.
+         *
+         * The R100 TF-A learns its chiplet identity from SYSREG
+         * (SYSREMAP_CHIPLET at 0x1E00220444), not from MPIDR. Its
+         * plat_core_pos_by_mpidr() masks out bits 24-31 and then requires
+         * the remaining value to be <= 0xFFFF (i.e. Aff2 = Aff3 = 0),
+         * returning Aff0 as the core position inside the chiplet. The
+         * binary is built per-cluster (bl31_cp0.bin / bl31_cp1.bin), so
+         * core positions only need to be unique within a cluster.
+         *
+         * Placing the chiplet id in the architectural "flags" band
+         * (bits 24-31, which the FW masks off) keeps mp_affinity unique
+         * across all 32 vCPUs for arm_set_cpu_on()/GIC routing while
+         * letting the FW see Aff2 == 0 on every chiplet.
          */
         object_property_set_int(cpuobj, "mp-affinity",
-                                (chiplet << 16) | (cluster << 8) | core,
+                                ((uint64_t)chiplet << 24) |
+                                    ((uint64_t)cluster << 8) | core,
                                 &error_fatal);
 
         /*

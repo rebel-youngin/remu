@@ -71,11 +71,18 @@ FW_IMAGES = [
 ]
 
 # Images that must also be staged at each secondary chiplet's DRAM base.
-# Each chiplet runs its own CP1.cpu0 starting at CP1_BL31_BASE, and the
-# per-chiplet CPU view routes the CP1 DRAM accesses to that chiplet's own
-# copy. Chiplet 0 is already covered by FW_IMAGES above; duplicate for
-# chiplets 1..R100_NUM_CHIPLETS-1 at chiplet_id * CHIPLET_OFFSET + base.
+# BL2 on each chiplet's CP0.cpu0 ERETs to BL31 at chiplet-local 0x0, and
+# then BL31 ERETs to FreeRTOS at chiplet-local 0x200000; similarly each
+# chiplet's CP1.cpu0 starts at CP1_BL31_BASE (0x14100000). On silicon,
+# BL2 on chiplet 0 DMA-copies these images to each secondary chiplet's
+# DRAM before releasing their CP0.cpu0 — REMU's DMA is a fake-completion
+# stub, so we instead pre-load all four binaries into every chiplet's
+# DRAM via QEMU -device loader. Chiplet 0 is already covered by
+# FW_IMAGES above; duplicate for chiplets 1..N-1 at
+# chiplet_id * CHIPLET_OFFSET + base.
 FW_PER_CHIPLET_IMAGES = [
+    ("bl31_cp0.bin",     0x0000000000, "TF-A BL31 for CP0 (DRAM, chiplet-local)"),
+    ("freertos_cp0.bin", 0x0000200000, "FreeRTOS for CP0 (DRAM, chiplet-local)"),
     ("bl31_cp1.bin",     0x0014100000, "TF-A BL31 for CP1 (DRAM, chiplet-local)"),
     ("freertos_cp1.bin", 0x0014200000, "FreeRTOS for CP1 (DRAM, chiplet-local)"),
 ]

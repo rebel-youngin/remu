@@ -8,8 +8,9 @@
  *   - RST_STAT (0x0404): reset type (cold vs chiplet reset)
  *   - INFORM4 (0x0840): secondary chiplet count (on primary) / boot config
  *   - CPU0_STATUS (0x2004): CPU power status (must return ON = 0xF)
- *   - CP0_NONCPU_STATUS (0x2404): cluster power status
- *   - CP0_L2_STATUS (0x2604): L2 cache power status
+ *   - CP{0,1}_NONCPU_STATUS (0x2404 / 0x2444): cluster power status
+ *     (FW computes as CP0_NONCPU_STATUS + PERNONCPU_OFFSET * cluster)
+ *   - CP{0,1}_L2_STATUS (0x2604 / 0x2624): L2 cache power status
  *   - DCL0_STATUS (0x4284): D-Cluster power status
  *
  * Writes to CPU_CONFIGURATION release (or halt) the target AP core; we
@@ -58,8 +59,14 @@ static void r100_pmu_set_defaults(R100PMUState *s)
         }
     }
 
-    /* Cluster power on */
+    /*
+     * Cluster power ON for both CP0 and CP1. BL2's plat_pmu_cl_on(cluster)
+     * polls CP0_NONCPU_STATUS + PERNONCPU_OFFSET*cluster & 0xF == 0xF
+     * before proceeding to plat_pmu_cpu_on() for the CP1.cpu0 release.
+     * Without the CP1 seed, that poll spins forever on all four chiplets.
+     */
     s->regs[R100_PMU_CP0_NONCPU_STATUS >> 2] = R100_PMU_CL_STATUS_ON;
+    s->regs[R100_PMU_CP1_NONCPU_STATUS >> 2] = R100_PMU_CL_STATUS_ON;
 
     /* L2 cache on for both CP0 and CP1 */
     s->regs[R100_PMU_CP0_L2_STATUS >> 2] = R100_PMU_L2_STATUS_ON;
@@ -186,7 +193,12 @@ static void r100_pmu_handle_cpu_config(R100PMUState *s, uint32_t cfg_off,
                  cpu_in_cluster * R100_PMU_PERCPU_OFFSET;
     s->regs[status_off >> 2] = power_on ? R100_PMU_CPU_STATUS_ON : 0;
 
-    mpidr = ((uint64_t)s->chiplet_id << 16) | ((uint64_t)cluster << 8)
+    /*
+     * Must match the mp-affinity encoding in r100_soc.c: chiplet in
+     * bits 24-25, Aff1=cluster, Aff0=core. See the long comment there
+     * for why the chiplet id is not placed in Aff2.
+     */
+    mpidr = ((uint64_t)s->chiplet_id << 24) | ((uint64_t)cluster << 8)
             | cpu_in_cluster;
 
     /*
