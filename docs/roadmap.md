@@ -4,7 +4,7 @@
 
 **Goal**: TF-A BL1 → BL2 → BL31 → FreeRTOS boots on all 4 chiplets, with **both** CP0 and CP1 clusters online on every chiplet.
 
-**Status**: `remu fw-build -p silicon` is the target FW configuration and produces the full CA73 image set (BL1/BL2/BL31 + FreeRTOS for both CP0 and CP1). BL1 completes on all four chiplets — past `QSPI bridge check`, `Load tboot_p0`, `pmu_release_cm7`, `cm7_wait_phy_sram_init_done` (unblocked by seeding `PHY{0..3}_SRAM_INIT_DONE` bit [0] in the `PCIE_SUBCTRL` RAM stub), `Load tboot_p1/u/n`, secondary-chiplet release, and BL1 → BL2 handoff. BL2 then fails in `HBM3 init` at 6400 Mbps with `CH[0] Unrepairable PKG` → `HBM Boot on chiplet{N} FAIL` on all four chiplets; the silicon DBI lane-repair scan reads default values from `r100_hbm.c`. See "Other remaining items" for the open work list.
+**Status**: `remu fw-build -p silicon` is the target FW configuration and produces the full CA73 image set (BL1/BL2/BL31 + FreeRTOS for both CP0 and CP1). BL1 completes on all four chiplets — past `QSPI bridge check`, `Load tboot_p0`, `pmu_release_cm7`, `cm7_wait_phy_sram_init_done` (unblocked by seeding `PHY{0..3}_SRAM_INIT_DONE` bit [0] in the `PCIE_SUBCTRL` RAM stub), `Load tboot_p1/u/n`, secondary-chiplet release, and BL1 → BL2 handoff. **BL2 now completes HBM3 init end-to-end on all four chiplets** — `r100_hbm.c` flips the PHY-region default from `0xFFFFFFFF` to `0` (so the fail-status / overflow / busy bitfields that dominate `hbm3_run_phy_training()` read back as "no error") and whitelists three "done = 1" polls (`cal_con4.phy_train_done`, `prbs_con0.prbs_{read,write}_done`, `scheduler_state.schd_fifo_empty_status`). With that, every chiplet runs the full `hbm3_phy_training_evt1` sequence (CBT → offset calibration → DCM init → Write Leveling → Read/Write training → PRBS → Vref search → HBM Training Complete), ECC init on all 16 channels, and then falls through to `BL2: Load CP0/CP1 BL31 + FREERTOS` and `Release a reset of CP1.cpu0`. The new boundary is BL31 / FreeRTOS bring-up — CP0.cpu0 appears to be reset-released on all four chiplets; UART output beyond `Set RVBAR of chiplet: N, cluster: 1, cpu: 0` has not been observed yet.
 
 > Historical: an earlier `-p zebu_ci` configuration reached the `REBELLIONS$` shell on chiplet 0's CP0 cluster (BL1 → BL2 → BL31 → FreeRTOS all four CP0 cores online, secondaries paused at BL31 entry, CP1 powered off via the `ZEBU_CI: skip CP1 reset release` guard). The zebu profiles are still accepted by `remu fw-build -p zebu_ci` / `-p zebu` / `-p zebu_vdk` but are no longer on the critical path — all new work targets silicon.
 
@@ -16,7 +16,7 @@
 | `r100_cmu.c` | CMU | 20 blocks / chiplet; PLL lock + mux_busy return idle instantly. |
 | `r100_pmu.c` | PMU | `CPU_CONFIGURATION` writes mirror `CPU_STATUS` and invoke `arm_set_cpu_on(mpidr, RVBAR, target_el=3)` with the FW-written RVBAR (covers BL1 cold-boot *and* BL31 PSCI warm-boot release); `DCL{0,1}_CONFIGURATION` → `DCL{0,1}_STATUS` mirror. Dual-mapped at config-space + private alias. |
 | `r100_sysreg.c` | SYSREG | Chiplet ID (0-3) via SYSREMAP. Dual-mapped. |
-| `r100_hbm.c` | HBM3 | Sparse `GHashTable` write-back (6 MB window, default `0xFFFFFFFF`); ICON `test_instruction_req0/req1` RMW mirror. |
+| `r100_hbm.c` | HBM3 | Sparse `GHashTable` write-back (6 MB window, default `0xFFFFFFFF` outside the PHY range, `0` inside). ICON `test_instruction_req0/req1` RMW mirror. EXTEST-aware `rd_wdrIDX_ch_X` responses — stub latches the scan sub-phase (TX0/TX1/RX0/RX1) from the `wr_wdr0` sentinel at the moment `extest_{tx,rx}_req` is asserted and returns the matching compare-vector so the DBI lane-repair scan sees `compare_result == 0` on every channel. PHY block (`HBM3_PHY_0_BASE..+16*0x10000`) defaults unwritten reads to 0 so fail-status / overflow / busy bitfields all pass, with three explicit "done = 1" overrides for the training polls (`cal_con4.phy_train_done`, `prbs_con0.prbs_{read,write}_done`, `scheduler_state.schd_fifo_empty_status`); lets BL2 run `hbm3_run_phy_training` end-to-end on all 16 channels per chiplet. |
 | `r100_qspi.c` | QSPI bridge | DW SSI inter-chiplet register access: `0x70` (1-word read), `0x80` (1-word write), `0x83` (16-word burst write, used by BL1 `qspi_bridge_load_image()` to stage `tboot_n`); latches `DW_SPI_SYSREG_ADDRESS` upper-addr, rebuilds 28-bit offset into the slave chiplet's `PRIVATE_BASE`. |
 | `r100_qspi_boot.c` | QSPI_ROT (DWC_SSI master) | Status register permanently idle (`TFNF\|TFE\|RFNE`, `BUSY=0`), `TXFLR=0`, DRX reads return `0x82` (`FLASH_READY\|WRITE_ENABLE_LATCH`) so `qspi_boot.c:tx_available()` / `check_read_*_status()` exit on iteration 0; covers BL1 flash-load and BL31 `NOR_FLASH_SVC_*` SMC paths. Dual-mapped (`0x1FF0500000` / `0x1E00500000`). |
 | `r100_rbc.c` | RBC/UCIe | 6 blocks / chiplet (V00/V01/V10/V11/H00/H01); dual-mapped cfg-space (`0x1FF5xxxxxx`) + private alias (`0x1E05xxxxxx`); link-up sentinel `global_reg_cmn_mcu_scratch_reg1 = 0xFFFFFFFF` + `lstatus_link_status = 1`. |
@@ -57,12 +57,29 @@ NOTICE:  BL2: Detected secondary chiplet count: 3
 NOTICE:  BL2: Init CMU of chiplet-0
 NOTICE:  BL2: Init HBM of chiplet-0
 NOTICE:  HBM3 6400Mbps
-   ... EXTEST + DBI lane-repair scan ...
-ERROR:   CH[0] Unrepairable PKG
-ERROR:   HBM Boot on chiplet0 FAIL
+   ... dfi_init_complete CH[0..15] ...
+========   EXTEST DONE  ========
+================================
+Lot_ID:  0000
+INFO:    CH[0] CBT Done
+ERROR:   CH[0] read optimal vref (vert) FAILED. No valid window found.
+INFO:    CH[0] Read/Write PRBS Training Done
+INFO:    CH[0] HBM Training Complete
+   ... repeats for CH[1..15] ...
+Chiplet ID[0] HBM3 init done
+NOTICE:  BL2: Run ECC init
+   ... ECC init done CH[0..15] ...
+NOTICE:  BL2: EVT version: 0x0
+NOTICE:  BL2: Load CP0 BL31
+NOTICE:  BL2: Load CP0 FREERTOS
+NOTICE:  BL2: Load CP1 BL31
+NOTICE:  BL2: Load CP1 FREERTOS
+NOTICE:  BL2: Backup flash images to Chiplet-0 DRAM
+NOTICE:  BL2: Release a reset of CP1.cpu0
+INFO:    Set RVBAR of chiplet: 0, cluster: 1, cpu: 0, ep: 336592896
 ```
 
-Chiplets 1-3 (`/tmp/remu_uart{1,2,3}.log`) each reach their own `BL2: Init HBM of chiplet-{1,2,3}` and stop with the same `Unrepairable PKG` verdict — the four chiplets are running the same BL2 code path in parallel against the common `r100_hbm.c` stub.
+Chiplets 1-3 (`/tmp/remu_uart{1,2,3}.log`) run the same sequence in parallel against their own `r100_hbm.c` instance — each prints `Chiplet ID[N] HBM3 init done`, 16x `ECC init done`, and `Release a reset of CP1.cpu0`. The `ERROR: CH[N] read optimal vref (vert) FAILED. No valid window found.` lines are the expected FW fallback path (`phy_read_recv_vref_training` returns without a valid window, FW retries at `0xfffe`, PRBS training reports Done, `HBM Training Complete` still fires) — not a failure. After all four chiplets finish BL2, boot currently stalls before any BL31 / FreeRTOS output on either cluster.
 
 ### CP1 boot — remaining REMU work
 
@@ -84,14 +101,15 @@ CP1.cpu0 then boots `bl31_cp1.bin` → `freertos_cp1.bin`, which runs its own `i
 
 Cluster-level `CP0_NONCPU_CONFIGURATION` / `CP0_L2_CONFIGURATION` writes don't need a write-through mirror: `r100_pmu_set_defaults()` already pre-seeds both status registers to ON at reset, so BL2's `plat_pmu_cl_on` polls pass on the first iteration.
 
-This work is gated behind the BL2 HBM3 blocker below — no point wiring CP1 until BL2 gets past HBM init.
+HBM3 init is no longer the blocker for CP1 bring-up — BL2 is now reaching `Release a reset of CP1.cpu0` on every chiplet, so the CP1 infrastructure items above are on the critical path.
 
 ### Other remaining items
 
 - [ ] Pre-load BL2/BL31/FreeRTOS (both CP0 and CP1) into each secondary chiplet's iRAM/DRAM so BL1's cross-chiplet copy lands on real data (alternative: populate `flash.bin` with a GPT image and let BL1 DMA-stage from flash).
 - [ ] Fix `sys/build.sh` where `debug` command resets CLI flags, so `CHIPLET_COUNT=1` builds work.
 - [ ] Test GDB attach and multi-core debugging (`thread N` across all 32 vCPUs, including CP1 halves).
-- [ ] **HBM3 init** (current BL2 blocker): BL2 runs real HBM PHY training at 6400 Mbps with EXTEST + DBI lane-repair scan; the stub in `r100_hbm.c` returns default values that BL2 reads as "Unrepairable PKG" → `HBM Boot on chiplet{N} FAIL` on all four chiplets. Either add DBI/repair sentinels to the HBM stub or build with `HBM_TEST=0` to skip the training loop.
+- [ ] **BL31 / FreeRTOS bring-up** (current BL2→BL31 boundary): BL2 finishes loading both CP0 and CP1 BL31 + FreeRTOS images, backs them up to chiplet-0 DRAM, and releases CP1.cpu0 via the PMU (`Set RVBAR of chiplet: N, cluster: 1, cpu: 0, ep: 0x14100000`), but no BL31 banner has been observed yet on any UART. Likely suspects, in order: (a) the release doesn't actually land because CP1 SYSREG / PMU paths aren't fully modelled (see "CP1 boot — remaining REMU work"); (b) CP0 BL31 needs something in HBM / CSR space beyond what the current stubs return; (c) FreeRTOS startup polls a peripheral we haven't touched (mailboxes, CNTGEN, DNC, SMMU). Next step: attach GDB to a stalled run (`remu run --gdb`), capture PC/LR for all 32 vCPUs, and walk outward from whichever one is spinning.
+- [ ] **HBM3 PHY training model** (optional, deferred): the current stub returns compile-time sentinels for the three "done" polls and 0 for everything else, which is enough for every training phase's top-level path to succeed but does emit benign `read optimal vref (vert) FAILED. No valid window found.` errors because the Vref search always "finds" no data. A more faithful model (seed a plausible eye, return real margins) would silence these, but is not on the critical path.
 
 ### Success criteria
 
@@ -154,7 +172,7 @@ This work is gated behind the BL2 HBM3 blocker below — no point wiring CP1 unt
 | DNC (16 x4) | N/A | Return-success | Behavioral model |
 | HDMA (x4) | N/A | Memcpy | Scatter-gather |
 | RBDMA (x4) | N/A | Stub | Behavioral model |
-| HBM3 (x4) | Sparse-writeback + ICON RMW mirror | Same | Same |
+| HBM3 (x4) | Sparse-writeback + ICON RMW mirror + EXTEST-aware `rd_wdr` sentinels + PHY fail/busy default 0 with `phy_train_done` / `prbs_{read,write}_done` / `schd_fifo_empty_status` overrides | Same | Same |
 | SMMU TCU (x4) | CR0/GBPA mirror + CMDQ walker (CMD_SYNC MSI=0 + auto-advance CONS) | Bypass | Translation model |
 | Mailboxes (x4) | Shared RAM (HBM-init handshake) | Same | Same |
 

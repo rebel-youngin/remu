@@ -118,6 +118,7 @@ struct R100HBMState {
     MemoryRegion iomem;
     GHashTable *regs;     /* hwaddr -> uint32_t (sparse write-back store) */
     uint32_t chiplet_id;
+    uint8_t extest_mode;  /* current ICON EXTEST scan: see r100_hbm.c */
 };
 
 typedef struct R100HBMState R100HBMState;
