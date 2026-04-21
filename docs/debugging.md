@@ -80,6 +80,37 @@ output/
 Re-using the same `--name` overwrites the log files in place. Nothing
 lands in `/tmp`.
 
+### Output layout with `--host` (Phase 2)
+
+`./remucli run --host` spawns both QEMUs (aarch64 NPU + x86_64 host
+guest) tied to the same shared-memory file. The run directory gains
+two subdirs and a `shm` symlink:
+
+```
+output/
+  my-test/
+    cmdline.txt       # NPU QEMU invocation
+    uart{0..3}.log    # NPU UARTs (as in Phase 1)
+    hils.log          # NPU HILS ring tail
+    shm -> /dev/shm/remu-my-test/
+    npu/
+      monitor.sock    # NPU HMP monitor (unix socket)
+      info-mtree.log  # captured info mtree — chiplet0.dram splice
+    host/
+      cmdline.txt     # x86 QEMU invocation
+      qemu.stdout.log
+      qemu.stderr.log
+      serial.log      # x86 guest serial (SeaBIOS + "No bootable device" idle)
+      monitor.sock    # host HMP monitor (unix socket)
+      info-pci.log    # captured info pci — lists 1eff:2030 endpoint
+      info-mtree.log  # captured info mtree — BAR0 shm splice
+```
+
+Everything under `/dev/shm/remu-<name>/` is cleaned up on exit. If
+`./remucli run --host` is killed `SIGKILL`-style and leaves an orphan
+behind, `rm -rf /dev/shm/remu-<name>` plus `pkill -f qemu-system-` is
+the manual recovery.
+
 ## Recommended agent workflow
 
 The standard loop when iterating on device models is:
@@ -217,6 +248,31 @@ Chiplet 0's UART is muxed with the QEMU monitor on stdio. Press
 (qemu) cont              # resume
 (qemu) info registers -a # every CPU
 ```
+
+### Unix-socket monitors with `--host`
+
+When Phase 2's `--host` is in play, the stdio-muxed monitor is still
+live on the NPU console, *and* both QEMUs expose a second monitor over
+a unix socket. Use `socat` interactively, or `nc -U` for one-shot
+queries:
+
+```
+# interactive
+socat - UNIX-CONNECT:output/my-test/npu/monitor.sock
+socat - UNIX-CONNECT:output/my-test/host/monitor.sock
+
+# one-shot, read back the shared splice
+printf 'info mtree\nquit\n' | socat - UNIX-CONNECT:output/my-test/npu/monitor.sock  | less
+printf 'xp /4wx 0x07f00000\nquit\n' | socat - UNIX-CONNECT:output/my-test/npu/monitor.sock
+printf 'xp /4wx 0xe007f00000\nquit\n' | socat - UNIX-CONNECT:output/my-test/host/monitor.sock
+```
+
+On the x86 side, the container-BAR0 window is at physical
+`0xE000000000` (top of the 64-bit PCI bridge pool), so shared-memory
+offsets become `0xE000000000 + <shm offset>`. On the NPU side,
+chiplet-0 DRAM starts at physical `0x0`, so the same bytes live at
+`<shm offset>`. `tests/m5_dataflow_test.py` is the canonical
+end-to-end check.
 
 ## Interpreting a boot log
 

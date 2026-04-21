@@ -857,19 +857,24 @@ def run(name, output_root, gdb, trace, chiplets, memory,
       cmdline.txt     — the full QEMU command used for this run
 
     With --host (Phase 2), a second QEMU process (x86_64) is launched
-    alongside with the r100-npu-pci endpoint (0x1eff:0x2030) attached,
-    and a /dev/shm-backed memory segment is mapped by both processes
-    (M4+ aliases it into BAR0). The host QEMU is paused at reset for
-    now; its monitor is reachable on <run>/host/monitor.sock.
-    Additional output files:
+    alongside, with the r100-npu-pci endpoint (0x1eff:0x2030) attached.
+    The same /dev/shm-backed memory segment is spliced into BAR0 of
+    that PCI device (M4) *and* over chiplet 0's DRAM on the NPU side
+    (M5), so stores from either side land in the same tmpfs pages.
+    SeaBIOS on the x86 side runs through BAR programming and idles at
+    "No bootable device"; both QEMU monitors are exposed on unix
+    sockets. Additional output files:
 
     \b
-      shm              symlink → /dev/shm/remu-<name>/
-      host/cmdline.txt the full x86 QEMU command
-      host/qemu.*.log  x86 QEMU stdout / stderr
-      host/serial.log  x86 guest serial
+      shm               symlink → /dev/shm/remu-<name>/
+      npu/monitor.sock  NPU HMP monitor (unix socket)
+      npu/info-mtree.log captured `info mtree` on the NPU (chiplet0.dram splice)
+      host/cmdline.txt  the full x86 QEMU command
+      host/qemu.*.log   x86 QEMU stdout / stderr
+      host/serial.log   x86 guest serial
+      host/monitor.sock host HMP monitor (unix socket)
       host/info-pci.log captured `info pci` HMP output (auto-verified)
-      host/info-mtree.log captured `info mtree` (shows BAR0/shm wiring)
+      host/info-mtree.log captured `info mtree` on the host (BAR0 splice)
 
     `<output-root>/latest` is updated to point at the most recent run.
     """

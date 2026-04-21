@@ -148,13 +148,11 @@ output/               Per-run log directories (gitignored; see docs/debugging.md
 
 ## Key external files
 
-When modifying device models, cross-reference these FW/driver sources:
-
-| What to check | File |
-|----------------|------|
 All FW/driver sources live inside `external/ssw-bundle` (initialized via
 `git submodule update --init --recursive`). Shorthand: `$BUNDLE` below is
 `external/ssw-bundle/products`.
+
+When modifying device models, cross-reference these FW/driver sources:
 
 | What to check | File |
 |----------------|------|

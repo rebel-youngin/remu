@@ -42,7 +42,10 @@ Real hardware:
 
 ### Dual-QEMU Model
 
-REMU uses two QEMU instances connected by shared memory:
+REMU uses two QEMU instances connected by shared memory (Phase 2;
+tracked per-milestone in `docs/roadmap.md`). Both binaries build from
+the single pinned QEMU tree (`./remucli build` → `qemu-system-aarch64`
++ `qemu-system-x86_64`); `./remucli run --host` wires them up:
 
 ```
 ┌─ Host QEMU (x86_64 + KVM) ─────────────────────┐
@@ -52,9 +55,10 @@ REMU uses two QEMU instances connected by shared memory:
 │       BAR0=DRAM  BAR2=config  BAR4=doorbell      │
 ├──────────────────────────────────────────────────┤
 │  r100-npu-pci (QEMU device model)                │
-│    └─ BARs backed by /dev/shm/remu-*             │
-│    └─ doorbell → eventfd → FW QEMU               │
-│    └─ MSI-X ← eventfd ← FW QEMU                 │
+│    └─ BAR0 backed by /dev/shm/remu-* (M4) ✓      │
+│    └─ BAR2/4/5 lazy RAM + MSI-X table (M3) ✓     │
+│    └─ doorbell → eventfd → FW QEMU   (M6 pending)│
+│    └─ MSI-X ← eventfd ← FW QEMU     (M7 pending) │
 └────────────┬──────────────────┬──────────────────┘
              │ shared memory    │ eventfd
 ┌────────────┴──────────────────┴──────────────────┐

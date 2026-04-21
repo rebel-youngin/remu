@@ -52,21 +52,40 @@ Additional inline RAM stubs in `r100_soc.c`: PCIe sub-controller (`PHY{0..3}_SRA
 - All 32 vCPUs (4 chiplets × 2 clusters × 4 cores) reach FreeRTOS steady-state ✓
 - GDB can step through FW code on any chiplet's CP0 or CP1 vCPU ✓ (see `docs/debugging.md`)
 
-## Phase 2: Host Drivers
+## Phase 2: Host Drivers — in progress (M1-M5 done)
 
 **Prerequisite**: Phase 1 complete. `q-cp` tasks on CP1 service a non-trivial slice of the host-facing FW interface, so opening the PCIe endpoint without CP1 online would hit missing task-registration paths.
 
 **Goal**: kmd loads in an x86_64 QEMU guest, probes virtual PCI device, handshakes with FW, umd opens device.
 
-### New components
+### Milestone breakdown
 
-- **r100-npu-pci**: QEMU PCI device model for the host side
-  - Vendor `0x1eff`, Device `0x2030` (CR03 quad)
-  - BAR0 (DRAM), BAR2 (config), BAR4 (doorbell), BAR5 (MSI-X)
-- **Shared memory bridge**: POSIX shm (`/dev/shm/remu-*`) connecting both QEMU instances
-- **Doorbell/MSI-X routing**: eventfd-based interrupt forwarding
-- **DNC stub**: accepts tasks, immediately generates completion interrupt
-- **HDMA stub**: performs actual memcpy between DRAM regions
+Phase 2 is sliced into 9 incremental milestones. Each one boots end-to-end and commits cleanly.
+
+| # | Milestone | Status | Deliverable |
+|---|---|---|---|
+| M1 | Two-binary build | done | `./remucli build` produces `qemu-system-{aarch64,x86_64}` from the single pinned QEMU tree |
+| M2 | Shared-memory plumbing | done | `/dev/shm/remu-<name>/remu-shm` opened `share=on` by both QEMUs; `./remucli run --host` orchestrates both with clean signal-driven teardown |
+| M3 | `r100-npu-pci` skeleton | done | PCI function `0x1eff:0x2030` exposes BAR0/2/4/5 at the sizes `rebel.h` expects; lazy RAM backing + `msix_init` table on BAR5 |
+| M4 | Host BAR0 → shm splice | done | BAR0 is a container: shared backend at offset 0, lazy RAM on the tail. `./remucli run --host` auto-verifies via `info pci` / `info mtree` / `/proc/<pid>/maps` |
+| M5 | NPU DRAM → shm splice | done | Chiplet-0 DRAM is a container: same shared backend at offset 0, lazy RAM on the tail past the FW image region. `tests/m5_dataflow_test.py` proves coherency both ways |
+| M6 | Doorbell path (guest → FW) | pending | BAR4 writes on the x86 side signal an eventfd that the NPU converts into a GIC SPI injection |
+| M7 | MSI-X path (FW → guest) | pending | Reverse direction. NPU-side eventfd fires `msix_notify()` in `r100-npu-pci` |
+| M8 | `FW_BOOT_DONE` + `TEST_IB` ring | pending | First real protocol: kmd and q-cp HIL exchange messages on the shared-DRAM ring. Hits the roadmap success criterion |
+| M9 | DNC stub + trivial umd job | pending | umd opens `/dev/rebellions0`, submits a zero-op job, DNC stub signals completion via MSI-X |
+
+### Components (current state after M5)
+
+- **`r100-npu-pci`** (`src/host/r100_npu_pci.c`): x86-side PCI device, vendor/device `0x1eff:0x2030`, four BARs. BAR0 splices in a `HostMemoryBackend` via the `memdev` link at offset 0 (M4); BAR2/4 are plain lazy RAM; BAR5 carries the 32-vector MSI-X table + PBA. **Pending**: BAR4 needs eventfd-backed MMIO (M6), MSI-X needs wiring to NPU-side eventfd (M7).
+- **`r100-soc` machine** (`src/machine/r100_soc.c`): gains a `memdev` string property resolved at machine-init. Chiplet 0 DRAM becomes a container — shared backend at offset 0 + lazy-RAM tail (M5). Secondary chiplets unchanged.
+- **Shared memory bridge**: `memory-backend-file` at `/dev/shm/remu-<name>/remu-shm`, opened with `share=on` by both QEMUs. Declared on x86 side as `-device r100-npu-pci,memdev=remushm`, on NPU side as `-machine r100-soc,memdev=remushm`.
+- **`./remucli run --host`**: dual-QEMU orchestrator. Auto-verifies the bridge end-to-end (PCI enumeration + host `info mtree` + NPU `info mtree` + `/proc/<pid>/maps` on both processes). Hands both QEMU monitors out as unix sockets under `output/<name>/{host,npu}/monitor.sock`.
+
+### Pending components
+
+- **Doorbell/MSI-X routing**: eventfd-based interrupt forwarding (M6, M7).
+- **DNC stub**: accepts tasks, immediately generates completion interrupt (M9).
+- **HDMA stub**: performs actual memcpy between DRAM regions (M9).
 
 ### Success criteria
 
