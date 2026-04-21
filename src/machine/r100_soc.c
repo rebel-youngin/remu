@@ -6,8 +6,9 @@
  *   - 32 CA73 vCPUs (4 chiplets x 2 clusters x 4 cores)
  *   - Per-chiplet memory regions (DRAM, iROM, iRAM, SP, SHM)
  *   - Per-chiplet peripheral stubs (CMU, PMU, SYSREG, HBM3)
- *   - GICv3 interrupt controller
- *   - PL011 UART for console output
+ *   - Per-chiplet GICv3 (one arm-gicv3 instance per chiplet, num-cpu=8)
+ *   - Per-chiplet 16550 UART for console output (chardev-demuxed, IRQ=SPI 33
+ *     on its own chiplet's GIC)
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -831,108 +832,54 @@ static MemoryRegion *r100_build_chiplet_view(MemoryRegion *sysmem,
                                         cp1_cfg_alias, 10);
 
     /*
-     * Per-chiplet GIC redistributor aliases.
+     * Chiplet-local aliases for this chiplet's own GIC.
      *
-     * On silicon each chiplet has its own GIC instance with 8 redistributor
-     * frames (CP0.cpu0..CP1.cpu3). The FW therefore hardcodes the same MMIO
-     * addresses on every chiplet:
-     *   R100_GIC_REDIST_CP0_BASE (0x1FF3840000) — CP0 cluster, 4 frames
-     *   R100_GIC_REDIST_CP1_BASE (0x1FF38C0000) — CP1 cluster, 4 frames
-     *
-     * REMU has a single flat GICv3 with 32 redistributor frames laid out
-     * contiguously from R100_GIC_REDIST_CP0_BASE in cpu_index order. Without
-     * remapping, a secondary chiplet's BL31 CP1 calls
-     * gicv3_rdistif_probe(0x1FF38C0000), reads back chiplet 0 CP1.cpu0's
-     * GICR_TYPER (MPIDR mismatch), and el3_panic()s.
-     *
-     * Remap each chiplet's view so that the two cluster-local redistributor
-     * bases resolve to the 4 frames belonging to that chiplet's CPUs:
-     *   chiplet N CP0 view  0x1FF3840000 -> frames [N*8 .. N*8+3]
-     *   chiplet N CP1 view  0x1FF38C0000 -> frames [N*8+4 .. N*8+7]
-     * For chiplet 0 the aliases are the identity mapping.
-     *
-     * We remap only the 4-frame cluster slice (0x80000 each), not the whole
-     * GIC window, so the distributor at R100_GIC_DIST_BASE still resolves
-     * through sysmem_alias to the single shared distributor.
-     */
-    {
-        uint64_t frame_sz = 0x20000ULL;
-        uint64_t cluster_sz = R100_NUM_CORES_PER_CLUSTER * frame_sz;
-        uint64_t chiplet_sz = R100_NUM_CORES_PER_CHIPLET * frame_sz;
-        MemoryRegion *cp0_rdist_alias = g_new(MemoryRegion, 1);
-        MemoryRegion *cp1_rdist_alias = g_new(MemoryRegion, 1);
-
-        snprintf(name, sizeof(name), "r100.chiplet%d.cp0_rdist_view",
-                 chiplet_id);
-        memory_region_init_alias(cp0_rdist_alias, NULL, name, sysmem,
-                                 R100_GIC_REDIST_CP0_BASE +
-                                     (uint64_t)chiplet_id * chiplet_sz,
-                                 cluster_sz);
-        memory_region_add_subregion_overlap(view, R100_GIC_REDIST_CP0_BASE,
-                                            cp0_rdist_alias, 10);
-
-        snprintf(name, sizeof(name), "r100.chiplet%d.cp1_rdist_view",
-                 chiplet_id);
-        memory_region_init_alias(cp1_rdist_alias, NULL, name, sysmem,
-                                 R100_GIC_REDIST_CP0_BASE +
-                                     (uint64_t)chiplet_id * chiplet_sz +
-                                     cluster_sz,
-                                 cluster_sz);
-        memory_region_add_subregion_overlap(view, R100_GIC_REDIST_CP1_BASE,
-                                            cp1_rdist_alias, 10);
-    }
-
-    /*
-     * Per-chiplet GIC distributor alias.
-     *
-     * Silicon has one GICv3 per chiplet, so every chiplet's FW reads
-     * GICD_PIDR2 from its own distributor at R100_GIC_DIST_BASE
-     * (0x1FF3800000). In REMU the single shared arm-gicv3's distributor
-     * is mounted in sysmem at R100_GIC_DIST_BASE (by sysbus_mmio_map in
-     * r100_soc_init), which chiplet 0 reaches fine via sysmem_alias.
-     *
-     * Secondary chiplets, however, never see it: r100_chiplet_init
-     * installs each chiplet's cfg_mr container (covering R100_CFG_BASE
-     * +R100_CFG_SIZE, priority 0) at `chiplet_base + R100_CFG_BASE` in
-     * sysmem. cfg_mr has an unimplemented-device catch-all, so its
-     * offset 0x380_FFE8 absorbs the GICD_PIDR2 read on chiplets 1-3
-     * before it can fall through to sysmem_alias → sysmem's real
-     * gicv3_dist. gicv3_driver_init() then reads PIDR2 = 0, its
-     * ARCH_REV_GICV3 assertion trips, and BL31 lands in
-     * plat_panic_handler.
-     *
-     * Alias the distributor at R100_GIC_DIST_BASE in this chiplet's
-     * view at priority 10 so the TLB walk hits the real gicv3_dist
-     * MMIO before the chiplet-local cfg_mr catch-all. The alias points
-     * at sysmem's copy (resolved lazily; the GIC is realized after
-     * this function runs).
+     * r100_soc_init mounts each chiplet's arm-gicv3 in sysmem at
+     * chiplet_base + R100_GIC_DIST_BASE / R100_GIC_REDIST_CP0_BASE (priority 1
+     * to beat cfg_mr). Here we alias the FW-hardcoded chiplet-local addresses
+     * back to that chiplet-absolute sysmem region, at priority 10 so the CPU
+     * resolves its GIC reads here instead of falling through sysmem_alias to
+     * chiplet 0's cfg_mr. The redist alias covers the full 8-frame 1 MB
+     * window (CP0 frames at +0..3, CP1 frames at +4..7 = +0x80000 =
+     * R100_GIC_REDIST_CP1_BASE). Aliases resolve lazily, so this is fine
+     * even though the GIC is realized later.
      */
     {
         MemoryRegion *dist_alias = g_new(MemoryRegion, 1);
+        MemoryRegion *redist_alias = g_new(MemoryRegion, 1);
 
         snprintf(name, sizeof(name), "r100.chiplet%d.gic_dist_view",
                  chiplet_id);
         memory_region_init_alias(dist_alias, NULL, name, sysmem,
-                                 R100_GIC_DIST_BASE, 0x10000);
+                                 chiplet_base + R100_GIC_DIST_BASE,
+                                 0x10000);
         memory_region_add_subregion_overlap(view, R100_GIC_DIST_BASE,
                                             dist_alias, 10);
+
+        snprintf(name, sizeof(name), "r100.chiplet%d.gic_redist_view",
+                 chiplet_id);
+        memory_region_init_alias(redist_alias, NULL, name, sysmem,
+                                 chiplet_base + R100_GIC_REDIST_CP0_BASE,
+                                 0x100000);
+        memory_region_add_subregion_overlap(view, R100_GIC_REDIST_CP0_BASE,
+                                            redist_alias, 10);
     }
 
     return view;
 }
 
 /*
- * Machine initialization: creates 4 chiplets, 32 CPUs, GIC, UART.
+ * Machine initialization: creates 4 chiplets, 32 CPUs, 4 per-chiplet GICs, UART.
  */
 static void r100_soc_init(MachineState *machine)
 {
     MemoryRegion *sysmem = get_system_memory();
     MemoryRegion *chiplet_views[R100_NUM_CHIPLETS];
+    DeviceState *gic_dev[R100_NUM_CHIPLETS];
     Object *cpuobj;
-    DeviceState *gicdev;
-    SysBusDevice *gicbusdev;
     int chiplet, cluster, core, cpu_idx;
     int num_cpus = R100_NUM_CORES_TOTAL;
+    const int cpus_per_gic = R100_NUM_CORES_PER_CHIPLET; /* 8 */
 
     /* Validate CPU count */
     if (machine->smp.cpus != num_cpus && machine->smp.cpus != 0) {
@@ -1031,44 +978,72 @@ static void r100_soc_init(MachineState *machine)
     }
 
     /*
-     * --- GICv3 ---
-     * We create one GIC for chiplet 0. In a full multi-chiplet model,
-     * each chiplet would have its own GIC instance. For Phase 1, we start
-     * with one GIC serving all CPUs (simplified).
+     * --- Per-chiplet GICv3 ---
+     * Silicon has one GIC600 per chiplet. Each is modelled here as an
+     * independent arm-gicv3 instance with num-cpu=8 (2 clusters * 4 cores)
+     * and a single 8-frame redistributor region:
+     *   GICD: 0x10000, 64 KB
+     *   GICR: 0x100000, 1 MB, 8 frames contiguous
+     *     frames 0..3 -> CP0.cpu0..3   (= R100_GIC_REDIST_CP0_BASE)
+     *     frames 4..7 -> CP1.cpu0..3   (= R100_GIC_REDIST_CP1_BASE,
+     *                                   i.e. CP0_BASE + 4 * 0x20000)
+     *
+     * Mounting strategy (same pattern as PMU, SYSREG, CMU, HBM, etc.):
+     *   - Each chiplet's GIC MMIO is mounted in sysmem at the chiplet-absolute
+     *     address `chiplet_base + R100_GIC_*_BASE`, using sysbus_mmio_map_overlap
+     *     with priority 1 — so it outranks that chiplet's cfg_mr container
+     *     (185 MB at chiplet_base + R100_CFG_BASE, priority 0) covering the
+     *     same range.
+     *   - r100_build_chiplet_view installs priority-10 aliases at the
+     *     FW-local R100_GIC_*_BASE that point back at the chiplet-absolute
+     *     sysmem regions. Aliases are lazy and propagate correctly even
+     *     though the GIC is realized after the CPU views are built.
+     *
+     * Upstream arm-gicv3 always binds to global CPUs 0..num_cpu-1 via
+     * qemu_get_cpu(i), so without extension multiple instances collide on
+     * ICC_* cpreg registration. external/qemu carries a local patch adding
+     * a first-cpu-index property (hw/intc/arm_gicv3_common.{c,h},
+     * arm_gicv3_cpuif.c, arm_gicv3_kvm.c); we set it to chiplet*8 so GIC N
+     * binds to global CPUs [8*N .. 8*N+7].
      */
-    gicdev = qdev_new("arm-gicv3");
-    qdev_prop_set_uint32(gicdev, "num-cpu", num_cpus);
-    qdev_prop_set_uint32(gicdev, "num-irq", 256);
-    qdev_prop_set_uint32(gicdev, "revision", 3);
-    /*
-     * GICv3 redistributor: each CPU needs a 128KB (0x20000) frame.
-     * 32 CPUs = 4MB total. Map as a single contiguous region.
-     */
-    {
-        QList *redist = qlist_new();
-        qlist_append_int(redist, num_cpus);
-        qdev_prop_set_array(gicdev, "redist-region-count", redist);
-    }
-    gicbusdev = SYS_BUS_DEVICE(gicdev);
-    sysbus_realize_and_unref(gicbusdev, &error_fatal);
+    for (chiplet = 0; chiplet < R100_NUM_CHIPLETS; chiplet++) {
+        SysBusDevice *gbd;
+        uint64_t chiplet_base = (uint64_t)chiplet * R100_CHIPLET_OFFSET;
 
-    /* Map GIC distributor at chiplet 0's GIC address */
-    sysbus_mmio_map(gicbusdev, 0, R100_GIC_DIST_BASE);
-    /* Map GIC redistributor (32 CPUs * 0x20000 = 4MB starting at GICR base) */
-    sysbus_mmio_map(gicbusdev, 1, R100_GIC_REDIST_CP0_BASE);
+        gic_dev[chiplet] = qdev_new("arm-gicv3");
+        qdev_prop_set_uint32(gic_dev[chiplet], "num-cpu", cpus_per_gic);
+        qdev_prop_set_uint32(gic_dev[chiplet], "first-cpu-index",
+                             (uint32_t)chiplet * cpus_per_gic);
+        qdev_prop_set_uint32(gic_dev[chiplet], "num-irq", 256);
+        qdev_prop_set_uint32(gic_dev[chiplet], "revision", 3);
+        {
+            QList *redist = qlist_new();
+            qlist_append_int(redist, cpus_per_gic);
+            qdev_prop_set_array(gic_dev[chiplet], "redist-region-count",
+                                redist);
+        }
+        gbd = SYS_BUS_DEVICE(gic_dev[chiplet]);
+        sysbus_realize_and_unref(gbd, &error_fatal);
 
-    /* Wire GIC IRQ outputs to CPU inputs (matches virt.c pattern) */
-    for (cpu_idx = 0; cpu_idx < num_cpus; cpu_idx++) {
-        DeviceState *cpudev = DEVICE(qemu_get_cpu(cpu_idx));
+        /* Priority 1 beats each chiplet's cfg_mr (priority 0). */
+        sysbus_mmio_map_overlap(gbd, 0,
+                                chiplet_base + R100_GIC_DIST_BASE, 1);
+        sysbus_mmio_map_overlap(gbd, 1,
+                                chiplet_base + R100_GIC_REDIST_CP0_BASE, 1);
 
-        sysbus_connect_irq(gicbusdev, cpu_idx,
-                           qdev_get_gpio_in(cpudev, ARM_CPU_IRQ));
-        sysbus_connect_irq(gicbusdev, cpu_idx + num_cpus,
-                           qdev_get_gpio_in(cpudev, ARM_CPU_FIQ));
-        sysbus_connect_irq(gicbusdev, cpu_idx + 2 * num_cpus,
-                           qdev_get_gpio_in(cpudev, ARM_CPU_VIRQ));
-        sysbus_connect_irq(gicbusdev, cpu_idx + 3 * num_cpus,
-                           qdev_get_gpio_in(cpudev, ARM_CPU_VFIQ));
+        for (int local = 0; local < cpus_per_gic; local++) {
+            int gi = chiplet * cpus_per_gic + local;
+            DeviceState *cpudev = DEVICE(qemu_get_cpu(gi));
+
+            sysbus_connect_irq(gbd, local,
+                               qdev_get_gpio_in(cpudev, ARM_CPU_IRQ));
+            sysbus_connect_irq(gbd, local + cpus_per_gic,
+                               qdev_get_gpio_in(cpudev, ARM_CPU_FIQ));
+            sysbus_connect_irq(gbd, local + 2 * cpus_per_gic,
+                               qdev_get_gpio_in(cpudev, ARM_CPU_VIRQ));
+            sysbus_connect_irq(gbd, local + 3 * cpus_per_gic,
+                               qdev_get_gpio_in(cpudev, ARM_CPU_VFIQ));
+        }
     }
 
     /* --- Shared QSPI NOR flash staging region ---
@@ -1093,8 +1068,8 @@ static void r100_soc_init(MachineState *machine)
      * chiplet its own SerialMM instance bound to a distinct chardev
      * (serial_hd(N)) so the four chiplets' output is demuxed into
      * separate streams. If the user didn't supply four -serial/-chardev
-     * options, the extra chiplets fall back to null. The IRQ output
-     * still routes through chiplet 0's GIC (SPI 33).
+     * options, the extra chiplets fall back to null. Each chiplet's UART IRQ
+     * wires to its own chiplet's GICv3 (SPI 33).
      */
     for (chiplet = 0; chiplet < R100_NUM_CHIPLETS; chiplet++) {
         SerialMM *smm = SERIAL_MM(qdev_new(TYPE_SERIAL_MM));
@@ -1109,10 +1084,8 @@ static void r100_soc_init(MachineState *machine)
         }
         qdev_prop_set_uint8(DEVICE(smm), "endianness", DEVICE_LITTLE_ENDIAN);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(smm), &error_fatal);
-        if (chiplet == 0) {
-            sysbus_connect_irq(SYS_BUS_DEVICE(smm), 0,
-                               qdev_get_gpio_in(gicdev, 33));
-        }
+        sysbus_connect_irq(SYS_BUS_DEVICE(smm), 0,
+                           qdev_get_gpio_in(gic_dev[chiplet], 33));
 
         uart_mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(smm), 0);
 

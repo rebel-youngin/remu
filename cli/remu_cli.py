@@ -29,6 +29,7 @@ REMU_ROOT = Path(__file__).resolve().parent.parent
 QEMU_SRC = REMU_ROOT / "external" / "qemu"
 QEMU_BUILD = REMU_ROOT / "build" / "qemu"
 QEMU_BIN = QEMU_BUILD / "qemu-system-aarch64"
+QEMU_PATCHES = REMU_ROOT / "cli" / "qemu-patches"
 MACHINE_SRC = REMU_ROOT / "src" / "machine"
 INCLUDE_SRC = REMU_ROOT / "src" / "include"
 IMAGES_DIR = REMU_ROOT / "images"
@@ -141,6 +142,39 @@ def _patch_meson():
     return False
 
 
+def _apply_qemu_patches():
+    """Idempotently apply every *.patch file under cli/qemu-patches/ to
+    external/qemu. Uses `git apply --check` to decide whether a patch is
+    already present (reverse-apply check) and skips it in that case, so
+    repeat builds and fresh clones both end up in the same state."""
+    if not QEMU_PATCHES.is_dir():
+        return
+    patches = sorted(QEMU_PATCHES.glob("*.patch"))
+    if not patches:
+        return
+    for patch in patches:
+        # Already applied? `git apply --reverse --check` succeeds iff the
+        # current tree matches the post-patch state.
+        reverse_check = subprocess.run(
+            ["git", "apply", "--reverse", "--check", str(patch)],
+            cwd=QEMU_SRC, capture_output=True,
+        )
+        if reverse_check.returncode == 0:
+            continue
+        # Confirm the patch applies cleanly to the current tree before doing it.
+        forward_check = subprocess.run(
+            ["git", "apply", "--check", str(patch)],
+            cwd=QEMU_SRC, capture_output=True,
+        )
+        if forward_check.returncode != 0:
+            click.secho("  Patch %s does not apply cleanly:" % patch.name,
+                        fg="red")
+            click.echo(forward_check.stderr.decode("utf-8", "replace"))
+            raise SystemExit(1)
+        subprocess.run(["git", "apply", str(patch)], cwd=QEMU_SRC, check=True)
+        click.echo("  Applied %s" % patch.name)
+
+
 def _run(cmd, cwd=None, check=True, **kwargs):
     """Run a subprocess, printing stdout/stderr live."""
     click.echo("  $ %s" % " ".join(str(c) for c in cmd))
@@ -181,6 +215,9 @@ def build(clean, jobs):
 
     click.echo("Patching meson.build...")
     _patch_meson()
+
+    click.echo("Applying QEMU source patches...")
+    _apply_qemu_patches()
 
     QEMU_BUILD.mkdir(parents=True, exist_ok=True)
 

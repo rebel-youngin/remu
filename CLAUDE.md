@@ -40,7 +40,9 @@ For persistent completion, add the eval to `~/.bashrc` with the
 absolute path to `remucli`, and either put the repo root on PATH or
 `alias remucli=/abs/path/to/remucli` so bare `remucli` tab-completes too.
 
-Manual ninja rebuild (skips the CLI's symlink / meson patch step):
+Manual ninja rebuild (skips the CLI's symlink / meson patch / `cli/qemu-patches/*.patch`
+apply step — use only when `external/qemu` is already set up by a prior
+`./remucli build`):
 ```
 cd build/qemu && ninja -j$(nproc)
 ```
