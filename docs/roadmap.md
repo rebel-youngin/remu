@@ -52,7 +52,7 @@ Additional inline RAM stubs in `r100_soc.c`: PCIe sub-controller (`PHY{0..3}_SRA
 - All 32 vCPUs (4 chiplets × 2 clusters × 4 cores) reach FreeRTOS steady-state ✓
 - GDB can step through FW code on any chiplet's CP0 or CP1 vCPU ✓ (see `docs/debugging.md`)
 
-## Phase 2: Host Drivers — in progress (M1-M5 done)
+## Phase 2: Host Drivers — in progress (M1-M6 done)
 
 **Prerequisite**: Phase 1 complete. `q-cp` tasks on CP1 service a non-trivial slice of the host-facing FW interface, so opening the PCIe endpoint without CP1 online would hit missing task-registration paths.
 
@@ -69,21 +69,24 @@ Phase 2 is sliced into 9 incremental milestones. Each one boots end-to-end and c
 | M3 | `r100-npu-pci` skeleton | done | PCI function `0x1eff:0x2030` exposes BAR0/2/4/5 at the sizes `rebel.h` expects; lazy RAM backing + `msix_init` table on BAR5 |
 | M4 | Host BAR0 → shm splice | done | BAR0 is a container: shared backend at offset 0, lazy RAM on the tail. `./remucli run --host` auto-verifies via `info pci` / `info mtree` / `/proc/<pid>/maps` |
 | M5 | NPU DRAM → shm splice | done | Chiplet-0 DRAM is a container: same shared backend at offset 0, lazy RAM on the tail past the FW image region. `tests/m5_dataflow_test.py` proves coherency both ways |
-| M6 | Doorbell path (guest → FW) | pending | BAR4 writes on the x86 side signal an eventfd that the NPU converts into a GIC SPI injection |
+| M6 | Doorbell path (guest → FW) | done | BAR4 `MAILBOX_INTGR0/1` writes on the x86 side emit 8-byte `(offset, value)` frames over a Unix socket chardev; NPU-side `r100-doorbell` parses frames and pulses GIC SPI 63 on chiplet 0. `tests/m6_doorbell_test.py` drives synthetic frames end-to-end |
 | M7 | MSI-X path (FW → guest) | pending | Reverse direction. NPU-side eventfd fires `msix_notify()` in `r100-npu-pci` |
 | M8 | `FW_BOOT_DONE` + `TEST_IB` ring | pending | First real protocol: kmd and q-cp HIL exchange messages on the shared-DRAM ring. Hits the roadmap success criterion |
 | M9 | DNC stub + trivial umd job | pending | umd opens `/dev/rebellions0`, submits a zero-op job, DNC stub signals completion via MSI-X |
 
-### Components (current state after M5)
+### Components (current state after M6)
 
-- **`r100-npu-pci`** (`src/host/r100_npu_pci.c`): x86-side PCI device, vendor/device `0x1eff:0x2030`, four BARs. BAR0 splices in a `HostMemoryBackend` via the `memdev` link at offset 0 (M4); BAR2/4 are plain lazy RAM; BAR5 carries the 32-vector MSI-X table + PBA. **Pending**: BAR4 needs eventfd-backed MMIO (M6), MSI-X needs wiring to NPU-side eventfd (M7).
-- **`r100-soc` machine** (`src/machine/r100_soc.c`): gains a `memdev` string property resolved at machine-init. Chiplet 0 DRAM becomes a container — shared backend at offset 0 + lazy-RAM tail (M5). Secondary chiplets unchanged.
+- **`r100-npu-pci`** (`src/host/r100_npu_pci.c`): x86-side PCI device, vendor/device `0x1eff:0x2030`, four BARs. BAR0 splices in a `HostMemoryBackend` via the `memdev` link at offset 0 (M4); BAR2 is plain lazy RAM; BAR4 is a container with a 4 KB MMIO head overlay (priority 10) that intercepts `MAILBOX_INTGR0/1` (0x8 / 0x1c) and emits `(offset, value)` frames on the `doorbell` chardev, plus an 8 MB lazy-RAM fallback at priority 0 for the `MAILBOX_BASE` payload and the rest of BAR4 (M6); BAR5 carries the 32-vector MSI-X table + PBA. **Pending**: MSI-X needs wiring to NPU-side eventfd (M7).
+- **`r100-soc` machine** (`src/machine/r100_soc.c`): `memdev` string property splices chiplet 0 DRAM over a shared `HostMemoryBackend` (M5). `doorbell` / `doorbell-debug` string properties resolve to `Chardev` instances that wire a `r100-doorbell` sysbus device on chiplet 0's GIC at SPI 63 (M6).
+- **`r100-doorbell`** (`src/machine/r100_doorbell.c`): receives 8-byte `(offset, value)` frames on a `CharBackend`, validates the offset is one of `MAILBOX_INTGR0/1`, and pulses the connected `qemu_irq`. Optional debug chardev traces every frame as `doorbell off=... val=... count=...` lines.
 - **Shared memory bridge**: `memory-backend-file` at `/dev/shm/remu-<name>/remu-shm`, opened with `share=on` by both QEMUs. Declared on x86 side as `-device r100-npu-pci,memdev=remushm`, on NPU side as `-machine r100-soc,memdev=remushm`.
-- **`./remucli run --host`**: dual-QEMU orchestrator. Auto-verifies the bridge end-to-end (PCI enumeration + host `info mtree` + NPU `info mtree` + `/proc/<pid>/maps` on both processes). Hands both QEMU monitors out as unix sockets under `output/<name>/{host,npu}/monitor.sock`.
+- **Doorbell bridge (M6)**: Unix socket chardev at `output/<name>/host/doorbell.sock`. Host QEMU owns the listener (`server=on,wait=off`), NPU QEMU is a `reconnect=1` client. An ASCII trace of each NPU-observed frame is written to `output/<name>/doorbell.log`.
+- **`./remucli run --host`**: dual-QEMU orchestrator. Auto-verifies both bridges end-to-end: M4/M5 via PCI enumeration + host/NPU `info mtree` + `/proc/<pid>/maps`; M6 via host `info mtree` (`r100.bar4.mmio` overlay) + NPU `info qtree` (`r100-doorbell` present). Both QEMU monitors exposed as unix sockets under `output/<name>/{host,npu}/monitor.sock`.
 
 ### Pending components
 
-- **Doorbell/MSI-X routing**: eventfd-based interrupt forwarding (M6, M7).
+- **MSI-X routing**: eventfd-based reverse-direction interrupt forwarding (M7).
+- **`r100-mailbox` peripheral** (M7/M8): models the Samsung mailbox register block (`intgr` / `intmsr` / `intcr` / `issr0..15`) at its CA73-visible MMIO address, with per-instance `irq_num_{low,high}` matching `mailbox_data[]` in `external/.../drivers/mailbox/mailbox.c`. When this lands, `r100-doorbell`'s chardev ingress still forwards frames from the host, but instead of pulsing a placeholder SPI directly it writes into the mailbox device's `intgr`, which sets the pending bit in `intmsr` and asserts the real per-instance SPI — matching silicon exactly. The `R100_PCIE_DOORBELL_SPI = 63` constant in `remu_addrmap.h` disappears with that refactor.
 - **DNC stub**: accepts tasks, immediately generates completion interrupt (M9).
 - **HDMA stub**: performs actual memcpy between DRAM regions (M9).
 
@@ -120,7 +123,7 @@ Phase 2 is sliced into 9 incremental milestones. Each one boots end-to-end and c
 | RBC/UCIe (6 x4) | Link-ready stub + PMU RBC status=ON | Same | Same |
 | DMA (PL330) | Fake-completion stub | Stub | Behavioral model |
 | PCIe sub-controller | RAM stub (pmu_release_cm7 writes + PHY{0..3}_SRAM_INIT_DONE seed) | Real model | Same |
-| PCIe/doorbell | N/A | Shared-mem bridge | Same |
+| PCIe/doorbell | N/A | Shared-mem bridge (M4/M5) + BAR4 MMIO overlay → chardev frame → GIC SPI 63 on chiplet 0 (M6) | Same |
 | DNC (16 x4) | Register-window stub via DCL CFG row (ip_ver + SP test) | Return-success task dispatch | Behavioral model |
 | HDMA (x4) | N/A | Memcpy | Scatter-gather |
 | HBM3 (x4) | Sparse-writeback + ICON RMW mirror + EXTEST-aware `rd_wdr` sentinels + PHY fail/busy default 0 with `phy_train_done` / `prbs_{read,write}_done` / `schd_fifo_empty_status` overrides | Same | Same |

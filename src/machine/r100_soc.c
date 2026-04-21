@@ -29,6 +29,8 @@
 #include "hw/loader.h"
 #include "sysemu/sysemu.h"
 #include "sysemu/hostmem.h"
+#include "chardev/char.h"
+#include "chardev/char-fe.h"
 #include "migration/vmstate.h"
 #include "exec/address-spaces.h"
 #include "target/arm/cpu.h"
@@ -1231,6 +1233,54 @@ static void r100_soc_init(MachineState *machine)
     }
 
     /*
+     * --- PCIe doorbell ingress (Phase 2, M6) ---
+     *
+     * Instantiated only when `-machine r100-soc,doorbell=<chardev-id>`
+     * is set. The chardev is a client Unix socket (see cli/remu_cli.py
+     * _build_npu_cmd) wired to the x86 host-side r100-npu-pci's
+     * matching server socket, so 8-byte (offset, value) frames emitted
+     * on BAR4 MAILBOX_INTGR writes arrive here and pulse
+     * R100_PCIE_DOORBELL_SPI on chiplet 0's GIC. See
+     * src/machine/r100_doorbell.c for the wire format.
+     */
+    {
+        R100SoCMachineState *r100m = R100_SOC_MACHINE(machine);
+
+        if (r100m->doorbell_chardev_id != NULL &&
+            *r100m->doorbell_chardev_id != '\0') {
+            Chardev *chr = qemu_chr_find(r100m->doorbell_chardev_id);
+            Chardev *dbg = NULL;
+            DeviceState *db;
+
+            if (chr == NULL) {
+                error_report("r100-soc: doorbell chardev '%s' not found",
+                             r100m->doorbell_chardev_id);
+                exit(1);
+            }
+            if (r100m->doorbell_debug_chardev_id != NULL &&
+                *r100m->doorbell_debug_chardev_id != '\0') {
+                dbg = qemu_chr_find(r100m->doorbell_debug_chardev_id);
+                if (dbg == NULL) {
+                    error_report("r100-soc: doorbell debug chardev "
+                                 "'%s' not found",
+                                 r100m->doorbell_debug_chardev_id);
+                    exit(1);
+                }
+            }
+
+            db = qdev_new(TYPE_R100_DOORBELL);
+            qdev_prop_set_chr(db, "chardev", chr);
+            if (dbg) {
+                qdev_prop_set_chr(db, "debug-chardev", dbg);
+            }
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(db), &error_fatal);
+            sysbus_connect_irq(SYS_BUS_DEVICE(db), 0,
+                               qdev_get_gpio_in(gic_dev[0],
+                                                R100_PCIE_DOORBELL_SPI));
+        }
+    }
+
+    /*
      * --- Shared inter-chiplet mailbox RAM ---
      * TF-A's `mailbox_data[]` table pairs each IDX_MAILBOX_* instance
      * with an absolute base. ipm_samsung_write/receive dereference
@@ -1298,6 +1348,33 @@ static void r100_soc_set_memdev(Object *obj, const char *value, Error **errp)
     r100m->memdev_id = g_strdup(value);
 }
 
+static char *r100_soc_get_doorbell(Object *obj, Error **errp)
+{
+    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
+    return g_strdup(r100m->doorbell_chardev_id);
+}
+
+static void r100_soc_set_doorbell(Object *obj, const char *value, Error **errp)
+{
+    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
+    g_free(r100m->doorbell_chardev_id);
+    r100m->doorbell_chardev_id = g_strdup(value);
+}
+
+static char *r100_soc_get_doorbell_debug(Object *obj, Error **errp)
+{
+    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
+    return g_strdup(r100m->doorbell_debug_chardev_id);
+}
+
+static void r100_soc_set_doorbell_debug(Object *obj, const char *value,
+                                        Error **errp)
+{
+    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
+    g_free(r100m->doorbell_debug_chardev_id);
+    r100m->doorbell_debug_chardev_id = g_strdup(value);
+}
+
 static void r100_soc_machine_instance_init(Object *obj)
 {
     object_property_add_str(obj, "memdev",
@@ -1306,12 +1383,29 @@ static void r100_soc_machine_instance_init(Object *obj)
         "Optional memory-backend-* id spliced over chiplet 0 DRAM head; "
         "shared with the Phase-2 x86 host QEMU so BAR0 and the CA73 "
         "cores see the same bytes.");
+
+    object_property_add_str(obj, "doorbell",
+                            r100_soc_get_doorbell, r100_soc_set_doorbell);
+    object_property_set_description(obj, "doorbell",
+        "Optional chardev id that receives 8-byte (BAR4 offset, value) "
+        "frames from the Phase-2 x86 host QEMU's r100-npu-pci BAR4 and "
+        "injects them as GIC SPI " G_STRINGIFY(R100_PCIE_DOORBELL_SPI)
+        " on chiplet 0.");
+
+    object_property_add_str(obj, "doorbell-debug",
+                            r100_soc_get_doorbell_debug,
+                            r100_soc_set_doorbell_debug);
+    object_property_set_description(obj, "doorbell-debug",
+        "Optional chardev id that receives an ASCII trace of every "
+        "doorbell frame observed by the NPU (one line per frame).");
 }
 
 static void r100_soc_machine_instance_finalize(Object *obj)
 {
     R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
     g_free(r100m->memdev_id);
+    g_free(r100m->doorbell_chardev_id);
+    g_free(r100m->doorbell_debug_chardev_id);
 }
 
 /*

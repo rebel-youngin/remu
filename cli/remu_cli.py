@@ -479,7 +479,8 @@ def _make_run_dir(name, output_root):
 
 
 def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
-                   npu_monitor_sock=None):
+                   npu_monitor_sock=None, doorbell_sock=None,
+                   doorbell_log=None):
     """Assemble the aarch64 QEMU cmdline for the R100 NPU side.
     Matches the previous in-line flow exactly; extracted so that
     --host can extend it (Phase 2) without duplicating boot-image
@@ -493,13 +494,24 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
     npu_monitor_sock: if given (path), an additional Unix-socket HMP
     monitor is attached to the NPU QEMU so the CLI can programmatically
     query `info mtree` / `xp`. The existing stdio-muxed readline monitor
-    on uart0 keeps working for interactive use."""
+    on uart0 keeps working for interactive use.
+
+    doorbell_sock / doorbell_log: M6 plumbing. When `doorbell_sock` is a
+    path, the NPU attaches a client socket chardev (connecting to the
+    matching server on the host side) and wires it into the r100-soc
+    machine's `doorbell` option. When `doorbell_log` is a path, a file
+    chardev is also attached and fed to the machine's `doorbell-debug`
+    option so every received frame appends an ASCII line to it."""
     uart0_log = run_dir / "uart0.log"
     hils_log = run_dir / "hils.log"
 
     machine_opt = "r100-soc"
     if with_host:
         machine_opt += ",memdev=remushm"
+    if doorbell_sock is not None:
+        machine_opt += ",doorbell=doorbell"
+        if doorbell_log is not None:
+            machine_opt += ",doorbell-debug=doorbell_dbg"
 
     cmd = [
         str(QEMU_BIN),
@@ -513,6 +525,20 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
     if npu_monitor_sock is not None:
         cmd += ["-monitor",
                 "unix:%s,server=on,wait=off" % npu_monitor_sock]
+    if doorbell_sock is not None:
+        # Client side: the host-side QEMU owns the listening socket (it
+        # starts first and we poll for its bind before launching NPU).
+        # reconnect=1 keeps retrying for a second in case the host is
+        # still coming up when the NPU machine-init runs.
+        cmd += [
+            "-chardev",
+            "socket,id=doorbell,path=%s,reconnect=1" % doorbell_sock,
+        ]
+        if doorbell_log is not None:
+            cmd += [
+                "-chardev",
+                "file,id=doorbell_dbg,path=%s,mux=off" % doorbell_log,
+            ]
     click.echo("  Chiplet 0 UART -> stdio (log: %s)" % uart0_log)
 
     for n in range(1, 4):
@@ -577,7 +603,8 @@ def _setup_shm(run_name, size):
     return shm_dir, shm_file
 
 
-def _build_host_cmd(host_dir, shm_file, shm_size, monitor_sock, mem):
+def _build_host_cmd(host_dir, shm_file, shm_size, monitor_sock, mem,
+                    doorbell_sock=None):
     """Assemble the x86_64 QEMU cmdline for the Phase-2 host side.
 
     M3 upgraded the placeholder ivshmem-plain to our own `r100-npu-pci`
@@ -587,7 +614,11 @@ def _build_host_cmd(host_dir, shm_file, shm_size, monitor_sock, mem):
     BAR0 offset 0..shm_size is backed by the shared /dev/shm file;
     since the NPU-side QEMU holds the same file mapped, stores from
     the x86 guest into BAR0 end up page-visible to the NPU process
-    (NPU-CPU-visible DRAM integration lands in M5).
+    (NPU-CPU-visible DRAM integration lands in M5). M6 adds the
+    doorbell chardev: when `doorbell_sock` is set, the r100-npu-pci
+    BAR4 becomes a hybrid MMIO+RAM region whose writes to
+    MAILBOX_INTGR0/INTGR1 emit 8-byte (offset, value) frames on a
+    Unix socket that the NPU QEMU is connected to.
 
     SeaBIOS IS allowed to run (no `-S`) so the BAR addresses get
     programmed — the automated verify queries `info mtree`, which
@@ -600,6 +631,19 @@ def _build_host_cmd(host_dir, shm_file, shm_size, monitor_sock, mem):
     stdout_log = host_dir / "qemu.stdout.log"
     stderr_log = host_dir / "qemu.stderr.log"
 
+    device_arg = "r100-npu-pci,memdev=remushm"
+    chardevs = []
+    if doorbell_sock is not None:
+        # Host is the server since it starts first; NPU connects as
+        # client (see _build_npu_cmd). wait=off lets host QEMU proceed
+        # without blocking on the NPU connection so BAR programming /
+        # info-pci verification still races ahead.
+        chardevs += [
+            "-chardev",
+            "socket,id=doorbell,path=%s,server=on,wait=off" % doorbell_sock,
+        ]
+        device_arg += ",doorbell=doorbell"
+
     cmd = [
         str(QEMU_BIN_X86),
         "-M", "pc",
@@ -611,7 +655,8 @@ def _build_host_cmd(host_dir, shm_file, shm_size, monitor_sock, mem):
         "-object",
         "memory-backend-file,id=remushm,mem-path=%s,size=%d,share=on"
         % (shm_file, shm_size),
-        "-device", "r100-npu-pci,memdev=remushm",
+        *chardevs,
+        "-device", device_arg,
         "-chardev",
         "socket,id=mon,path=%s,server=on,wait=off" % monitor_sock,
         "-mon", "chardev=mon,mode=readline",
@@ -794,6 +839,59 @@ def _verify_shared_mapping(monitor_sock, shm_file, host_pid, npu_pid,
     return snippet
 
 
+def _verify_doorbell_wired(host_monitor_sock, npu_monitor_sock,
+                           host_mtree_log, npu_qtree_log,
+                           poll_timeout=10.0):
+    """Prove the M6 doorbell plumbing is alive on both sides.
+
+    Host side: `info mtree` must list the `r100.bar4.mmio` subregion
+    on the r100-npu-pci BAR4 container, which only exists when the
+    `doorbell` chardev property was wired.
+
+    NPU side: `info qtree` must list a `r100-doorbell` device instance.
+    Presence of the device + a realized `chardev` property is the
+    server-coming-up ack. The socket connect itself is async (host is
+    server, NPU is reconnect=1 client), but the device being realized
+    means the machine chose to instantiate it from our `-machine
+    r100-soc,doorbell=doorbell` option.
+
+    Raises RuntimeError with an actionable message on failure. Log
+    files are always written (empty if the query itself errored out)
+    so the caller can diff runs.
+    """
+    host_mtree = ""
+    deadline = time.time() + poll_timeout
+    while time.time() < deadline:
+        host_mtree = _hmp_query(host_monitor_sock, "info mtree",
+                                timeout=10.0)
+        if "r100.bar4.mmio" in host_mtree:
+            break
+        time.sleep(0.3)
+    host_mtree_log.write_text(host_mtree + "\n")
+    if "r100.bar4.mmio" not in host_mtree:
+        raise RuntimeError(
+            "host-side BAR4 MMIO overlay missing (r100.bar4.mmio not in "
+            "info mtree); see %s" % host_mtree_log)
+
+    snippet = _extract_mtree_container(host_mtree, "r100.bar4.container")
+    if snippet is None:
+        # Fall back to showing the mmio line only.
+        snippet = "\n".join(
+            ln for ln in host_mtree.splitlines()
+            if "r100.bar4" in ln
+        )
+
+    # NPU side: confirm r100-doorbell was instantiated.
+    qtree = _hmp_query(npu_monitor_sock, "info qtree", timeout=10.0)
+    npu_qtree_log.write_text(qtree + "\n")
+    if "r100-doorbell" not in qtree:
+        raise RuntimeError(
+            "NPU-side r100-doorbell device not found in info qtree; see %s"
+            % npu_qtree_log)
+
+    return snippet
+
+
 def _verify_npu_shared_mapping(npu_monitor_sock, mtree_log):
     """Prove the shared memory-backend-file is spliced over chiplet 0
     DRAM on the NPU side (M5).
@@ -888,14 +986,30 @@ def run(name, output_root, gdb, trace, chiplets, memory,
     host_proc = None
     shm_dir = None
     npu_monitor_sock = None
+    doorbell_sock = None
+    doorbell_log = None
     if with_host:
         npu_dir = run_dir / "npu"
         npu_dir.mkdir(exist_ok=True)
         npu_monitor_sock = npu_dir / "monitor.sock"
+        # M6 doorbell: server socket lives under host/ (host QEMU is
+        # the listener), ASCII tail under run root so users can tail
+        # it directly. Stale sock path would make the host bind EADDRINUSE.
+        host_dir_early = run_dir / "host"
+        host_dir_early.mkdir(exist_ok=True)
+        doorbell_sock = host_dir_early / "doorbell.sock"
+        if doorbell_sock.exists():
+            try:
+                doorbell_sock.unlink()
+            except OSError:
+                pass
+        doorbell_log = run_dir / "doorbell.log"
 
     npu_cmd, found = _build_npu_cmd(run_dir, gdb, trace,
                                     with_host=with_host,
-                                    npu_monitor_sock=npu_monitor_sock)
+                                    npu_monitor_sock=npu_monitor_sock,
+                                    doorbell_sock=doorbell_sock,
+                                    doorbell_log=doorbell_log)
 
     if found == 0:
         click.secho("Warning: no firmware images in %s/" % IMAGES_DIR,
@@ -931,10 +1045,13 @@ def run(name, output_root, gdb, trace, chiplets, memory,
         host_dir.mkdir(exist_ok=True)
         monitor_sock = host_dir / "monitor.sock"
         host_cmd, host_stdout, host_stderr = _build_host_cmd(
-            host_dir, shm_file, shm_size, monitor_sock, host_mem)
+            host_dir, shm_file, shm_size, monitor_sock, host_mem,
+            doorbell_sock=doorbell_sock)
         (host_dir / "cmdline.txt").write_text(
             " \\\n  ".join(host_cmd) + "\n")
         click.echo("  Host QEMU   -> SeaBIOS idle (monitor: %s)" % monitor_sock)
+        click.echo("  Doorbell    -> %s (debug tail: %s)"
+                   % (doorbell_sock, doorbell_log))
 
     (run_dir / "cmdline.txt").write_text(" \\\n  ".join(npu_cmd) + "\n")
 
@@ -989,6 +1106,11 @@ def run(name, output_root, gdb, trace, chiplets, memory,
         if shm_dir and shm_dir.exists():
             try:
                 shutil.rmtree(shm_dir)
+            except OSError:
+                pass
+        if doorbell_sock and doorbell_sock.exists():
+            try:
+                doorbell_sock.unlink()
             except OSError:
                 pass
 
@@ -1081,6 +1203,22 @@ def run(name, output_root, gdb, trace, chiplets, memory,
                 "  memdev aliased over chiplet 0 DRAM (NPU side)",
                 fg="green")
             for ln in npu_snippet.splitlines():
+                click.echo("    " + ln)
+            click.echo()
+        except Exception as e:
+            click.secho("  %s" % e, fg="red")
+
+        # M6: Verify the doorbell plumbing is wired on both sides.
+        try:
+            db_snip = _verify_doorbell_wired(
+                host_dir / "monitor.sock", npu_monitor_sock,
+                host_dir / "info-mtree-bar4.log",
+                npu_dir / "info-qtree.log",
+            )
+            click.secho(
+                "  doorbell chardev wired: BAR4 MMIO overlay on host + "
+                "r100-doorbell on NPU", fg="green")
+            for ln in db_snip.splitlines():
                 click.echo("    " + ln)
             click.echo()
         except Exception as e:

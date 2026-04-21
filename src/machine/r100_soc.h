@@ -40,6 +40,17 @@ struct R100SoCMachineState {
      * -machine options are applied in system/vl.c, so a link property
      * would fail with "Device not found". */
     char *memdev_id;
+
+    /* `-machine r100-soc,doorbell=<chardev-id>` : M6 cross-process
+     * doorbell ingress from the x86 host guest's BAR4. Resolved to a
+     * Chardev at machine-init time for the same reason memdev is
+     * deferred. When unset, the r100-doorbell device is not created
+     * (single-QEMU runs are unaffected). */
+    char *doorbell_chardev_id;
+    /* Optional: debug tail chardev id that the r100-doorbell device
+     * echoes each received frame to as an ASCII line. Used by the
+     * M6 verification test and humans; does not affect signalling. */
+    char *doorbell_debug_chardev_id;
 };
 
 typedef struct R100SoCMachineState R100SoCMachineState;
@@ -60,6 +71,7 @@ DECLARE_INSTANCE_CHECKER(R100SoCMachineState, R100_SOC_MACHINE,
 #define TYPE_R100_LOGBUF        "r100-logbuf-tail"
 #define TYPE_R100_DNC_CLUSTER   "r100-dnc-cluster"
 #define TYPE_R100_RBDMA         "r100-rbdma"
+#define TYPE_R100_DOORBELL      "r100-doorbell"
 #define TYPE_R100_UNIMPL        "r100-unimpl"
 
 #define R100_RBC_BLOCK_SIZE     0x80000ULL  /* 512KB per RBC block */

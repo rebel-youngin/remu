@@ -18,11 +18,17 @@
  *   BAR4 (Doorbell, 32-bit MMIO):     >= RBLN_PERI_SIZE  (8 MB)
  *   BAR5 (MSI-X,    32-bit MMIO):     >= RBLN_PCIE_SIZE  (1 MB)
  *
- * BAR2/4 are plain lazily-allocated host RAM (no side effects on
- * writes); BAR5 holds the MSI-X table + PBA in its first few KB with
- * plain RAM filling the rest so the driver's size check passes. Lazy
- * allocation keeps the 64 GB BAR0 from actually costing 64 GB of
- * host RSS unless the guest touches every page.
+ * BAR2 is plain lazily-allocated host RAM (no side effects on
+ * writes); BAR4 is normally lazy RAM too, but when the `doorbell`
+ * chardev property is wired (M6+) a 4 KB MMIO head overlay
+ * intercepts MAILBOX_INTGR0/INTGR1 writes and forwards them as
+ * 8-byte (offset, value) frames to the NPU-side r100-doorbell
+ * device, which injects a GIC SPI. MAILBOX_BASE (0x80..0x180) and
+ * the rest of BAR4 remain RAM-like so the driver's mailbox payload
+ * writes don't fault. BAR5 holds the MSI-X table + PBA in its first
+ * few KB with plain RAM filling the rest so the driver's size
+ * check passes. Lazy allocation keeps the 64 GB BAR0 from actually
+ * costing 64 GB of host RSS unless the guest touches every page.
  *
  * BAR0 has two shapes:
  *
@@ -41,26 +47,30 @@
  *
  * Later milestones layer real behavior on top:
  *   M5 — alias the same backend into the NPU-side HBM memory map so
- *        NPU CPUs see x86-guest writes as DRAM accesses.
- *   M6 — swap BAR4 RAM for an MMIO region whose writes signal an
- *        eventfd that the NPU process converts into its local IRQ.
+ *        NPU CPUs see x86-guest writes as DRAM accesses.  [done]
+ *   M6 — hybrid MMIO+RAM BAR4 that forwards MAILBOX_INTGR writes to
+ *        the NPU process over a chardev (see `doorbell` property and
+ *        src/machine/r100_doorbell.c).                    [done]
  *   M7 — wire MSI-X back: NPU-side eventfd fires msix_notify() here.
  */
 
 #include "qemu/osdep.h"
 #include "qemu/units.h"
+#include "qemu/bswap.h"
+#include "qemu/log.h"
 #include "qemu/module.h"
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msix.h"
 #include "hw/qdev-properties.h"
+#include "hw/qdev-properties-system.h"
 #include "sysemu/hostmem.h"
+#include "chardev/char-fe.h"
 #include "migration/vmstate.h"
 #include "qom/object.h"
 #include "qapi/error.h"
+#include "hw/arm/remu_addrmap.h"
 
-#define R100_PCI_VENDOR_ID      0x1eff  /* PCI_VENDOR_ID_REBEL */
-#define R100_PCI_DEVICE_ID      0x2030  /* PCI_ID_CR03 (CR03 quad) */
 #define R100_PCI_REVISION       0x01
 #define R100_PCI_CLASS          0x1200  /* Processing accelerator */
 
@@ -90,11 +100,115 @@ struct R100NpuPciState {
      * bar0_tail is unused. */
     HostMemoryBackend *hostmem;
 
+    /* When set (via -device r100-npu-pci,doorbell=<chardev-id>),
+     * BAR4 becomes a container with a small MMIO head that intercepts
+     * MAILBOX_INTGR0/INTGR1 writes and emits an 8-byte frame on this
+     * chardev, plus lazy RAM filling the rest of BAR4 for backward-
+     * compatible mailbox-payload semantics. When unset, the whole BAR
+     * is plain RAM (M3/M5 behaviour). */
+    CharBackend doorbell_chr;
+
     MemoryRegion bar0_ddr;
     MemoryRegion bar0_tail;
     MemoryRegion bar2_acp;
-    MemoryRegion bar4_doorbell;
+
+    /* BAR4 layout:
+     *   bar4_container (8 MB) holds the BAR. When doorbell_chr is
+     *   connected, bar4_mmio (4 KB MMIO, priority 10) overlays offset
+     *   0..R100_BAR4_MMIO_SIZE and handles INTGR triggers + holds a
+     *   backing register file for reads; bar4_ram (8 MB lazy RAM,
+     *   priority 0) catches everything else (including MAILBOX_BASE
+     *   payload writes). When doorbell_chr is not connected, only
+     *   bar4_ram is added at priority 0 for full-BAR RAM semantics. */
+    MemoryRegion bar4_container;
+    MemoryRegion bar4_mmio;
+    MemoryRegion bar4_ram;
+
+    /* Backing for bar4_mmio so reads return the last written value
+     * (KMD doesn't read INTGR registers, but we keep consistent
+     * semantics across save/restore). R100_BAR4_MMIO_SIZE is 4 KB =
+     * 1024 u32s. */
+    uint32_t bar4_mmio_regs[R100_BAR4_MMIO_SIZE / 4];
+    uint64_t doorbell_frames_sent;
+
     MemoryRegion bar5_msix;
+};
+
+/*
+ * Emit an 8-byte (offset, value) frame to the NPU-side doorbell
+ * chardev. The NPU process (r100-doorbell) decodes this as "BAR4
+ * offset <off> got <val>" and pulses a GIC SPI (see
+ * src/machine/r100_doorbell.c). Best-effort write: if the socket is
+ * temporarily full we drop the frame and log — silicon doesn't
+ * back-pressure on doorbell writes either.
+ */
+static void r100_doorbell_emit(R100NpuPciState *s, uint32_t off, uint32_t val)
+{
+    uint8_t frame[8];
+    int rc;
+
+    if (!qemu_chr_fe_backend_connected(&s->doorbell_chr)) {
+        return;
+    }
+
+    stl_le_p(&frame[0], off);
+    stl_le_p(&frame[4], val);
+
+    rc = qemu_chr_fe_write(&s->doorbell_chr, frame, sizeof(frame));
+    if (rc != sizeof(frame)) {
+        qemu_log_mask(LOG_UNIMP,
+                      "r100-npu-pci: doorbell frame off=0x%x val=0x%x "
+                      "dropped (rc=%d)\n", off, val, rc);
+        return;
+    }
+    s->doorbell_frames_sent++;
+}
+
+static uint64_t r100_bar4_mmio_read(void *opaque, hwaddr addr, unsigned size)
+{
+    R100NpuPciState *s = opaque;
+    uint32_t idx = (uint32_t)(addr >> 2);
+
+    if (idx >= ARRAY_SIZE(s->bar4_mmio_regs)) {
+        return 0;
+    }
+    return s->bar4_mmio_regs[idx];
+}
+
+static void r100_bar4_mmio_write(void *opaque, hwaddr addr, uint64_t val,
+                                 unsigned size)
+{
+    R100NpuPciState *s = opaque;
+    uint32_t idx = (uint32_t)(addr >> 2);
+    uint32_t v32 = (uint32_t)val;
+
+    if (idx < ARRAY_SIZE(s->bar4_mmio_regs)) {
+        s->bar4_mmio_regs[idx] = v32;
+    }
+
+    /* Triggers: only the MAILBOX_INTGR* registers forward to the NPU.
+     * Everything else in the MMIO window (MAILBOX_BASE payload at
+     * 0x80..0x180, etc.) is stash-only — the NPU reads it out of DRAM
+     * once it takes the SPI. */
+    if (addr == R100_BAR4_MAILBOX_INTGR0 ||
+        addr == R100_BAR4_MAILBOX_INTGR1) {
+        r100_doorbell_emit(s, (uint32_t)addr, v32);
+    }
+}
+
+static const MemoryRegionOps r100_bar4_mmio_ops = {
+    .read       = r100_bar4_mmio_read,
+    .write      = r100_bar4_mmio_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+        .unaligned = false,
+    },
+    .impl = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
 };
 
 static void r100_npu_pci_realize(PCIDevice *pdev, Error **errp)
@@ -169,20 +283,42 @@ static void r100_npu_pci_realize(PCIDevice *pdev, Error **errp)
                      PCI_BASE_ADDRESS_MEM_PREFETCH,
                      &s->bar2_acp);
 
-    /* BAR4 — Doorbell window. Real silicon raises NPU-internal IRQs on
-     * writes here; for M3 writes just hit RAM so the driver's doorbell
-     * ioctls don't fault. M5 will swap this for an MMIO region whose
-     * writes eventfd-signal the NPU-side QEMU. 32-bit non-prefetchable
-     * to match real PCIe topology. */
-    memory_region_init_ram(&s->bar4_doorbell, OBJECT(s),
-                           "r100.bar4.doorbell", R100_BAR4_DB_SIZE, &err);
+    /* BAR4 — Doorbell window. Always an 8 MB container so the driver's
+     * size check (rebel_check_pci_bars_size) passes. Layout depends on
+     * whether the `doorbell` chardev is wired:
+     *
+     *   - With chardev (M6+): small 4 KB MMIO head overlay (priority
+     *     10) at offset 0 intercepts MAILBOX_INTGR0/INTGR1 writes and
+     *     forwards them as 8-byte frames to the NPU process. The rest
+     *     of the 4 KB head is RAM-backed from an internal register
+     *     file so the MAILBOX_BASE payload (0x80..0x180) is readable.
+     *     A lazy RAM region (priority 0) covers the full 8 MB as a
+     *     fallback for offsets outside the MMIO window.
+     *   - Without chardev (M3/M5 behaviour): plain 8 MB RAM, no MMIO
+     *     overlay. Lets BAR4 mmaps from the guest driver still work
+     *     for single-QEMU bring-up runs.
+     *
+     * 32-bit non-prefetchable to match real PCIe topology. */
+    memory_region_init(&s->bar4_container, OBJECT(s),
+                       "r100.bar4.container", R100_BAR4_DB_SIZE);
+    memory_region_init_ram(&s->bar4_ram, OBJECT(s),
+                           "r100.bar4.ram", R100_BAR4_DB_SIZE, &err);
     if (err) {
         error_propagate(errp, err);
         return;
     }
+    memory_region_add_subregion_overlap(&s->bar4_container, 0,
+                                        &s->bar4_ram, 0);
+    if (qemu_chr_fe_backend_connected(&s->doorbell_chr)) {
+        memory_region_init_io(&s->bar4_mmio, OBJECT(s),
+                              &r100_bar4_mmio_ops, s,
+                              "r100.bar4.mmio", R100_BAR4_MMIO_SIZE);
+        memory_region_add_subregion_overlap(&s->bar4_container, 0,
+                                            &s->bar4_mmio, 10);
+    }
     pci_register_bar(pdev, 4,
                      PCI_BASE_ADDRESS_SPACE_MEMORY,
-                     &s->bar4_doorbell);
+                     &s->bar4_container);
 
     /* BAR5 — MSI-X. Driver requires the BAR to be >= 1 MB, but the
      * actual MSI-X table (32 * 16 B) + PBA (4 B) is tiny. We allocate
@@ -217,11 +353,13 @@ static void r100_npu_pci_exit(PCIDevice *pdev)
         vmstate_unregister_ram(shared, DEVICE(s));
         host_memory_backend_set_mapped(s->hostmem, false);
     }
+    qemu_chr_fe_deinit(&s->doorbell_chr, false);
 }
 
 static Property r100_npu_pci_properties[] = {
     DEFINE_PROP_LINK("memdev", R100NpuPciState, hostmem,
                      TYPE_MEMORY_BACKEND, HostMemoryBackend *),
+    DEFINE_PROP_CHR("doorbell", R100NpuPciState, doorbell_chr),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -233,7 +371,7 @@ static void r100_npu_pci_class_init(ObjectClass *klass, void *data)
     k->realize   = r100_npu_pci_realize;
     k->exit      = r100_npu_pci_exit;
     k->vendor_id = R100_PCI_VENDOR_ID;
-    k->device_id = R100_PCI_DEVICE_ID;
+    k->device_id = R100_PCI_DEVICE_ID_CR03;
     k->revision  = R100_PCI_REVISION;
     k->class_id  = R100_PCI_CLASS;
 

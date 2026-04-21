@@ -395,4 +395,25 @@
 #define R100_DOORBELL_BAR_ID        4
 #define R100_MSI_BAR_ID             5
 
+/* BAR4 doorbell trigger offsets (see
+ * external/ssw-bundle/.../kmd/rebellions/rebel/rebel_regs.h:143-144).
+ * Writes to these MAILBOX_INTGR registers from the x86 guest are the
+ * actual doorbells — host QEMU forwards them to the NPU as an 8-byte
+ * (offset, value) frame over the M6 chardev. */
+#define R100_BAR4_MAILBOX_INTGR0    0x00000008u  /* db_idx >= 32 */
+#define R100_BAR4_MAILBOX_INTGR1    0x0000001cu  /* db_idx <  32 */
+/* The first MMIO-trapped window of BAR4 that the host-side device
+ * treats as register-backed (i.e. not lazy RAM). Covers both INTGR
+ * registers at 0x8/0x1c and the MAILBOX_BASE body at 0x80..0x180. */
+#define R100_BAR4_MMIO_SIZE         0x1000u
+
+/* GIC SPI for the PCIe doorbell ingress on chiplet 0. Placeholder for
+ * M6: the real silicon routes BAR4 MAILBOX_INTGR writes to the PCIe
+ * CM7 subcontroller, which forwards a per-group SPI into the CA73 GIC
+ * via the CFG mailbox table (see external/.../drivers/mailbox/mailbox.c
+ * mailbox_data[] __TARGET_CP entries). Full modelling of that chain is
+ * M8; until then we pick SPI 63, which is unused in the CA73-side
+ * mailbox IRQ allocation (UART is 33, mailbox block starts at 144+). */
+#define R100_PCIE_DOORBELL_SPI      63
+
 #endif /* REMU_ADDRMAP_H */
