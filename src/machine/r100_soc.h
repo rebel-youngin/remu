@@ -10,14 +10,43 @@
 
 #include "hw/sysbus.h"
 #include "hw/arm/boot.h"
+#include "hw/boards.h"
 #include "qom/object.h"
 #include "remu_addrmap.h"
+
+/* Forward declaration — full def in sysemu/hostmem.h (included only by
+ * r100_soc.c, which needs the type name for the memdev link property). */
+typedef struct HostMemoryBackend HostMemoryBackend;
 
 /* ========================================================================
  * QOM type names
  * ======================================================================== */
 
 #define TYPE_R100_SOC_MACHINE   "r100-soc-machine"
+
+/* ========================================================================
+ * Machine state subclass (adds the optional memdev link used by Phase 2
+ * to splice a cross-process memory-backend-file over chiplet 0's DRAM
+ * head, so the x86 host guest's BAR0 and the NPU CA73 cores see the
+ * same bytes. See docs/roadmap.md Phase 2 / M5 for the wiring details.)
+ * ======================================================================== */
+
+struct R100SoCMachineState {
+    MachineState parent_obj;
+
+    /* `-machine r100-soc,memdev=<id>` stores the backend id here; the
+     * HostMemoryBackend itself is resolved at machine-init time (see
+     * r100_soc_init) because memory-backend-* objects are created AFTER
+     * -machine options are applied in system/vl.c, so a link property
+     * would fail with "Device not found". */
+    char *memdev_id;
+};
+
+typedef struct R100SoCMachineState R100SoCMachineState;
+
+DECLARE_INSTANCE_CHECKER(R100SoCMachineState, R100_SOC_MACHINE,
+                         TYPE_R100_SOC_MACHINE)
+
 #define TYPE_R100_CMU           "r100-cmu"
 #define TYPE_R100_PMU           "r100-pmu"
 #define TYPE_R100_SYSREG        "r100-sysreg"

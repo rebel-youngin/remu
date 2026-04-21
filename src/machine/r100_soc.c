@@ -28,11 +28,18 @@
 #include "hw/qdev-properties-system.h"
 #include "hw/loader.h"
 #include "sysemu/sysemu.h"
+#include "sysemu/hostmem.h"
+#include "migration/vmstate.h"
 #include "exec/address-spaces.h"
 #include "target/arm/cpu.h"
 #include "target/arm/cpregs.h"
 #include "qapi/qmp/qlist.h"
 #include "r100_soc.h"
+
+/* Forward declaration — definition at the bottom next to the rest of
+ * the machine-level QOM glue. Needed here because r100_soc_init (which
+ * calls it) is compiled before the definition. */
+static HostMemoryBackend *r100_soc_resolve_memdev(R100SoCMachineState *r100m);
 
 /*
  * Samsung IMPDEF EL1/EL3 system instructions used by the R100 FW.
@@ -533,19 +540,61 @@ static void r100_create_flash(MemoryRegion *sysmem)
 
 /*
  * Initialize a single chiplet: memory regions, CPUs, and peripheral stubs.
+ *
+ * `memdev` (optional, chiplet 0 only): when non-NULL, the memory-backend
+ * is spliced over the head of chiplet 0's DRAM at offset 0. The tail
+ * (R100_DRAM_INIT_SIZE - memdev_size) stays plain lazy RAM. This gives
+ * the x86 host guest's BAR0 and the NPU CA73 cores a coherent view of
+ * the same bytes — the Phase 2 cross-process DRAM sharing path. The
+ * memdev is silently ignored on secondary chiplets since silicon
+ * exposes only chiplet 0's DRAM via PCIe BAR0. See docs/roadmap.md
+ * Phase 2 / M5.
  */
 static void r100_chiplet_init(MachineState *machine, int chiplet_id,
-                              MemoryRegion *sysmem)
+                              MemoryRegion *sysmem,
+                              HostMemoryBackend *memdev)
 {
     uint64_t chiplet_base = (uint64_t)chiplet_id * R100_CHIPLET_OFFSET;
     char name[64];
     MemoryRegion *dram, *irom, *iram, *sp_mem, *sh_mem, *cfg_mr;
     int i;
 
-    /* --- DRAM --- */
+    /* --- DRAM ---
+     * Chiplet 0 with memdev: container with shared backend at offset 0
+     *                        and plain RAM covering the tail.
+     * Every other case:      single plain RAM region. */
     dram = g_new(MemoryRegion, 1);
-    snprintf(name, sizeof(name), "r100.chiplet%d.dram", chiplet_id);
-    memory_region_init_ram(dram, NULL, name, R100_DRAM_INIT_SIZE, &error_fatal);
+    if (chiplet_id == 0 && memdev != NULL) {
+        MemoryRegion *shared = host_memory_backend_get_memory(memdev);
+        uint64_t shared_size = memory_region_size(shared);
+
+        if (shared_size == 0 || shared_size > R100_DRAM_INIT_SIZE) {
+            error_report("r100-soc: memdev size 0x%" PRIx64
+                         " is out of range for chiplet 0 DRAM (max 0x%"
+                         PRIx64 ")",
+                         shared_size, (uint64_t)R100_DRAM_INIT_SIZE);
+            exit(1);
+        }
+
+        snprintf(name, sizeof(name), "r100.chiplet0.dram");
+        memory_region_init(dram, NULL, name, R100_DRAM_INIT_SIZE);
+        memory_region_add_subregion(dram, 0, shared);
+        host_memory_backend_set_mapped(memdev, true);
+        vmstate_register_ram(shared, NULL);
+
+        if (shared_size < R100_DRAM_INIT_SIZE) {
+            MemoryRegion *tail = g_new(MemoryRegion, 1);
+            snprintf(name, sizeof(name), "r100.chiplet0.dram_tail");
+            memory_region_init_ram(tail, NULL, name,
+                                   R100_DRAM_INIT_SIZE - shared_size,
+                                   &error_fatal);
+            memory_region_add_subregion(dram, shared_size, tail);
+        }
+    } else {
+        snprintf(name, sizeof(name), "r100.chiplet%d.dram", chiplet_id);
+        memory_region_init_ram(dram, NULL, name, R100_DRAM_INIT_SIZE,
+                               &error_fatal);
+    }
     memory_region_add_subregion(sysmem, chiplet_base + R100_DRAM_BASE, dram);
 
     /* --- iROM (64KB) --- */
@@ -1105,8 +1154,13 @@ static void r100_soc_init(MachineState *machine)
     r100_create_flash(sysmem);
 
     /* --- Initialize all 4 chiplets --- */
-    for (chiplet = 0; chiplet < R100_NUM_CHIPLETS; chiplet++) {
-        r100_chiplet_init(machine, chiplet, sysmem);
+    {
+        R100SoCMachineState *r100m = R100_SOC_MACHINE(machine);
+        HostMemoryBackend *memdev = r100_soc_resolve_memdev(r100m);
+        for (chiplet = 0; chiplet < R100_NUM_CHIPLETS; chiplet++) {
+            r100_chiplet_init(machine, chiplet, sysmem,
+                              chiplet == 0 ? memdev : NULL);
+        }
     }
 
     /*
@@ -1222,6 +1276,71 @@ static void r100_soc_init(MachineState *machine)
     }
 }
 
+/*
+ * Accessors for the optional `memdev` string property on the machine.
+ *
+ * QEMU parses `-machine ...` options BEFORE it creates memory-backend-*
+ * objects (system/vl.c: object_create_early() returns false for
+ * "memory-backend-*"), so a link-style property would always fail with
+ * "Device 'remushm' not found". We stash the id as a plain string and
+ * resolve it to a HostMemoryBackend at machine-init time instead.
+ */
+static char *r100_soc_get_memdev(Object *obj, Error **errp)
+{
+    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
+    return g_strdup(r100m->memdev_id);
+}
+
+static void r100_soc_set_memdev(Object *obj, const char *value, Error **errp)
+{
+    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
+    g_free(r100m->memdev_id);
+    r100m->memdev_id = g_strdup(value);
+}
+
+static void r100_soc_machine_instance_init(Object *obj)
+{
+    object_property_add_str(obj, "memdev",
+                            r100_soc_get_memdev, r100_soc_set_memdev);
+    object_property_set_description(obj, "memdev",
+        "Optional memory-backend-* id spliced over chiplet 0 DRAM head; "
+        "shared with the Phase-2 x86 host QEMU so BAR0 and the CA73 "
+        "cores see the same bytes.");
+}
+
+static void r100_soc_machine_instance_finalize(Object *obj)
+{
+    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
+    g_free(r100m->memdev_id);
+}
+
+/*
+ * Resolve `-machine memdev=<id>` to the HostMemoryBackend instance
+ * created by the late-backend phase. Returns NULL if no id was given.
+ * Any other failure (id set but object missing / wrong type) exits.
+ */
+static HostMemoryBackend *r100_soc_resolve_memdev(R100SoCMachineState *r100m)
+{
+    Object *obj;
+
+    if (r100m->memdev_id == NULL || *r100m->memdev_id == '\0') {
+        return NULL;
+    }
+    obj = object_resolve_path_component(object_get_objects_root(),
+                                        r100m->memdev_id);
+    if (obj == NULL) {
+        error_report("r100-soc: memdev '%s' not found under /objects",
+                     r100m->memdev_id);
+        exit(1);
+    }
+    if (!object_dynamic_cast(obj, TYPE_MEMORY_BACKEND)) {
+        error_report("r100-soc: object '%s' is not a memory-backend",
+                     r100m->memdev_id);
+        exit(1);
+    }
+    return MEMORY_BACKEND(obj);
+}
+
 static void r100_soc_machine_class_init(ObjectClass *oc, void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -1240,6 +1359,9 @@ static void r100_soc_machine_class_init(ObjectClass *oc, void *data)
 static const TypeInfo r100_soc_machine_info = {
     .name = TYPE_R100_SOC_MACHINE,
     .parent = TYPE_MACHINE,
+    .instance_size = sizeof(R100SoCMachineState),
+    .instance_init = r100_soc_machine_instance_init,
+    .instance_finalize = r100_soc_machine_instance_finalize,
     .class_init = r100_soc_machine_class_init,
 };
 

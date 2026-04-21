@@ -478,23 +478,41 @@ def _make_run_dir(name, output_root):
     return run_dir, name
 
 
-def _build_npu_cmd(run_dir, gdb, trace):
+def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
+                   npu_monitor_sock=None):
     """Assemble the aarch64 QEMU cmdline for the R100 NPU side.
     Matches the previous in-line flow exactly; extracted so that
     --host can extend it (Phase 2) without duplicating boot-image
-    and UART wiring logic."""
+    and UART wiring logic.
+
+    with_host: if True, wires `-machine r100-soc,memdev=remushm` so the
+    r100-soc machine splices the shared memory-backend-file over chiplet
+    0's DRAM head (M5). The `remushm` object itself is appended later by
+    the `run` command along with the PCI-side plumbing.
+
+    npu_monitor_sock: if given (path), an additional Unix-socket HMP
+    monitor is attached to the NPU QEMU so the CLI can programmatically
+    query `info mtree` / `xp`. The existing stdio-muxed readline monitor
+    on uart0 keeps working for interactive use."""
     uart0_log = run_dir / "uart0.log"
     hils_log = run_dir / "hils.log"
 
+    machine_opt = "r100-soc"
+    if with_host:
+        machine_opt += ",memdev=remushm"
+
     cmd = [
         str(QEMU_BIN),
-        "-M", "r100-soc",
+        "-M", machine_opt,
         "-display", "none",
         "-chardev",
         "stdio,id=uart0,mux=on,signal=off,logfile=%s,logappend=off" % uart0_log,
         "-mon", "chardev=uart0,mode=readline",
         "-serial", "chardev:uart0",
     ]
+    if npu_monitor_sock is not None:
+        cmd += ["-monitor",
+                "unix:%s,server=on,wait=off" % npu_monitor_sock]
     click.echo("  Chiplet 0 UART -> stdio (log: %s)" % uart0_log)
 
     for n in range(1, 4):
@@ -693,6 +711,31 @@ def _proc_has_mmap(pid, shm_file):
     return str(shm_file) in maps
 
 
+def _extract_mtree_container(mtree, container_name):
+    """Return the `info mtree` snippet (header + indented children) for
+    the first MemoryRegion whose line contains `container_name`, or None
+    if not found. info mtree uses indent to denote sub-region nesting."""
+    lines = mtree.splitlines()
+    idx = None
+    for i, ln in enumerate(lines):
+        if container_name in ln:
+            idx = i
+            break
+    if idx is None:
+        return None
+    header_indent = len(lines[idx]) - len(lines[idx].lstrip())
+    snippet = [lines[idx]]
+    for ln in lines[idx + 1:]:
+        stripped = ln.lstrip()
+        if not stripped:
+            break
+        indent = len(ln) - len(stripped)
+        if indent <= header_indent:
+            break
+        snippet.append(ln)
+    return "\n".join(snippet)
+
+
 def _verify_shared_mapping(monitor_sock, shm_file, host_pid, npu_pid,
                            mtree_log, bar_poll_timeout=10.0):
     """Prove the shared-memory bridge actually reaches both processes:
@@ -725,33 +768,16 @@ def _verify_shared_mapping(monitor_sock, shm_file, host_pid, npu_pid,
 
     mtree_log.write_text(mtree + "\n")
 
-    lines = mtree.splitlines()
-    bar0_idx = None
-    for i, ln in enumerate(lines):
-        if "r100.bar0.ddr" in ln:
-            bar0_idx = i
-            break
-    if bar0_idx is None:
+    snippet = _extract_mtree_container(mtree, "r100.bar0.ddr")
+    if snippet is None:
         raise RuntimeError(
             "SeaBIOS never placed r100.bar0.ddr into the pci address "
             "space within %.1fs; see %s" % (bar_poll_timeout, mtree_log))
 
-    bar0_indent = len(lines[bar0_idx]) - len(lines[bar0_idx].lstrip())
-    snippet = [lines[bar0_idx]]
-    for ln in lines[bar0_idx + 1:]:
-        stripped = ln.lstrip()
-        if not stripped:
-            break
-        indent = len(ln) - len(stripped)
-        if indent <= bar0_indent:
-            break
-        snippet.append(ln)
-
-    joined = "\n".join(snippet)
     # info mtree prints MemoryRegions by their NAME (the object id for
     # memory-backend-file). The backing path isn't in the mtree output
     # — that we verify separately via /proc/<pid>/maps below.
-    if "remushm" not in joined:
+    if "remushm" not in snippet:
         raise RuntimeError(
             "BAR0 container does not contain the 'remushm' backend at "
             "offset 0; see %s" % mtree_log)
@@ -765,7 +791,34 @@ def _verify_shared_mapping(monitor_sock, shm_file, host_pid, npu_pid,
             "NPU QEMU (pid %d) does not have %s mmap'd" %
             (npu_pid, shm_file))
 
-    return joined
+    return snippet
+
+
+def _verify_npu_shared_mapping(npu_monitor_sock, mtree_log):
+    """Prove the shared memory-backend-file is spliced over chiplet 0
+    DRAM on the NPU side (M5).
+
+    `info mtree` on the NPU QEMU monitor must list the `r100.chiplet0
+    .dram` container with the `remushm` backend at offset 0. Unlike the
+    host-side BAR0 wiring, chiplet 0 DRAM is mounted at machine init
+    time (no BAR programming to wait for), so this is a single-shot
+    query with a modest timeout.
+
+    Returns the mtree snippet for the container. Raises RuntimeError if
+    the expected layout is missing."""
+    mtree = _hmp_query(npu_monitor_sock, "info mtree", timeout=10.0)
+    mtree_log.write_text(mtree + "\n")
+
+    snippet = _extract_mtree_container(mtree, "r100.chiplet0.dram")
+    if snippet is None:
+        raise RuntimeError(
+            "NPU `info mtree` does not list r100.chiplet0.dram; see %s"
+            % mtree_log)
+    if "remushm" not in snippet:
+        raise RuntimeError(
+            "chiplet 0 DRAM container is not backed by the 'remushm' "
+            "backend; see %s" % mtree_log)
+    return snippet
 
 
 @cli.command()
@@ -827,7 +880,17 @@ def run(name, output_root, gdb, trace, chiplets, memory,
     run_dir, run_name = _make_run_dir(name, output_root)
     click.echo("Run directory: %s" % run_dir)
 
-    npu_cmd, found = _build_npu_cmd(run_dir, gdb, trace)
+    host_proc = None
+    shm_dir = None
+    npu_monitor_sock = None
+    if with_host:
+        npu_dir = run_dir / "npu"
+        npu_dir.mkdir(exist_ok=True)
+        npu_monitor_sock = npu_dir / "monitor.sock"
+
+    npu_cmd, found = _build_npu_cmd(run_dir, gdb, trace,
+                                    with_host=with_host,
+                                    npu_monitor_sock=npu_monitor_sock)
 
     if found == 0:
         click.secho("Warning: no firmware images in %s/" % IMAGES_DIR,
@@ -836,8 +899,6 @@ def run(name, output_root, gdb, trace, chiplets, memory,
         if not click.confirm("Run with empty memory anyway?"):
             return
 
-    host_proc = None
-    shm_dir = None
     if with_host:
         shm_dir, shm_file = _setup_shm(run_name, shm_size)
         shm_link = run_dir / "shm"
@@ -848,9 +909,10 @@ def run(name, output_root, gdb, trace, chiplets, memory,
         except OSError:
             pass
 
-        # Attach the same backend to the NPU QEMU so both processes hold
-        # it open (cross-process mmap proof). No R100 device consumes it
-        # yet — M4 will map it into the NPU physical address space.
+        # Attach the same backend to the NPU QEMU. M5 also wires it via
+        # `-machine r100-soc,memdev=remushm` (see _build_npu_cmd) so the
+        # backend ends up spliced over chiplet 0's DRAM head — both CA73
+        # cores and the x86 host guest's BAR0 see the same bytes.
         npu_cmd += [
             "-object",
             "memory-backend-file,id=remushm,mem-path=%s,size=%d,share=on"
@@ -858,6 +920,7 @@ def run(name, output_root, gdb, trace, chiplets, memory,
         ]
         click.echo("  Shared memory -> %s (%d MB)"
                    % (shm_file, shm_size // (1024 * 1024)))
+        click.echo("  NPU QEMU    -> monitor: %s" % npu_monitor_sock)
 
         host_dir = run_dir / "host"
         host_dir.mkdir(exist_ok=True)
@@ -999,8 +1062,24 @@ def run(name, output_root, gdb, trace, chiplets, memory,
             click.echo()
         except Exception as e:
             click.secho("  %s" % e, fg="red")
-            # Don't kill the run — M5+ work is orthogonal to this
-            # verification. Just surface the failure and keep going.
+            # Don't kill the run — follow-up M-work is orthogonal to
+            # this verification. Just surface the failure and keep going.
+
+        # M5: Verify the NPU side also splices remushm over chiplet 0
+        # DRAM at offset 0. Unlike BAR0 this is a machine-time mount so
+        # it's present immediately; _hmp_query's built-in connect
+        # retries handle the small race with NPU-QEMU monitor bring-up.
+        try:
+            npu_snippet = _verify_npu_shared_mapping(
+                npu_monitor_sock, npu_dir / "info-mtree.log")
+            click.secho(
+                "  memdev aliased over chiplet 0 DRAM (NPU side)",
+                fg="green")
+            for ln in npu_snippet.splitlines():
+                click.echo("    " + ln)
+            click.echo()
+        except Exception as e:
+            click.secho("  %s" % e, fg="red")
 
         try:
             rc = npu_proc.wait()

@@ -44,23 +44,42 @@ match the driver's size checks in `rebel_check_pci_bars_size`:
 | 5   | 1 MB  (= `RBLN_PCIE_SIZE`)        | MSI-X table (32 vectors) + PBA |
 
 Both QEMUs open the same 128 MB memory-backed file at
-`/dev/shm/remu-<name>/remu-shm` with `share=on`. On the x86 side it's
-aliased through the device's `memdev` link over **BAR0 offset 0** (M4),
-so stores into BAR0[0..128MB) land in tmpfs pages the NPU-side QEMU
-process also has mmap'd. (Stitching the NPU CPUs' DRAM view onto that
-same file is M5.) SeaBIOS is allowed to run so the BAR addresses get
-programmed; the guest idles at "No bootable device" with serial
-redirected to `host/serial.log`. The HMP monitor lives at
-`output/<name>/host/monitor.sock` (use `socat - UNIX-CONNECT:...` for
+`/dev/shm/remu-<name>/remu-shm` with `share=on`. The **same** backend is
+spliced into **two** places — one per QEMU process — via containers
+that layer the shared file at offset 0 and lazy RAM over the tail:
+
+- **x86 host QEMU** (M4) — aliased through the `r100-npu-pci` device's
+  `memdev` link over **BAR0 offset 0**, so stores into
+  BAR0[0..128MB) land in tmpfs pages.
+- **NPU QEMU** (M5) — aliased through the `r100-soc` machine's
+  `memdev` string property (resolved at machine-init time because
+  `-object memory-backend-*` is processed after `-machine` options)
+  over **chiplet 0 DRAM offset 0**, so CA73 loads/stores into
+  chiplet-0 physical 0x0..0x07FFFFFF hit the same file. The tail
+  (0x08000000..0x40000000) stays plain lazy RAM, so BL31_CP1 / FreeRTOS_CP1
+  loaded at 0x14100000 / 0x14200000 remain private to the NPU.
+
+The NPU QEMU's HMP monitor is exposed on a second unix socket at
+`output/<name>/npu/monitor.sock` (on top of the existing stdio-muxed
+readline monitor on uart0). SeaBIOS is allowed to run so the x86 BAR
+addresses get programmed; the guest idles at "No bootable device" with
+serial redirected to `host/serial.log`. The host-side HMP monitor lives
+at `output/<name>/host/monitor.sock` (use `socat - UNIX-CONNECT:...` for
 interactive HMP).
 
-`./remucli run --host` auto-verifies the bridge end-to-end: `info pci`
-must list `1eff:2030`; `info mtree` must place the `remushm` subregion
-at offset 0 of the `r100.bar0.ddr` container; and both QEMU PIDs must
-have the shm file in `/proc/<pid>/maps`. Logs: `host/info-pci.log`,
-`host/info-mtree.log`. Any of the three checks failing prints to the
-terminal — the NPU still boots for post-mortem poking, it just means
-the x86 guest won't see shared DRAM until fixed.
+`./remucli run --host` auto-verifies the bridge end-to-end:
+  - `info pci` on host must list `1eff:2030` (logged to `host/info-pci.log`);
+  - `info mtree` on host must place the `remushm` subregion at offset 0
+    of `r100.bar0.ddr` (logged to `host/info-mtree.log`);
+  - `info mtree` on the NPU must place the same `remushm` subregion at
+    offset 0 of `r100.chiplet0.dram` (logged to `npu/info-mtree.log`);
+  - both QEMU PIDs must have the shm file in `/proc/<pid>/maps`.
+
+Any check failing prints to the terminal — the NPU still boots for
+post-mortem poking. `tests/m5_dataflow_test.py` is an end-to-end
+sanity script: it writes a magic pattern to `/dev/shm/.../remu-shm` at
+offset 0x07F00000 (past the FW image region) and asserts `xp /4wx` on
+both monitors returns the same bytes.
 
 All `./remucli run` invocations write into `output/<name>/` (or
 `output/run-<timestamp>/` if `--name` is omitted). Never pass paths
