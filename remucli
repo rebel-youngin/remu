@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# REMU CLI — no install step required.
+#
+# Thin dispatcher to cli/remu_cli.py. Runs with the current Python 3;
+# only external dependency is `click` (pip install --user click).
+#
+# Usage:
+#   ./remucli build
+#   ./remucli fw-build -p silicon
+#   ./remucli run --name my-test
+#   ./remucli run --gdb --name dbg
+#   ./remucli gdb -b <elf>
+#   ./remucli status
+#
+# See docs/debugging.md for the agent workflow.
+
+set -e
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec python3 "${SCRIPT_DIR}/cli/remu_cli.py" "$@"

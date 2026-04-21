@@ -8,24 +8,45 @@ REMU — R100 NPU System Emulator. QEMU-based functional emulator for the R100 (
 
 - [docs/architecture.md](docs/architecture.md) — System architecture, memory maps, device model design, FW source references
 - [docs/roadmap.md](docs/roadmap.md) — Phased implementation plan (Phase 1: FW boot, Phase 2: host drivers, Phase 3: inference)
+- [docs/debugging.md](docs/debugging.md) — **How the agent should build / run / inspect logs / drive GDB.** Read this before running the emulator.
 
 ## Build
 
+All commands go through `./remucli` at the repo root — a thin bash
+wrapper around `cli/remu_cli.py`. **No install step** — just make sure
+`click` is available (`pip install --user click`).
+
 ```
-remu build              # or: cd cli && pip install -e . && remu build
-remu run                # boot with FW images from images/
-remu run --gdb          # wait for GDB on :1234
-remu status             # show environment status
-remu fw-build -p silicon   # build q-sys FW (tf-a + cp0 + cp1) → images/
+./remucli build                     # builds QEMU with R100 device models
+./remucli fw-build -p silicon       # builds q-sys FW (tf-a + cp0 + cp1) → images/
+./remucli status                    # sanity-check environment
+./remucli run --name my-test        # boot; logs land in output/my-test/
+./remucli run --name dbg --gdb      # boot paused, wait for GDB on :1234
 ```
 
-Manual build:
+All `./remucli run` invocations write into `output/<name>/` (or
+`output/run-<timestamp>/` if `--name` is omitted). Never pass paths
+under `/tmp/` — stick with the per-run output directory so multiple
+runs don't clobber each other. See `docs/debugging.md` for the full
+agent loop, log interpretation, and GDB workflow.
+
+Shell tab-completion (optional, but handy):
+
+```
+eval "$(./remucli completion bash)"   # or: completion zsh / completion fish
+```
+
+For persistent completion, add the eval to `~/.bashrc` with the
+absolute path to `remucli`, and either put the repo root on PATH or
+`alias remucli=/abs/path/to/remucli` so bare `remucli` tab-completes too.
+
+Manual ninja rebuild (skips the CLI's symlink / meson patch step):
 ```
 cd build/qemu && ninja -j$(nproc)
 ```
 
-`remu fw-build` wraps `external/ssw-bundle/.../q/sys/build.sh`. Components are
-repeatable (`-c tf-a -c cp0 -c cp1`, default covers the CA73 boot set);
+`./remucli fw-build` wraps `external/ssw-bundle/.../q/sys/build.sh`. Components
+are repeatable (`-c tf-a -c cp0 -c cp1`, default covers the CA73 boot set);
 platform is `silicon` / `zebu` / `zebu_ci` / `zebu_vdk`; `--install` (default
 on) copies the 6 CA73 binaries into `images/`. Toolchains are taken from
 `COMPILER_PATH_ARM64` / `COMPILER_PATH_ARM32` env vars, with defaults under
@@ -34,15 +55,16 @@ on) copies the 6 CA73 binaries into `images/`. Toolchains are taken from
 ## Project layout
 
 ```
+remucli               Bash wrapper — the one entry point (`./remucli <cmd>`)
 src/machine/          QEMU device models (symlinked into external/qemu/hw/arm/r100/)
 src/include/          Shared headers (remu_addrmap.h)
-cli/                  Click-based CLI tool
-scripts/              Build and launch scripts
+cli/remu_cli.py       Click-based CLI implementation (invoked by ./remucli)
 tests/                Test binaries and test scripts
-docs/                 Architecture and roadmap docs
+docs/                 Architecture, roadmap, debugging docs
 external/             Read-only: ssw-bundle (q-sys, q-cp, kmd, umd, ...), qemu
 images/               FW binaries (bl1.bin, bl31_cp0.bin, freertos_cp0.bin, ...)
 build/qemu/           QEMU build output (gitignored)
+output/               Per-run log directories (gitignored; see docs/debugging.md)
 ```
 
 ## Code style
@@ -59,7 +81,7 @@ build/qemu/           QEMU build output (gitignored)
 - **CPU**: 8x CA73 per chiplet (2 clusters x 4 cores) = 32 total
 - **CHIPLET_OFFSET**: `0x2000000000` between chiplets
 - **Boot**: TF-A BL1 → BL2 → BL31 → FreeRTOS (q-sys), then q-cp tasks
-- **FW build**: `remu fw-build -p silicon` (default). The zebu / zebu_ci / zebu_vdk profiles are still accepted by `-p <name>` but are deprecated — see `docs/roadmap.md` Phase 1 Status
+- **FW build**: `./remucli fw-build -p silicon` (default). The zebu / zebu_ci / zebu_vdk profiles are still accepted by `-p <name>` but are deprecated — see `docs/roadmap.md` Phase 1 Status
 - **UART**: PL011 at `0x1FF9040000` (PERI0_UART0), 250MHz clock
 - **GIC**: GICv3 distributor at `0x1FF3800000`, redistributor at `0x1FF3840000`
 - **Timer**: 500MHz generic timer (`CORE_TIMER_FREQ`)

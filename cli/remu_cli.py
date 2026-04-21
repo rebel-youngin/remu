@@ -2,16 +2,22 @@
 """
 REMU CLI — R100 NPU System Emulator management tool.
 
+Invoked via the ./remucli wrapper at the repo root (no install step).
+Dependency: click (`pip install --user click`).
+
 Usage:
-    remu build [--clean] [--jobs N]
-    remu run [--gdb] [--trace] [--chiplets N]
-    remu gdb [--port PORT]
-    remu status
-    remu images [--list | --check]
+    ./remucli build [--clean] [--jobs N]
+    ./remucli fw-build [-p silicon] [-c tf-a -c cp0 -c cp1] [--clean]
+    ./remucli run [--name NAME] [--gdb] [--trace] [--chiplets N]
+    ./remucli gdb [--port PORT] [-b ELF]
+    ./remucli status
+    ./remucli images [--check | --from-dir PATH]
+    ./remucli completion {bash,zsh,fish}
 """
 
 import os
 import sys
+import time
 import shutil
 import signal
 import subprocess
@@ -26,6 +32,7 @@ QEMU_BIN = QEMU_BUILD / "qemu-system-aarch64"
 MACHINE_SRC = REMU_ROOT / "src" / "machine"
 INCLUDE_SRC = REMU_ROOT / "src" / "include"
 IMAGES_DIR = REMU_ROOT / "images"
+OUTPUT_ROOT = REMU_ROOT / "output"
 
 # q-sys (CP firmware) build paths
 SSW_SYS = REMU_ROOT / "external" / "ssw-bundle" / "products" / "rebel" / "q" / "sys"
@@ -98,7 +105,7 @@ def _check_qemu_src():
 
 def _check_qemu_bin():
     if not QEMU_BIN.is_file():
-        click.secho("QEMU binary not found. Run 'remu build' first.", fg="red")
+        click.secho("QEMU binary not found. Run './remucli build' first.", fg="red")
         raise SystemExit(1)
 
 
@@ -142,8 +149,8 @@ def _run(cmd, cwd=None, check=True, **kwargs):
 
 # ── CLI Group ────────────────────────────────────────────────────────────────
 
-@click.group()
-@click.version_option("0.1.0", prog_name="remu")
+@click.group(context_settings={"help_option_names": ["-h", "--help"]})
+@click.version_option("0.1.0", prog_name="remucli")
 def cli():
     """REMU — R100 NPU System Emulator CLI."""
 
@@ -203,7 +210,7 @@ def build(clean, jobs):
 
 # q-sys build.sh targets that have real build_* functions. Note: the `rtos`
 # alias advertised in build.sh --help has no corresponding build_rtos in
-# scripts/, so we don't expose it here.
+# q-sys scripts/, so we don't expose it here.
 FW_COMPONENTS = ["all", "tf-a", "cp0", "cp1", "cm", "boot", "bootrom", "cmrt"]
 FW_PLATFORMS = ["silicon", "zebu", "zebu_ci", "zebu_vdk"]
 FW_MODES = ["debug", "release", "profile"]
@@ -329,7 +336,33 @@ def fw_build(components, platform, mode, chiplets, clean, install):
 
 # ── run ──────────────────────────────────────────────────────────────────────
 
+def _make_run_dir(name, output_root):
+    """Create <output_root>/<name>/ (defaulting to output/run-<ts>/) and
+    refresh the output/latest -> <name> convenience symlink."""
+    root = Path(output_root).resolve() if output_root else OUTPUT_ROOT
+    root.mkdir(parents=True, exist_ok=True)
+    if not name:
+        name = "run-" + time.strftime("%Y%m%d-%H%M%S")
+    run_dir = root / name
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    latest = root / "latest"
+    try:
+        if latest.is_symlink() or latest.exists():
+            latest.unlink()
+        latest.symlink_to(name)
+    except OSError:
+        pass
+    return run_dir
+
+
 @cli.command()
+@click.option("--name", "-n", default=None,
+              help="Run name. Outputs land in <output-root>/<name>/. "
+                   "Default: run-<YYYYmmdd-HHMMSS>.")
+@click.option("--output-root", type=click.Path(file_okay=False), default=None,
+              help="Parent directory for run outputs. "
+                   "Default: <repo>/output/.")
 @click.option("--gdb", is_flag=True, help="Wait for GDB connection on :1234.")
 @click.option("--trace", is_flag=True,
               help="Enable guest_errors and unimp logging.")
@@ -337,39 +370,47 @@ def fw_build(components, platform, mode, chiplets, clean, install):
               help="Number of chiplets (1-4). Default 4.")
 @click.option("--memory", "-m", default="1G",
               help="DRAM size per chiplet (e.g. 1G, 512M).")
-@click.option("--uart-log-dir", type=click.Path(file_okay=False),
-              default="/tmp",
-              help="Directory for per-chiplet UART log files. "
-                   "Chiplet 0 uses stdio; 1-3 write to "
-                   "remu_uart{1,2,3}.log. Default: /tmp.")
-@click.option("--hils-log", type=click.Path(dir_okay=False), default=None,
-              help="File to receive the FreeRTOS HILS ring tail "
-                   "(RLOG_*/FLOG_* messages from DRAM 0x10000000). "
-                   "Default: <uart-log-dir>/remu_hils.log. Pass 'stderr' "
-                   "to mux onto the controlling terminal instead.")
-def run(gdb, trace, chiplets, memory, uart_log_dir, hils_log):
-    """Boot R100 firmware on the emulated SoC."""
+def run(name, output_root, gdb, trace, chiplets, memory):
+    """Boot R100 firmware on the emulated SoC.
+
+    Every invocation gets a dedicated output directory under
+    <repo>/output/<name>/ (or a timestamped default) containing:
+
+    \b
+      uart0.log       — chiplet 0 UART (also muxed to stdio + monitor)
+      uart1..3.log    — chiplets 1-3 UARTs
+      hils.log        — FreeRTOS HILS ring tail (RLOG_*/FLOG_* from DRAM)
+      cmdline.txt     — the full QEMU command used for this run
+
+    `<output-root>/latest` is updated to point at the most recent run.
+    """
     _check_qemu_bin()
 
-    # Per-chiplet UART routing: chiplet 0 goes to stdio so boot output
-    # is live; chiplets 1-3 each get a dedicated file chardev to keep
-    # logs from interleaving with each other.
-    uart_log_dir = Path(uart_log_dir)
-    uart_log_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = _make_run_dir(name, output_root)
+    click.echo("Run directory: %s" % run_dir)
 
-    # Drive chiplet 0's UART onto stdio (muxed with monitor) and the
-    # other three onto dedicated file chardevs. We manage all four
-    # serial bindings explicitly because QEMU's `-nographic` implicit
-    # `-serial mon:stdio` is suppressed once any other `-serial`
-    # option is present, which otherwise leaves chiplet 3 unbound.
+    uart0_log = run_dir / "uart0.log"
+    hils_log = run_dir / "hils.log"
+
+    # Chiplet 0 UART drives stdio (muxed with the QEMU monitor — Ctrl-A C
+    # toggles) and tee's into uart0.log via chardev logfile=. Chiplets
+    # 1-3 each get a dedicated file chardev so per-chiplet boot output
+    # doesn't interleave. All four -serial bindings are explicit because
+    # QEMU's implicit `-serial mon:stdio` is suppressed once any other
+    # -serial option is present.
     cmd = [
         str(QEMU_BIN),
         "-M", "r100-soc",
         "-display", "none",
-        "-serial", "mon:stdio",
+        "-chardev",
+        "stdio,id=uart0,mux=on,signal=off,logfile=%s,logappend=off" % uart0_log,
+        "-mon", "chardev=uart0,mode=readline",
+        "-serial", "chardev:uart0",
     ]
+    click.echo("  Chiplet 0 UART -> stdio (log: %s)" % uart0_log)
+
     for n in range(1, 4):
-        log_path = uart_log_dir / ("remu_uart%d.log" % n)
+        log_path = run_dir / ("uart%d.log" % n)
         cmd += [
             "-chardev",
             "file,id=uart%d,path=%s,mux=off" % (n, log_path),
@@ -381,28 +422,21 @@ def run(gdb, trace, chiplets, memory, uart_log_dir, hils_log):
     # r100-logbuf-tail device. It polls chiplet 0's DRAM .logbuf ring at
     # 0x10000000 and drains RLOG_*/FLOG_* entries out of band so they
     # surface even before FreeRTOS's own terminal_task starts draining.
-    if hils_log == "stderr":
-        cmd += ["-chardev", "stdio,id=hils,mux=off,signal=off",
-                "-serial", "chardev:hils"]
-        click.echo("  HILS ring tail -> stderr (chardev=stdio)")
-    else:
-        hils_path = Path(hils_log) if hils_log else (uart_log_dir / "remu_hils.log")
-        hils_path.parent.mkdir(parents=True, exist_ok=True)
-        cmd += [
-            "-chardev",
-            "file,id=hils,path=%s,mux=off" % hils_path,
-            "-serial", "chardev:hils",
-        ]
-        click.echo("  HILS ring tail -> %s" % hils_path)
+    cmd += [
+        "-chardev",
+        "file,id=hils,path=%s,mux=off" % hils_log,
+        "-serial", "chardev:hils",
+    ]
+    click.echo("  HILS ring tail -> %s" % hils_log)
 
     if gdb:
         cmd += ["-s", "-S"]
         click.secho("Waiting for GDB on localhost:1234...", fg="yellow")
 
     if trace:
-        cmd += ["-d", "guest_errors,unimp"]
+        cmd += ["-d", "guest_errors,unimp",
+                "-D", str(run_dir / "qemu.log")]
 
-    # Load firmware images
     found = 0
     for fname, addr, desc in FW_IMAGES:
         path = IMAGES_DIR / fname
@@ -410,11 +444,10 @@ def run(gdb, trace, chiplets, memory, uart_log_dir, hils_log):
             cmd += ["-device", "loader,file=%s,addr=0x%x" % (path, addr)]
             found += 1
 
-    # CP1 images also need to land in each secondary chiplet's DRAM so that
-    # chiplet N's CP1.cpu0 (released by its own BL2) finds bl31_cp1.bin at
-    # its chiplet-local `CP1_BL31_BASE` entry point. Chiplet 0 is already
-    # covered by FW_IMAGES; replicate at chiplet_id * CHIPLET_OFFSET + base
-    # for chiplets 1..N-1.
+    # CP0 + CP1 images also need to land in each secondary chiplet's DRAM
+    # so chiplet N's CP0/CP1.cpu0 (released by BL2) finds its reset vector
+    # images. Chiplet 0 is already covered by FW_IMAGES; replicate at
+    # chiplet_id * CHIPLET_OFFSET + base for chiplets 1..N-1.
     for chiplet_id in range(1, R100_NUM_CHIPLETS):
         for fname, base, _desc in FW_PER_CHIPLET_IMAGES:
             path = IMAGES_DIR / fname
@@ -431,6 +464,9 @@ def run(gdb, trace, chiplets, memory, uart_log_dir, hils_log):
         if not click.confirm("Run with empty memory anyway?"):
             return
 
+    (run_dir / "cmdline.txt").write_text(" \\\n  ".join(cmd) + "\n")
+
+    click.echo()
     click.echo("Starting R100 emulator (%d chiplets)..." % chiplets)
     click.echo("  Machine: r100-soc (4 chiplets, 32 CA73 cores)")
     click.echo("  Press Ctrl-A X to quit")
@@ -485,7 +521,7 @@ def status():
     if QEMU_BIN.is_file():
         click.secho("  QEMU binary:  %s" % QEMU_BIN, fg="green")
     else:
-        click.secho("  QEMU binary:  NOT BUILT (run: remu build)", fg="yellow")
+        click.secho("  QEMU binary:  NOT BUILT (run: ./remucli build)", fg="yellow")
 
     # Firmware images
     click.echo()
@@ -505,7 +541,7 @@ def status():
     if not any_found:
         click.echo()
         click.secho("  No firmware images found. Run: "
-                     "remu fw-build -p silicon", fg="yellow")
+                     "./remucli fw-build -p silicon", fg="yellow")
 
     # Device models
     click.echo()
@@ -521,7 +557,7 @@ def status():
     if r100_link.exists():
         click.secho("  QEMU integration:  linked", fg="green")
     else:
-        click.secho("  QEMU integration:  not linked (run: remu build)",
+        click.secho("  QEMU integration:  not linked (run: ./remucli build)",
                      fg="yellow")
 
 
@@ -557,7 +593,7 @@ def images(check, from_dir):
                     click.secho("  %s -> %s" % (cand_path, dest), fg="green")
                     break
 
-        click.echo("Done. Run 'remu images --check' to verify.")
+        click.echo("Done. Run './remucli images --check' to verify.")
         return
 
     # Default: show image status (same as --check)
@@ -574,13 +610,46 @@ def images(check, from_dir):
             click.secho("  [--] %-22s  missing         @ 0x%010x" %
                          (fname, addr), fg="red")
     click.echo()
-    click.echo("Copy images manually or use: remu images --from-dir <path>")
+    click.echo("Copy images manually or use: ./remucli images --from-dir <path>")
+
+
+# ── completion ───────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("shell", type=click.Choice(["bash", "zsh", "fish"]))
+def completion(shell):
+    """Print a shell completion script.
+
+    \b
+    One-off (current shell):
+        eval "$(./remucli completion bash)"
+
+    \b
+    Persistent — source from ~/.bashrc (pick one):
+        eval "$(/abs/path/to/remucli completion bash)"
+        source /abs/path/to/remucli-complete.bash   # if you write it to a file first
+
+    \b
+    Zsh and fish use the same pattern:
+        eval "$(./remucli completion zsh)"
+        ./remucli completion fish | source
+
+    The generated script hooks the command name `remucli`, so either put the
+    repo root on PATH or `alias remucli=/abs/path/to/remucli` for bare-name
+    invocations to tab-complete.
+    """
+    from click.shell_completion import get_completion_class
+    comp_cls = get_completion_class(shell)
+    if comp_cls is None:
+        raise click.ClickException("shell '%s' not supported by this click" % shell)
+    comp = comp_cls(cli, {}, "remucli", "_REMUCLI_COMPLETE")
+    click.echo(comp.source())
 
 
 # ── entry point ──────────────────────────────────────────────────────────────
 
 def main():
-    cli()
+    cli(prog_name="remucli")
 
 
 if __name__ == "__main__":

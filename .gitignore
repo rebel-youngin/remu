@@ -1,5 +1,6 @@
 build/
 install/
+output/
 images/*.bin
 tests/*.bin
 tests/*.o
