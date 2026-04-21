@@ -5,6 +5,11 @@ REMU CLI — R100 NPU System Emulator management tool.
 Invoked via the ./remucli wrapper at the repo root (no install step).
 Dependency: click (`pip install --user click`).
 
+`./remucli build` produces two QEMU binaries from the same pinned source
+tree: qemu-system-aarch64 (NPU side, Phase 1 FW boot) and
+qemu-system-x86_64 (host side, Phase 2 kmd/umd guest). Build time roughly
+doubles on a fresh tree; incremental rebuilds only touch changed files.
+
 Usage:
     ./remucli build [--clean] [--jobs N]
     ./remucli fw-build [-p silicon] [-c tf-a -c cp0 -c cp1] [--clean]
@@ -29,11 +34,30 @@ REMU_ROOT = Path(__file__).resolve().parent.parent
 QEMU_SRC = REMU_ROOT / "external" / "qemu"
 QEMU_BUILD = REMU_ROOT / "build" / "qemu"
 QEMU_BIN = QEMU_BUILD / "qemu-system-aarch64"
+QEMU_BIN_X86 = QEMU_BUILD / "qemu-system-x86_64"
 QEMU_PATCHES = REMU_ROOT / "cli" / "qemu-patches"
 MACHINE_SRC = REMU_ROOT / "src" / "machine"
+HOST_SRC = REMU_ROOT / "src" / "host"
 INCLUDE_SRC = REMU_ROOT / "src" / "include"
 IMAGES_DIR = REMU_ROOT / "images"
 OUTPUT_ROOT = REMU_ROOT / "output"
+
+# QEMU --target-list passed at configure time. aarch64 hosts the NPU-side
+# FW boot (Phase 1); x86_64 hosts the Linux guest that runs kmd/umd
+# against our r100-npu-pci device model (Phase 2). Both targets build
+# from the same pinned QEMU source tree so the shared-memory bridge +
+# host-side PCI device compile into both binaries.
+QEMU_TARGETS = "aarch64-softmmu,x86_64-softmmu"
+QEMU_TARGETS_MARKER = QEMU_BUILD / ".remu-targets"
+
+# Phase 2 shared-memory bridge defaults.
+# 128 MB is a power-of-2 scratch size — plenty to prove cross-process
+# mmap without using much tmpfs. M4 will grow this to match the BAR0
+# DRAM window (1 GB per chiplet). Kept outside the repo tree (/dev/shm
+# is tmpfs on all supported hosts) so large sizes don't land on disk.
+SHM_ROOT = Path("/dev/shm")
+SHM_SIZE_DEFAULT = 128 * 1024 * 1024
+HOST_MEM_DEFAULT = "512M"
 
 # q-sys (CP firmware) build paths
 SSW_SYS = REMU_ROOT / "external" / "ssw-bundle" / "products" / "rebel" / "q" / "sys"
@@ -104,10 +128,16 @@ def _check_qemu_src():
         raise SystemExit(1)
 
 
-def _check_qemu_bin():
-    if not QEMU_BIN.is_file():
-        click.secho("QEMU binary not found. Run './remucli build' first.", fg="red")
+def _check_qemu_bin(which="aarch64"):
+    """Verify a built QEMU binary exists. `which` is 'aarch64' (NPU-side,
+    default) or 'x86_64' (host-side; Phase 2)."""
+    bin_path = QEMU_BIN if which == "aarch64" else QEMU_BIN_X86
+    if not bin_path.is_file():
+        click.secho("QEMU %s binary not found at %s." % (which, bin_path),
+                    fg="red")
+        click.secho("Run './remucli build' first.", fg="red")
         raise SystemExit(1)
+    return bin_path
 
 
 def _link_sources():
@@ -127,19 +157,38 @@ def _link_sources():
         r100_soc_h_link.symlink_to(MACHINE_SRC / "r100_soc.h")
         click.echo("  Linked %s" % r100_soc_h_link)
 
+    # Host-side (x86 guest) device models go under hw/misc/ — that's
+    # where QEMU puts other generic PCI devices (edu, ivshmem) that
+    # aren't tied to a specific target architecture.
+    host_dir = QEMU_SRC / "hw" / "misc" / "r100-host"
+    if not host_dir.exists():
+        host_dir.symlink_to(HOST_SRC)
+        click.echo("  Linked %s -> %s" % (host_dir, HOST_SRC))
+
 
 def _patch_meson():
-    """Ensure QEMU's hw/arm/meson.build includes our subdir."""
-    meson_path = QEMU_SRC / "hw" / "arm" / "meson.build"
-    marker = "subdir('r100')"
+    """Ensure QEMU's meson.build files include our subdirs. Called
+    twice (arm + misc) so fresh trees and upgraded trees both end up
+    with both hooks wired. Returns True if anything changed."""
+    changed = False
 
-    content = meson_path.read_text()
-    if marker not in content:
-        content += "\n%s\n" % marker
-        meson_path.write_text(content)
-        click.echo("  Patched %s" % meson_path)
-        return True
-    return False
+    arm_meson = QEMU_SRC / "hw" / "arm" / "meson.build"
+    arm_marker = "subdir('r100')"
+    arm_content = arm_meson.read_text()
+    if arm_marker not in arm_content:
+        arm_meson.write_text(arm_content + "\n%s\n" % arm_marker)
+        click.echo("  Patched %s" % arm_meson)
+        changed = True
+
+    misc_meson = QEMU_SRC / "hw" / "misc" / "meson.build"
+    misc_marker = "subdir('r100-host')"
+    misc_content = misc_meson.read_text()
+    if misc_marker not in misc_content:
+        misc_meson.write_text(misc_content + "\n%s\n" % misc_marker)
+        click.echo("  Patched %s" % misc_meson)
+        changed = True
+
+    return changed
 
 
 def _apply_qemu_patches():
@@ -196,7 +245,18 @@ def cli():
 @click.option("--jobs", "-j", type=int, default=0,
               help="Parallel build jobs (0 = auto-detect).")
 def build(clean, jobs):
-    """Build QEMU with R100 device models."""
+    """Build QEMU with R100 device models.
+
+    Produces two binaries from one source tree:
+
+    \b
+      build/qemu/qemu-system-aarch64  — NPU-side FW boot (Phase 1)
+      build/qemu/qemu-system-x86_64   — host-side kmd/umd guest (Phase 2)
+
+    On an existing aarch64-only build tree, the configure step is
+    automatically re-run to pick up the new target list (no --clean
+    needed).
+    """
     _check_qemu_src()
 
     if clean:
@@ -206,6 +266,9 @@ def build(clean, jobs):
         r100_link = QEMU_SRC / "hw" / "arm" / "r100"
         if r100_link.is_symlink():
             r100_link.unlink()
+        host_link = QEMU_SRC / "hw" / "misc" / "r100-host"
+        if host_link.is_symlink():
+            host_link.unlink()
         click.secho("Clean complete.", fg="green")
         if not click.confirm("Continue with build?"):
             return
@@ -221,12 +284,27 @@ def build(clean, jobs):
 
     QEMU_BUILD.mkdir(parents=True, exist_ok=True)
 
-    # Configure
-    if not (QEMU_BUILD / "build.ninja").exists():
-        click.echo("Configuring QEMU (aarch64-softmmu)...")
+    # Configure if the build dir is fresh OR the target list has changed
+    # since the last configure. The marker file lets us detect an old
+    # aarch64-only build tree and transparently upgrade it to the dual
+    # aarch64+x86_64 configuration without requiring --clean.
+    have_build = (QEMU_BUILD / "build.ninja").exists()
+    have_targets = (
+        QEMU_TARGETS_MARKER.is_file()
+        and QEMU_TARGETS_MARKER.read_text().strip() == QEMU_TARGETS
+    )
+    if not have_build or not have_targets:
+        if have_build and not have_targets:
+            click.echo("Target list changed; re-configuring "
+                       "(was: %r, now: %r)..." % (
+                           QEMU_TARGETS_MARKER.read_text().strip()
+                           if QEMU_TARGETS_MARKER.is_file() else "<none>",
+                           QEMU_TARGETS))
+        else:
+            click.echo("Configuring QEMU (%s)..." % QEMU_TARGETS)
         _run([
             str(QEMU_SRC / "configure"),
-            "--target-list=aarch64-softmmu",
+            "--target-list=%s" % QEMU_TARGETS,
             "--prefix=%s" % (REMU_ROOT / "install"),
             "--enable-debug",
             "--disable-werror",
@@ -234,13 +312,19 @@ def build(clean, jobs):
             "--disable-guest-agent",
             "--extra-cflags=-I%s" % INCLUDE_SRC,
         ], cwd=QEMU_BUILD)
+        QEMU_TARGETS_MARKER.write_text(QEMU_TARGETS + "\n")
 
     # Build
     nj = jobs if jobs > 0 else os.cpu_count()
     click.echo("Building with %d jobs..." % nj)
     _run(["ninja", "-j", str(nj)], cwd=QEMU_BUILD)
 
-    click.secho("\nBuild complete: %s" % QEMU_BIN, fg="green")
+    click.secho("\nBuild complete:", fg="green")
+    click.secho("  aarch64 (NPU side):  %s" % QEMU_BIN, fg="green")
+    if QEMU_BIN_X86.is_file():
+        click.secho("  x86_64 (host side):  %s" % QEMU_BIN_X86, fg="green")
+    else:
+        click.secho("  x86_64 (host side):  NOT BUILT", fg="yellow")
 
 
 # ── fw-build ─────────────────────────────────────────────────────────────────
@@ -375,7 +459,8 @@ def fw_build(components, platform, mode, chiplets, clean, install):
 
 def _make_run_dir(name, output_root):
     """Create <output_root>/<name>/ (defaulting to output/run-<ts>/) and
-    refresh the output/latest -> <name> convenience symlink."""
+    refresh the output/latest -> <name> convenience symlink. Returns
+    (run_dir, run_name)."""
     root = Path(output_root).resolve() if output_root else OUTPUT_ROOT
     root.mkdir(parents=True, exist_ok=True)
     if not name:
@@ -390,51 +475,17 @@ def _make_run_dir(name, output_root):
         latest.symlink_to(name)
     except OSError:
         pass
-    return run_dir
+    return run_dir, name
 
 
-@cli.command()
-@click.option("--name", "-n", default=None,
-              help="Run name. Outputs land in <output-root>/<name>/. "
-                   "Default: run-<YYYYmmdd-HHMMSS>.")
-@click.option("--output-root", type=click.Path(file_okay=False), default=None,
-              help="Parent directory for run outputs. "
-                   "Default: <repo>/output/.")
-@click.option("--gdb", is_flag=True, help="Wait for GDB connection on :1234.")
-@click.option("--trace", is_flag=True,
-              help="Enable guest_errors and unimp logging.")
-@click.option("--chiplets", type=int, default=4,
-              help="Number of chiplets (1-4). Default 4.")
-@click.option("--memory", "-m", default="1G",
-              help="DRAM size per chiplet (e.g. 1G, 512M).")
-def run(name, output_root, gdb, trace, chiplets, memory):
-    """Boot R100 firmware on the emulated SoC.
-
-    Every invocation gets a dedicated output directory under
-    <repo>/output/<name>/ (or a timestamped default) containing:
-
-    \b
-      uart0.log       — chiplet 0 UART (also muxed to stdio + monitor)
-      uart1..3.log    — chiplets 1-3 UARTs
-      hils.log        — FreeRTOS HILS ring tail (RLOG_*/FLOG_* from DRAM)
-      cmdline.txt     — the full QEMU command used for this run
-
-    `<output-root>/latest` is updated to point at the most recent run.
-    """
-    _check_qemu_bin()
-
-    run_dir = _make_run_dir(name, output_root)
-    click.echo("Run directory: %s" % run_dir)
-
+def _build_npu_cmd(run_dir, gdb, trace):
+    """Assemble the aarch64 QEMU cmdline for the R100 NPU side.
+    Matches the previous in-line flow exactly; extracted so that
+    --host can extend it (Phase 2) without duplicating boot-image
+    and UART wiring logic."""
     uart0_log = run_dir / "uart0.log"
     hils_log = run_dir / "hils.log"
 
-    # Chiplet 0 UART drives stdio (muxed with the QEMU monitor — Ctrl-A C
-    # toggles) and tee's into uart0.log via chardev logfile=. Chiplets
-    # 1-3 each get a dedicated file chardev so per-chiplet boot output
-    # doesn't interleave. All four -serial bindings are explicit because
-    # QEMU's implicit `-serial mon:stdio` is suppressed once any other
-    # -serial option is present.
     cmd = [
         str(QEMU_BIN),
         "-M", "r100-soc",
@@ -455,10 +506,6 @@ def run(name, output_root, gdb, trace, chiplets, memory):
         ]
         click.echo("  Chiplet %d UART -> %s" % (n, log_path))
 
-    # 5th `-serial` slot (serial_hd(4)) is consumed by the in-machine
-    # r100-logbuf-tail device. It polls chiplet 0's DRAM .logbuf ring at
-    # 0x10000000 and drains RLOG_*/FLOG_* entries out of band so they
-    # surface even before FreeRTOS's own terminal_task starts draining.
     cmd += [
         "-chardev",
         "file,id=hils,path=%s,mux=off" % hils_log,
@@ -481,10 +528,6 @@ def run(name, output_root, gdb, trace, chiplets, memory):
             cmd += ["-device", "loader,file=%s,addr=0x%x" % (path, addr)]
             found += 1
 
-    # CP0 + CP1 images also need to land in each secondary chiplet's DRAM
-    # so chiplet N's CP0/CP1.cpu0 (released by BL2) finds its reset vector
-    # images. Chiplet 0 is already covered by FW_IMAGES; replicate at
-    # chiplet_id * CHIPLET_OFFSET + base for chiplets 1..N-1.
     for chiplet_id in range(1, R100_NUM_CHIPLETS):
         for fname, base, _desc in FW_PER_CHIPLET_IMAGES:
             path = IMAGES_DIR / fname
@@ -494,6 +537,207 @@ def run(name, output_root, gdb, trace, chiplets, memory):
                         "loader,file=%s,addr=0x%x" % (path, addr)]
                 found += 1
 
+    return cmd, found
+
+
+def _setup_shm(run_name, size):
+    """Create /dev/shm/remu-<run>/remu-shm of exactly `size` bytes.
+    The directory lives on tmpfs to keep large backing files off the
+    workspace filesystem. Returns (shm_dir, shm_file).
+
+    Idempotent if the file already exists at the correct size; larger
+    or smaller files are truncated to size (caller wiped the previous
+    run, or the run name is new)."""
+    shm_dir = SHM_ROOT / ("remu-" + run_name)
+    shm_dir.mkdir(parents=True, exist_ok=True)
+    shm_file = shm_dir / "remu-shm"
+    if shm_file.exists() and shm_file.stat().st_size == size:
+        pass
+    else:
+        with open(shm_file, "wb") as f:
+            f.truncate(size)
+    return shm_dir, shm_file
+
+
+def _build_host_cmd(host_dir, shm_file, shm_size, monitor_sock, mem):
+    """Assemble the x86_64 QEMU cmdline for the Phase-2 host side.
+
+    M3 upgrades the placeholder ivshmem-plain device to our own
+    `r100-npu-pci` (0x1eff:0x2030) with the four BARs at the sizes
+    rebellions.ko expects (36 GB DDR, 64 MB ACP, 8 MB doorbell, 1 MB
+    MSI-X). The memory-backend-file is still declared on both QEMUs —
+    M2's shared-mmap proof remains valid — but no device consumes it
+    yet; M4 will wire it via r100-npu-pci's `memdev` link to alias it
+    over BAR0 offset 0.
+
+    Paused at reset (`-S`) so the BIOS never spins on "no bootable
+    device"; we only need HMP access to prove the device shows up.
+    KVM disabled — later milestones flip it on and boot a real Linux
+    guest (M7).
+    """
+    stdout_log = host_dir / "qemu.stdout.log"
+    stderr_log = host_dir / "qemu.stderr.log"
+
+    cmd = [
+        str(QEMU_BIN_X86),
+        "-M", "pc",
+        "-cpu", "qemu64",
+        "-m", mem,
+        "-display", "none",
+        "-nographic",
+        "-S",
+        "-object",
+        "memory-backend-file,id=remushm,mem-path=%s,size=%d,share=on"
+        % (shm_file, shm_size),
+        "-device", "r100-npu-pci",
+        "-chardev",
+        "socket,id=mon,path=%s,server=on,wait=off" % monitor_sock,
+        "-mon", "chardev=mon,mode=readline",
+        "-serial", "file:%s" % (host_dir / "serial.log"),
+    ]
+    return cmd, stdout_log, stderr_log
+
+
+def _hmp_query(sock_path, cmd, timeout=5.0, connect_retries=20):
+    """Talk to a QEMU HMP monitor on a unix socket and return the
+    response to `cmd` (with the echoed command and trailing prompt
+    stripped). Retries the connect for up to `connect_retries` * 0.1s
+    while QEMU is still bringing the socket up.
+
+    HMP in `mode=readline` echoes every keystroke with carriage returns
+    and partial line redraws, so naive line-splitting picks up noise
+    like "iininfinfoinfo info pci". We instead locate the final fully-
+    echoed copy of `cmd` followed by a newline, and take everything
+    between it and the trailing `(qemu) ` prompt as the real response.
+    """
+    import re
+    import socket
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    for _ in range(connect_retries):
+        try:
+            s.connect(str(sock_path))
+            break
+        except (FileNotFoundError, ConnectionRefusedError):
+            time.sleep(0.1)
+    else:
+        raise RuntimeError("HMP socket %s did not come up in time" % sock_path)
+
+    def _read_until_prompt():
+        buf = b""
+        while b"(qemu) " not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        return buf.decode("utf-8", errors="replace")
+
+    _read_until_prompt()
+    s.sendall((cmd + "\n").encode())
+    resp = _read_until_prompt()
+    s.close()
+
+    # Find the LAST fully-echoed `cmd\n` (or `cmd\r\n`) — everything
+    # after that is the real response. Readline's partial-echo line
+    # redraws use \r to return to column 0, so `cmd` reliably appears
+    # once intact as the final echo before the response body.
+    pattern = re.escape(cmd) + r"\r?\n"
+    last = None
+    for m in re.finditer(pattern, resp):
+        last = m
+    body = resp[last.end():] if last else resp
+
+    # Drop trailing "(qemu) " prompt and any stray \r.
+    body = body.replace("\r", "")
+    if body.rstrip().endswith("(qemu)"):
+        body = body.rstrip()[:-len("(qemu)")].rstrip()
+    return body.strip("\n")
+
+
+# r100-npu-pci IDs. Must match the constants compiled into
+# src/host/r100_npu_pci.c (R100_PCI_VENDOR_ID / R100_PCI_DEVICE_ID) and
+# the driver's PCI_VENDOR_ID_REBEL / PCI_ID_CR03 in
+# external/ssw-bundle/.../kmd/rebellions/common/rebellions{,_drv}.{h,c}.
+R100_PCI_VENDOR = "1eff"
+R100_PCI_DEVICE = "2030"
+
+
+def _verify_host_npu_pci(monitor_sock, info_pci_log):
+    """Run `info pci` on the host QEMU monitor, save the raw output, and
+    assert the r100-npu-pci device is present. Returns the captured
+    output so the caller can show the relevant block to the user."""
+    out = _hmp_query(monitor_sock, "info pci")
+    info_pci_log.write_text(out + "\n")
+    needle = "%s:%s" % (R100_PCI_VENDOR, R100_PCI_DEVICE)
+    if needle not in out.lower().replace(" ", ""):
+        click.secho(
+            "Host QEMU did not expose r100-npu-pci (%s in info pci)" % needle,
+            fg="red")
+        click.echo(out)
+        raise RuntimeError("r100-npu-pci verification failed")
+    return out
+
+
+@cli.command()
+@click.option("--name", "-n", default=None,
+              help="Run name. Outputs land in <output-root>/<name>/. "
+                   "Default: run-<YYYYmmdd-HHMMSS>.")
+@click.option("--output-root", type=click.Path(file_okay=False), default=None,
+              help="Parent directory for run outputs. "
+                   "Default: <repo>/output/.")
+@click.option("--gdb", is_flag=True, help="Wait for GDB connection on :1234.")
+@click.option("--trace", is_flag=True,
+              help="Enable guest_errors and unimp logging.")
+@click.option("--chiplets", type=int, default=4,
+              help="Number of chiplets (1-4). Default 4.")
+@click.option("--memory", "-m", default="1G",
+              help="DRAM size per chiplet (e.g. 1G, 512M).")
+@click.option("--host", "with_host", is_flag=True,
+              help="Phase 2: also launch the x86_64 host-side QEMU and "
+                   "wire a shared-memory bridge between the two.")
+@click.option("--host-mem", default=HOST_MEM_DEFAULT, show_default=True,
+              help="Guest RAM for the x86 host-side QEMU (only with --host).")
+@click.option("--shm-size", type=int, default=SHM_SIZE_DEFAULT,
+              help="Bytes for the shared-memory backing file "
+                   "(default: 128 MB). M4+ will alias this into BAR0.")
+def run(name, output_root, gdb, trace, chiplets, memory,
+        with_host, host_mem, shm_size):
+    """Boot R100 firmware on the emulated SoC.
+
+    Every invocation gets a dedicated output directory under
+    <repo>/output/<name>/ (or a timestamped default) containing:
+
+    \b
+      uart0.log       — chiplet 0 UART (also muxed to stdio + monitor)
+      uart1..3.log    — chiplets 1-3 UARTs
+      hils.log        — FreeRTOS HILS ring tail (RLOG_*/FLOG_* from DRAM)
+      cmdline.txt     — the full QEMU command used for this run
+
+    With --host (Phase 2), a second QEMU process (x86_64) is launched
+    alongside with the r100-npu-pci endpoint (0x1eff:0x2030) attached,
+    and a /dev/shm-backed memory segment is mapped by both processes
+    (M4+ aliases it into BAR0). The host QEMU is paused at reset for
+    now; its monitor is reachable on <run>/host/monitor.sock.
+    Additional output files:
+
+    \b
+      shm              symlink → /dev/shm/remu-<name>/
+      host/cmdline.txt the full x86 QEMU command
+      host/qemu.*.log  x86 QEMU stdout / stderr
+      host/serial.log  x86 guest serial
+      host/info-pci.log captured `info pci` HMP output (auto-verified)
+
+    `<output-root>/latest` is updated to point at the most recent run.
+    """
+    _check_qemu_bin("aarch64")
+    if with_host:
+        _check_qemu_bin("x86_64")
+
+    run_dir, run_name = _make_run_dir(name, output_root)
+    click.echo("Run directory: %s" % run_dir)
+
+    npu_cmd, found = _build_npu_cmd(run_dir, gdb, trace)
+
     if found == 0:
         click.secho("Warning: no firmware images in %s/" % IMAGES_DIR,
                      fg="yellow")
@@ -501,7 +745,39 @@ def run(name, output_root, gdb, trace, chiplets, memory):
         if not click.confirm("Run with empty memory anyway?"):
             return
 
-    (run_dir / "cmdline.txt").write_text(" \\\n  ".join(cmd) + "\n")
+    host_proc = None
+    shm_dir = None
+    if with_host:
+        shm_dir, shm_file = _setup_shm(run_name, shm_size)
+        shm_link = run_dir / "shm"
+        try:
+            if shm_link.is_symlink() or shm_link.exists():
+                shm_link.unlink()
+            shm_link.symlink_to(shm_dir)
+        except OSError:
+            pass
+
+        # Attach the same backend to the NPU QEMU so both processes hold
+        # it open (cross-process mmap proof). No R100 device consumes it
+        # yet — M4 will map it into the NPU physical address space.
+        npu_cmd += [
+            "-object",
+            "memory-backend-file,id=remushm,mem-path=%s,size=%d,share=on"
+            % (shm_file, shm_size),
+        ]
+        click.echo("  Shared memory -> %s (%d MB)"
+                   % (shm_file, shm_size // (1024 * 1024)))
+
+        host_dir = run_dir / "host"
+        host_dir.mkdir(exist_ok=True)
+        monitor_sock = host_dir / "monitor.sock"
+        host_cmd, host_stdout, host_stderr = _build_host_cmd(
+            host_dir, shm_file, shm_size, monitor_sock, host_mem)
+        (host_dir / "cmdline.txt").write_text(
+            " \\\n  ".join(host_cmd) + "\n")
+        click.echo("  Host QEMU   -> paused (monitor: %s)" % monitor_sock)
+
+    (run_dir / "cmdline.txt").write_text(" \\\n  ".join(npu_cmd) + "\n")
 
     click.echo()
     click.echo("Starting R100 emulator (%d chiplets)..." % chiplets)
@@ -509,11 +785,104 @@ def run(name, output_root, gdb, trace, chiplets, memory):
     click.echo("  Press Ctrl-A X to quit")
     click.echo()
 
+    if not with_host:
+        # Single-QEMU mode: exec so Python gets out of the way and the
+        # NPU QEMU owns stdio directly (unchanged Phase 1 behavior).
+        try:
+            os.execvp(npu_cmd[0], npu_cmd)
+        except OSError as e:
+            click.secho("Failed to start QEMU: %s" % e, fg="red")
+            raise SystemExit(1)
+
+    # ── Dual-QEMU mode (Phase 2) ───────────────────────────────────────
+    # 1. Spawn host QEMU detached (own session, stdio to files).
+    # 2. Wait for its HMP monitor to come up, query `info pci`,
+    #    auto-verify the r100-npu-pci device is bound.
+    # 3. Spawn NPU QEMU in the foreground, inheriting the terminal
+    #    (same UX as single-QEMU mode).
+    # 4. When NPU exits — cleanly OR via signal OR SIGPIPE from a
+    #    piped head/tee — tear down host QEMU and wipe the /dev/shm
+    #    backing directory. SIGTERM is converted to SystemExit so
+    #    try/finally below fires; atexit is kept as a last resort.
+    import atexit
+
+    with open(host_stdout, "wb") as _so, open(host_stderr, "wb") as _se:
+        host_proc = subprocess.Popen(
+            host_cmd, stdout=_so, stderr=_se, stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    npu_proc = None
+
+    def _cleanup():
+        if npu_proc and npu_proc.poll() is None:
+            try:
+                npu_proc.terminate()
+                npu_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                npu_proc.kill()
+        if host_proc and host_proc.poll() is None:
+            try:
+                host_proc.terminate()
+                host_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                host_proc.kill()
+        if shm_dir and shm_dir.exists():
+            try:
+                shutil.rmtree(shm_dir)
+            except OSError:
+                pass
+
+    atexit.register(_cleanup)
+    # Convert signal-driven deaths (timeout, kill, parent exit,
+    # broken pipe through tee/head) into SystemExit so the finally
+    # below runs normal cleanup instead of leaving orphans.
+    def _sig_exit(signum, _frame):
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, _sig_exit)
+    signal.signal(signal.SIGHUP, _sig_exit)
+    signal.signal(signal.SIGPIPE, _sig_exit)
+
     try:
-        os.execvp(cmd[0], cmd)
-    except OSError as e:
-        click.secho("Failed to start QEMU: %s" % e, fg="red")
-        raise SystemExit(1)
+        click.echo("Verifying host-side r100-npu-pci...")
+        try:
+            info = _verify_host_npu_pci(
+                host_dir / "monitor.sock", host_dir / "info-pci.log")
+        except Exception as e:
+            click.secho("Host-side verification failed: %s" % e, fg="red")
+            if host_stderr.exists():
+                err = host_stderr.read_text()[-2000:]
+                if err:
+                    click.echo("--- host QEMU stderr (tail) ---")
+                    click.echo(err)
+            raise SystemExit(1)
+
+        click.secho(
+            "  r100-npu-pci bound on host (see %s)" %
+            (host_dir / "info-pci.log"), fg="green")
+        # Print only the r100-npu-pci block so the common case is a few
+        # lines of proof, not a full `info pci` dump. `info pci`
+        # groups entries under `  Bus N, device M, function F:`
+        # headers with no blank line between groups; split on that.
+        import re as _re
+        groups = _re.split(r"(?=^  Bus\s)", info, flags=_re.MULTILINE)
+        needle = "%s:%s" % (R100_PCI_VENDOR, R100_PCI_DEVICE)
+        for grp in groups:
+            if needle in grp.lower():
+                for ln in grp.rstrip().splitlines():
+                    click.echo("    " + ln)
+                break
+        click.echo()
+
+        npu_proc = subprocess.Popen(npu_cmd)
+        try:
+            rc = npu_proc.wait()
+        except KeyboardInterrupt:
+            npu_proc.terminate()
+            rc = npu_proc.wait()
+        raise SystemExit(rc)
+    finally:
+        _cleanup()
 
 
 # ── gdb ──────────────────────────────────────────────────────────────────────
@@ -554,11 +923,17 @@ def status():
     else:
         click.secho("  QEMU source:  NOT FOUND", fg="red")
 
-    # QEMU binary
+    # QEMU binaries (aarch64 hosts the NPU; x86_64 hosts the Phase 2 guest)
     if QEMU_BIN.is_file():
-        click.secho("  QEMU binary:  %s" % QEMU_BIN, fg="green")
+        click.secho("  QEMU aarch64: %s" % QEMU_BIN, fg="green")
     else:
-        click.secho("  QEMU binary:  NOT BUILT (run: ./remucli build)", fg="yellow")
+        click.secho("  QEMU aarch64: NOT BUILT (run: ./remucli build)",
+                    fg="yellow")
+    if QEMU_BIN_X86.is_file():
+        click.secho("  QEMU x86_64:  %s" % QEMU_BIN_X86, fg="green")
+    else:
+        click.secho("  QEMU x86_64:  NOT BUILT (run: ./remucli build)",
+                    fg="yellow")
 
     # Firmware images
     click.echo()

@@ -17,12 +17,41 @@ wrapper around `cli/remu_cli.py`. **No install step** — just make sure
 `click` is available (`pip install --user click`).
 
 ```
-./remucli build                     # builds QEMU with R100 device models
+./remucli build                     # builds QEMU (aarch64 + x86_64) with R100 device models
 ./remucli fw-build -p silicon       # builds q-sys FW (tf-a + cp0 + cp1) → images/
 ./remucli status                    # sanity-check environment
-./remucli run --name my-test        # boot; logs land in output/my-test/
-./remucli run --name dbg --gdb      # boot paused, wait for GDB on :1234
+./remucli run --name my-test        # Phase 1: boot NPU only; logs land in output/my-test/
+./remucli run --name dbg --gdb      # Phase 1: boot paused, wait for GDB on :1234
+./remucli run --host --name pair    # Phase 2: launch NPU + x86 host QEMUs with r100-npu-pci bridge
 ```
+
+`./remucli build` produces two QEMU binaries from one pinned source
+tree: `build/qemu/qemu-system-aarch64` (NPU side, Phase 1 FW boot) and
+`build/qemu/qemu-system-x86_64` (host side, Phase 2 kmd/umd guest). On
+an existing aarch64-only build tree the configure step is re-run
+automatically to pick up the x86_64 target — no `--clean` needed.
+
+With `--host`, the x86 guest has our custom `r100-npu-pci` endpoint
+attached (vendor/device `0x1eff:0x2030` matching the real CR03 silicon,
+so the stock `rebellions.ko` binds with no changes). Its four BARs
+match the driver's size checks in `rebel_check_pci_bars_size`:
+
+| BAR | Size | Role |
+|-----|------|------|
+| 0   | 64 GB (>= 36 GB `RBLN_DRAM_SIZE`) | DDR — lazily-allocated RAM |
+| 2   | 64 MB (= `RBLN_SRAM_SIZE`)        | ACP / SRAM / logbuf |
+| 4   | 8 MB  (= `RBLN_PERI_SIZE`)        | Doorbells (plain RAM for M3) |
+| 5   | 1 MB  (= `RBLN_PCIE_SIZE`)        | MSI-X table (32 vectors) + PBA |
+
+Both QEMUs also open the same 128 MB memory-backed file at
+`/dev/shm/remu-<name>/remu-shm` (declared but not yet wired into either
+process — M4 aliases it into BAR0 offset 0 for cross-process DRAM
+sharing). The host QEMU starts paused (`-S`); its monitor lives at
+`output/<name>/host/monitor.sock` (use `socat - UNIX-CONNECT:...`
+for interactive HMP, or spell out `info pci` directly). The auto-
+verification in `./remucli run --host` queries that monitor and fails
+loudly if `1eff:2030` isn't listed in `info pci`;
+`output/<name>/host/info-pci.log` has the full dump.
 
 All `./remucli run` invocations write into `output/<name>/` (or
 `output/run-<timestamp>/` if `--name` is omitted). Never pass paths
@@ -58,7 +87,8 @@ on) copies the 6 CA73 binaries into `images/`. Toolchains are taken from
 
 ```
 remucli               Bash wrapper — the one entry point (`./remucli <cmd>`)
-src/machine/          QEMU device models (symlinked into external/qemu/hw/arm/r100/)
+src/machine/          NPU-side QEMU device models (symlinked into external/qemu/hw/arm/r100/)
+src/host/             Host-side (x86 guest) PCI device models (symlinked into external/qemu/hw/misc/r100-host/)
 src/include/          Shared headers (remu_addrmap.h)
 cli/remu_cli.py       Click-based CLI implementation (invoked by ./remucli)
 tests/                Test binaries and test scripts
