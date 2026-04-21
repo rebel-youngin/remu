@@ -714,6 +714,57 @@ static void r100_chiplet_init(MachineState *machine, int chiplet_id,
     /* --- RBC stubs (UCIe link status) — config space + private alias --- */
     r100_create_rbc_blocks(cfg_mr, sysmem, chiplet_id, chiplet_base);
 
+    /*
+     * --- D-cluster (DNC/SHM/MGLUE) and RBDMA cfg-window stubs ---
+     *
+     * q-cp on CP1 polls SHM INTR_VEC.tpg_done, RDSN MGLUE STATUS0 and
+     * reads RBDMA IP_INFO{0..5} during `cp_create_tasks_impl`. Without
+     * these stubs the reads fall to the chiplet-wide cfg_mr unimpl
+     * catch-all (returns 0), SHM TPG training times out after ~1 s of
+     * virtual time, and `abort_event(ERR_SHM)` fires. See src/machine/
+     * r100_dnc.c for the override table.
+     *
+     * Priority 1 overlays on cfg_mr (same pattern as SYSREG_CP*, RBC)
+     * so they outrank the unimpl catch-all at priority 0.
+     */
+    {
+        static const struct {
+            const char *tag;
+            uint64_t base;
+            uint32_t dcl_id;
+        } dcls[] = {
+            { "dcl0", R100_DCL0_CFG_BASE, 0 },
+            { "dcl1", R100_DCL1_CFG_BASE, 1 },
+        };
+        size_t k;
+
+        for (k = 0; k < ARRAY_SIZE(dcls); k++) {
+            DeviceState *dev = qdev_new(TYPE_R100_DNC_CLUSTER);
+            SysBusDevice *sbd;
+
+            qdev_prop_set_uint32(dev, "chiplet-id", chiplet_id);
+            qdev_prop_set_uint32(dev, "dcl-id", dcls[k].dcl_id);
+            sbd = SYS_BUS_DEVICE(dev);
+            sysbus_realize_and_unref(sbd, &error_fatal);
+            memory_region_add_subregion_overlap(
+                cfg_mr, dcls[k].base - R100_CFG_BASE,
+                sysbus_mmio_get_region(sbd, 0), 1);
+            (void)dcls[k].tag;
+        }
+    }
+
+    {
+        DeviceState *dev = qdev_new(TYPE_R100_RBDMA);
+        SysBusDevice *sbd;
+
+        qdev_prop_set_uint32(dev, "chiplet-id", chiplet_id);
+        sbd = SYS_BUS_DEVICE(dev);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        memory_region_add_subregion_overlap(
+            cfg_mr, R100_NBUS_L_RBDMA_CFG_BASE - R100_CFG_BASE,
+            sysbus_mmio_get_region(sbd, 0), 1);
+    }
+
     /* --- PCIe sub-controller catch-all RAM (for pmu_release_cm7) --- */
     r100_create_pcie_subctrl(cfg_mr, chiplet_id);
 

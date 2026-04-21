@@ -129,11 +129,31 @@
 #define R100_DCL1_PVT_CON0_BASE     0x1FF2920000ULL
 #define R100_DCL1_PVT_CON1_BASE     0x1FF2930000ULL
 
+/*
+ * Each DCLx CFG block is 1 MB wide (ends at the corresponding CMU base).
+ * It packs together the 8 DNC slots (0x000000..0x00E000, stride 0x2000),
+ * the 16 SHM banks (0x010000..0x013C00, stride 0x400), and the MGLUE /
+ * RDSN-head control block (0x020000). q-cp's shm_init / rdsn_init poll
+ * status bits in these regions from CP1 during task init; see
+ * src/machine/r100_dnc.c.
+ */
+#define R100_DCL_CFG_SIZE           0x100000ULL
+
+/* Within a DCL block (offsets from R100_DCLx_CFG_BASE) */
+#define R100_DNC_SLOT_BASE          0x000000ULL
+#define R100_DNC_SLOT_STRIDE        0x002000ULL
+#define R100_DNC_SLOT_COUNT         8
+#define R100_SHM_BANK_BASE          0x010000ULL
+#define R100_SHM_BANK_STRIDE        0x000400ULL
+#define R100_SHM_BANK_COUNT         16
+#define R100_MGLUE_BASE             0x020000ULL
+
 /* --- NBUS blocks --- */
 #define R100_NBUS_U_CMU_BASE        0x1FF3000000ULL
 #define R100_NBUS_D_CMU_BASE        0x1FF3300000ULL
 #define R100_NBUS_L_CMU_BASE        0x1FF3500000ULL
 #define R100_NBUS_L_RBDMA_CFG_BASE  0x1FF3700000ULL
+#define R100_NBUS_L_RBDMA_CFG_SIZE  0x100000ULL    /* 0x1FF3700000 .. 0x1FF3800000 */
 
 /* --- PL330 DMA controller (used by BL1 for UCIe firmware load) --- */
 #define R100_DMA_PL330_BASE         0x1FF02C0000ULL
