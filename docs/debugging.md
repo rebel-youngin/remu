@@ -158,6 +158,38 @@ p/x $ESR_EL3
 p/x $FAR_EL3
 ```
 
+### Scripted CP1 sweep across all chiplets
+
+`tests/scripts/gdb_inspect_cp1.gdb` is a pure-GDB (no Python) batch
+script that dumps `info threads` plus per-thread frame 0 + `ELR_EL3`
+for every CP1 vCPU (threads 5-8, 13-16, 21-24, 29-32). Useful for
+confirming each chiplet's CP1 half is running FreeRTOS steady-state
+code rather than spinning in PSCI wait or faulted. Two-step workflow:
+
+1. Start QEMU **with gdbstub but not paused** — current `./remucli
+   run --gdb` bundles `-s -S`, which stops the VM before FW boot. To
+   let FW boot for ~60 s first, cd into `output/<name>/cmdline.txt`
+   and replay it by hand with `-S` dropped (keep `-s`). Then leave
+   it running in the background.
+
+2. After ~60 s of wall clock, attach GDB in batch mode — connect
+   will interrupt the running inferior, the script dumps all 16 CP1
+   threads, and detach leaves QEMU resumable:
+
+   ```
+   aarch64-none-elf-gdb -batch \
+     -ex 'set pagination off' \
+     -ex 'file external/ssw-bundle/products/rebel/q/sys/binaries/FreeRTOS_CP1/freertos_kernel.elf' \
+     -ex 'add-symbol-file external/ssw-bundle/products/rebel/q/sys/binaries/FreeRTOS_CP1/bl31.elf' \
+     -ex 'target remote :1234' \
+     -x tests/scripts/gdb_inspect_cp1.gdb
+   ```
+
+   Healthy steady-state layout (per chiplet): `CP1.cpu0` in
+   `ipm_samsung_receive`, `CP1.cpu{1,2,3}` in
+   `taskmgr_fetch_dnc_task_worker_cp1` for DNC ranges 0-5 / 6-10 /
+   11-15.
+
 ## Trace mode
 
 `--trace` turns on QEMU's `guest_errors,unimp` logs (missed MMIO regions,
