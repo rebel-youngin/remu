@@ -882,6 +882,42 @@ static MemoryRegion *r100_build_chiplet_view(MemoryRegion *sysmem,
                                             cp1_rdist_alias, 10);
     }
 
+    /*
+     * Per-chiplet GIC distributor alias.
+     *
+     * Silicon has one GICv3 per chiplet, so every chiplet's FW reads
+     * GICD_PIDR2 from its own distributor at R100_GIC_DIST_BASE
+     * (0x1FF3800000). In REMU the single shared arm-gicv3's distributor
+     * is mounted in sysmem at R100_GIC_DIST_BASE (by sysbus_mmio_map in
+     * r100_soc_init), which chiplet 0 reaches fine via sysmem_alias.
+     *
+     * Secondary chiplets, however, never see it: r100_chiplet_init
+     * installs each chiplet's cfg_mr container (covering R100_CFG_BASE
+     * +R100_CFG_SIZE, priority 0) at `chiplet_base + R100_CFG_BASE` in
+     * sysmem. cfg_mr has an unimplemented-device catch-all, so its
+     * offset 0x380_FFE8 absorbs the GICD_PIDR2 read on chiplets 1-3
+     * before it can fall through to sysmem_alias → sysmem's real
+     * gicv3_dist. gicv3_driver_init() then reads PIDR2 = 0, its
+     * ARCH_REV_GICV3 assertion trips, and BL31 lands in
+     * plat_panic_handler.
+     *
+     * Alias the distributor at R100_GIC_DIST_BASE in this chiplet's
+     * view at priority 10 so the TLB walk hits the real gicv3_dist
+     * MMIO before the chiplet-local cfg_mr catch-all. The alias points
+     * at sysmem's copy (resolved lazily; the GIC is realized after
+     * this function runs).
+     */
+    {
+        MemoryRegion *dist_alias = g_new(MemoryRegion, 1);
+
+        snprintf(name, sizeof(name), "r100.chiplet%d.gic_dist_view",
+                 chiplet_id);
+        memory_region_init_alias(dist_alias, NULL, name, sysmem,
+                                 R100_GIC_DIST_BASE, 0x10000);
+        memory_region_add_subregion_overlap(view, R100_GIC_DIST_BASE,
+                                            dist_alias, 10);
+    }
+
     return view;
 }
 

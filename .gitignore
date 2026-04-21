@@ -1,7 +1,6 @@
 build/
 install/
 images/*.bin
-external/
 tests/*.bin
 tests/*.o
 *.egg-info/

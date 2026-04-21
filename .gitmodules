@@ -1,0 +1,13 @@
+[submodule "external/qemu"]
+	path = external/qemu
+	url = https://gitlab.com/qemu-project/qemu.git
+	# Pinned to v9.2.0. `scripts/build-qemu.sh` injects a `subdir('r100')`
+	# line into hw/arm/meson.build and symlinks the R100 device models +
+	# headers under hw/arm/r100/ and include/hw/arm/. `ignore = dirty`
+	# suppresses those build-time modifications from the superproject's
+	# `git status`; a change to the submodule's HEAD commit will still
+	# show up so we never silently drift off the pinned QEMU version.
+	ignore = dirty
+[submodule "external/ssw-bundle"]
+	path = external/ssw-bundle
+	url = https://github.com/rebellions-sw/ssw-bundle.git
