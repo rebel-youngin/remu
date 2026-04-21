@@ -38,20 +38,29 @@ match the driver's size checks in `rebel_check_pci_bars_size`:
 
 | BAR | Size | Role |
 |-----|------|------|
-| 0   | 64 GB (>= 36 GB `RBLN_DRAM_SIZE`) | DDR — lazily-allocated RAM |
-| 2   | 64 MB (= `RBLN_SRAM_SIZE`)        | ACP / SRAM / logbuf |
-| 4   | 8 MB  (= `RBLN_PERI_SIZE`)        | Doorbells (plain RAM for M3) |
+| 0   | 64 GB (>= 36 GB `RBLN_DRAM_SIZE`) | DDR — first 128 MB = `/dev/shm` shared file, tail = lazy RAM |
+| 2   | 64 MB (= `RBLN_SRAM_SIZE`)        | ACP / SRAM / logbuf (lazy RAM) |
+| 4   | 8 MB  (= `RBLN_PERI_SIZE`)        | Doorbells (plain RAM — M6 swaps for eventfd MMIO) |
 | 5   | 1 MB  (= `RBLN_PCIE_SIZE`)        | MSI-X table (32 vectors) + PBA |
 
-Both QEMUs also open the same 128 MB memory-backed file at
-`/dev/shm/remu-<name>/remu-shm` (declared but not yet wired into either
-process — M4 aliases it into BAR0 offset 0 for cross-process DRAM
-sharing). The host QEMU starts paused (`-S`); its monitor lives at
-`output/<name>/host/monitor.sock` (use `socat - UNIX-CONNECT:...`
-for interactive HMP, or spell out `info pci` directly). The auto-
-verification in `./remucli run --host` queries that monitor and fails
-loudly if `1eff:2030` isn't listed in `info pci`;
-`output/<name>/host/info-pci.log` has the full dump.
+Both QEMUs open the same 128 MB memory-backed file at
+`/dev/shm/remu-<name>/remu-shm` with `share=on`. On the x86 side it's
+aliased through the device's `memdev` link over **BAR0 offset 0** (M4),
+so stores into BAR0[0..128MB) land in tmpfs pages the NPU-side QEMU
+process also has mmap'd. (Stitching the NPU CPUs' DRAM view onto that
+same file is M5.) SeaBIOS is allowed to run so the BAR addresses get
+programmed; the guest idles at "No bootable device" with serial
+redirected to `host/serial.log`. The HMP monitor lives at
+`output/<name>/host/monitor.sock` (use `socat - UNIX-CONNECT:...` for
+interactive HMP).
+
+`./remucli run --host` auto-verifies the bridge end-to-end: `info pci`
+must list `1eff:2030`; `info mtree` must place the `remushm` subregion
+at offset 0 of the `r100.bar0.ddr` container; and both QEMU PIDs must
+have the shm file in `/proc/<pid>/maps`. Logs: `host/info-pci.log`,
+`host/info-mtree.log`. Any of the three checks failing prints to the
+terminal — the NPU still boots for post-mortem poking, it just means
+the x86 guest won't see shared DRAM until fixed.
 
 All `./remucli run` invocations write into `output/<name>/` (or
 `output/run-<timestamp>/` if `--name` is omitted). Never pass paths

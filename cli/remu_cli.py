@@ -562,18 +562,22 @@ def _setup_shm(run_name, size):
 def _build_host_cmd(host_dir, shm_file, shm_size, monitor_sock, mem):
     """Assemble the x86_64 QEMU cmdline for the Phase-2 host side.
 
-    M3 upgrades the placeholder ivshmem-plain device to our own
-    `r100-npu-pci` (0x1eff:0x2030) with the four BARs at the sizes
-    rebellions.ko expects (36 GB DDR, 64 MB ACP, 8 MB doorbell, 1 MB
-    MSI-X). The memory-backend-file is still declared on both QEMUs —
-    M2's shared-mmap proof remains valid — but no device consumes it
-    yet; M4 will wire it via r100-npu-pci's `memdev` link to alias it
-    over BAR0 offset 0.
+    M3 upgraded the placeholder ivshmem-plain to our own `r100-npu-pci`
+    (0x1eff:0x2030) with the four BARs at the sizes rebellions.ko
+    expects (36 GB DDR, 64 MB ACP, 8 MB doorbell, 1 MB MSI-X). M4 wires
+    the memory-backend-file through the device's `memdev` link so
+    BAR0 offset 0..shm_size is backed by the shared /dev/shm file;
+    since the NPU-side QEMU holds the same file mapped, stores from
+    the x86 guest into BAR0 end up page-visible to the NPU process
+    (NPU-CPU-visible DRAM integration lands in M5).
 
-    Paused at reset (`-S`) so the BIOS never spins on "no bootable
-    device"; we only need HMP access to prove the device shows up.
-    KVM disabled — later milestones flip it on and boot a real Linux
-    guest (M7).
+    SeaBIOS IS allowed to run (no `-S`) so the BAR addresses get
+    programmed — the automated verify queries `info mtree`, which
+    only shows BAR subregions after they're placed into the pci
+    address space. The guest hangs harmlessly at "No bootable
+    device" afterwards in an HLT idle loop (serial to file, no
+    stdout pollution). KVM disabled; later milestones swap the
+    bootrom-only setup for a real Linux guest (M7).
     """
     stdout_log = host_dir / "qemu.stdout.log"
     stderr_log = host_dir / "qemu.stderr.log"
@@ -585,11 +589,11 @@ def _build_host_cmd(host_dir, shm_file, shm_size, monitor_sock, mem):
         "-m", mem,
         "-display", "none",
         "-nographic",
-        "-S",
+        "-no-reboot",
         "-object",
         "memory-backend-file,id=remushm,mem-path=%s,size=%d,share=on"
         % (shm_file, shm_size),
-        "-device", "r100-npu-pci",
+        "-device", "r100-npu-pci,memdev=remushm",
         "-chardev",
         "socket,id=mon,path=%s,server=on,wait=off" % monitor_sock,
         "-mon", "chardev=mon,mode=readline",
@@ -678,6 +682,92 @@ def _verify_host_npu_pci(monitor_sock, info_pci_log):
     return out
 
 
+def _proc_has_mmap(pid, shm_file):
+    """Return True if /proc/<pid>/maps lists the given path. Any
+    permission / race error is reported as False (the caller logs the
+    discrepancy instead of bailing)."""
+    try:
+        maps = Path("/proc/%d/maps" % pid).read_text()
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return False
+    return str(shm_file) in maps
+
+
+def _verify_shared_mapping(monitor_sock, shm_file, host_pid, npu_pid,
+                           mtree_log, bar_poll_timeout=10.0):
+    """Prove the shared-memory bridge actually reaches both processes:
+
+      1. `info mtree` on the host QEMU monitor must list the
+         /dev/shm backing file as a subregion at offset 0 of the
+         pci@...r100.bar0.ddr container (so x86-guest stores into
+         BAR0[0..shm_size) hit the shared file).
+      2. Both the host and the NPU QEMU process must have the shm
+         file present in /proc/<pid>/maps (i.e. both processes have
+         the file mmap'd, which is what makes them coherent via the
+         tmpfs page cache).
+
+    The host QEMU is launched without `-S`, but SeaBIOS takes ~1-2 s
+    to enumerate PCI and program BAR addresses; only after that does
+    the BAR0 container show up in the pci address space. We poll
+    `info mtree` for up to `bar_poll_timeout` s to let SeaBIOS catch
+    up before failing.
+
+    Returns the mtree snippet containing the BAR0 container so the
+    caller can show it. Raises RuntimeError on any failure — the
+    exception string is what gets printed to the user."""
+    mtree = ""
+    deadline = time.time() + bar_poll_timeout
+    while time.time() < deadline:
+        mtree = _hmp_query(monitor_sock, "info mtree", timeout=10.0)
+        if "r100.bar0.ddr" in mtree:
+            break
+        time.sleep(0.3)
+
+    mtree_log.write_text(mtree + "\n")
+
+    lines = mtree.splitlines()
+    bar0_idx = None
+    for i, ln in enumerate(lines):
+        if "r100.bar0.ddr" in ln:
+            bar0_idx = i
+            break
+    if bar0_idx is None:
+        raise RuntimeError(
+            "SeaBIOS never placed r100.bar0.ddr into the pci address "
+            "space within %.1fs; see %s" % (bar_poll_timeout, mtree_log))
+
+    bar0_indent = len(lines[bar0_idx]) - len(lines[bar0_idx].lstrip())
+    snippet = [lines[bar0_idx]]
+    for ln in lines[bar0_idx + 1:]:
+        stripped = ln.lstrip()
+        if not stripped:
+            break
+        indent = len(ln) - len(stripped)
+        if indent <= bar0_indent:
+            break
+        snippet.append(ln)
+
+    joined = "\n".join(snippet)
+    # info mtree prints MemoryRegions by their NAME (the object id for
+    # memory-backend-file). The backing path isn't in the mtree output
+    # — that we verify separately via /proc/<pid>/maps below.
+    if "remushm" not in joined:
+        raise RuntimeError(
+            "BAR0 container does not contain the 'remushm' backend at "
+            "offset 0; see %s" % mtree_log)
+
+    if not _proc_has_mmap(host_pid, shm_file):
+        raise RuntimeError(
+            "host QEMU (pid %d) does not have %s mmap'd" %
+            (host_pid, shm_file))
+    if not _proc_has_mmap(npu_pid, shm_file):
+        raise RuntimeError(
+            "NPU QEMU (pid %d) does not have %s mmap'd" %
+            (npu_pid, shm_file))
+
+    return joined
+
+
 @cli.command()
 @click.option("--name", "-n", default=None,
               help="Run name. Outputs land in <output-root>/<name>/. "
@@ -726,6 +816,7 @@ def run(name, output_root, gdb, trace, chiplets, memory,
       host/qemu.*.log  x86 QEMU stdout / stderr
       host/serial.log  x86 guest serial
       host/info-pci.log captured `info pci` HMP output (auto-verified)
+      host/info-mtree.log captured `info mtree` (shows BAR0/shm wiring)
 
     `<output-root>/latest` is updated to point at the most recent run.
     """
@@ -775,7 +866,7 @@ def run(name, output_root, gdb, trace, chiplets, memory,
             host_dir, shm_file, shm_size, monitor_sock, host_mem)
         (host_dir / "cmdline.txt").write_text(
             " \\\n  ".join(host_cmd) + "\n")
-        click.echo("  Host QEMU   -> paused (monitor: %s)" % monitor_sock)
+        click.echo("  Host QEMU   -> SeaBIOS idle (monitor: %s)" % monitor_sock)
 
     (run_dir / "cmdline.txt").write_text(" \\\n  ".join(npu_cmd) + "\n")
 
@@ -875,6 +966,42 @@ def run(name, output_root, gdb, trace, chiplets, memory,
         click.echo()
 
         npu_proc = subprocess.Popen(npu_cmd)
+
+        # Wait for both QEMUs to actually mmap the shared file. QEMU
+        # does this very early (before CPU start), so a short poll is
+        # sufficient; bail noisily if it doesn't happen in a second or
+        # two so the failure mode isn't a silent "looks-like-M3-ran".
+        click.echo("Verifying shared-memory bridge...")
+        ok = False
+        for _ in range(30):
+            if (_proc_has_mmap(host_proc.pid, shm_file)
+                    and _proc_has_mmap(npu_proc.pid, shm_file)):
+                ok = True
+                break
+            if npu_proc.poll() is not None:
+                break
+            time.sleep(0.1)
+        if not ok:
+            click.secho(
+                "  Shared file %s not mmap'd by both QEMUs yet" % shm_file,
+                fg="yellow")
+
+        try:
+            snippet = _verify_shared_mapping(
+                host_dir / "monitor.sock", shm_file,
+                host_proc.pid, npu_proc.pid,
+                host_dir / "info-mtree.log")
+            click.secho(
+                "  memdev aliased over BAR0 + both QEMUs mmap %s"
+                % shm_file, fg="green")
+            for ln in snippet.splitlines():
+                click.echo("    " + ln)
+            click.echo()
+        except Exception as e:
+            click.secho("  %s" % e, fg="red")
+            # Don't kill the run — M5+ work is orthogonal to this
+            # verification. Just surface the failure and keep going.
+
         try:
             rc = npu_proc.wait()
         except KeyboardInterrupt:

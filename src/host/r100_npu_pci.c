@@ -18,18 +18,33 @@
  *   BAR4 (Doorbell, 32-bit MMIO):     >= RBLN_PERI_SIZE  (8 MB)
  *   BAR5 (MSI-X,    32-bit MMIO):     >= RBLN_PCIE_SIZE  (1 MB)
  *
- * For M3, BAR0/2/4 are backed by lazily-allocated host RAM (no side
- * effects on writes); BAR5 holds the MSI-X table + PBA in its first
- * few KB with plain RAM filling the rest so the driver's size check
- * passes. Lazy allocation keeps the 64 GB BAR0 from actually costing
- * 64 GB of host RSS unless the guest touches every page.
+ * BAR2/4 are plain lazily-allocated host RAM (no side effects on
+ * writes); BAR5 holds the MSI-X table + PBA in its first few KB with
+ * plain RAM filling the rest so the driver's size check passes. Lazy
+ * allocation keeps the 64 GB BAR0 from actually costing 64 GB of
+ * host RSS unless the guest touches every page.
+ *
+ * BAR0 has two shapes:
+ *
+ *   - Without `memdev`: plain lazy RAM (M3 behavior). Useful for
+ *     bring-up / driver-only experiments where the NPU-side QEMU
+ *     isn't involved.
+ *
+ *   - With `memdev` (M4+): BAR0 is a container MemoryRegion of the
+ *     full declared size (64 GB) with the backend's MR added as a
+ *     subregion at offset 0 and plain lazy RAM filling the tail.
+ *     Both QEMU processes (x86 host + aarch64 NPU) open the same
+ *     memory-backend-file with share=on, so writes from the x86
+ *     guest into BAR0 offset 0..backend_size land in a page the NPU-
+ *     side QEMU also has mmap'd. The NPU-side address-map integration
+ *     (so NPU CPUs see those bytes as their DRAM) lands in M5.
  *
  * Later milestones layer real behavior on top:
- *   M4 — alias the `memdev` HostMemoryBackend over BAR0 offset 0 so
- *        writes land in shared memory with the NPU-side QEMU.
- *   M5 — swap BAR4 RAM for an MMIO region whose writes signal an
+ *   M5 — alias the same backend into the NPU-side HBM memory map so
+ *        NPU CPUs see x86-guest writes as DRAM accesses.
+ *   M6 — swap BAR4 RAM for an MMIO region whose writes signal an
  *        eventfd that the NPU process converts into its local IRQ.
- *   M6 — wire MSI-X back: NPU-side eventfd fires msix_notify() here.
+ *   M7 — wire MSI-X back: NPU-side eventfd fires msix_notify() here.
  */
 
 #include "qemu/osdep.h"
@@ -40,6 +55,7 @@
 #include "hw/pci/msix.h"
 #include "hw/qdev-properties.h"
 #include "sysemu/hostmem.h"
+#include "migration/vmstate.h"
 #include "qom/object.h"
 #include "qapi/error.h"
 
@@ -66,12 +82,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(R100NpuPciState, R100_NPU_PCI)
 struct R100NpuPciState {
     PCIDevice parent_obj;
 
-    /* Optional: link to a HostMemoryBackend that the M4 milestone will
-     * alias over BAR0 offset 0 for cross-process DRAM sharing. Accepted
-     * but currently unused. */
+    /* When set (via -device r100-npu-pci,memdev=<id>), the backend's
+     * MR is added as a subregion of bar0_ddr at offset 0 for cross-
+     * process DRAM sharing with the NPU-side QEMU. `bar0_tail` then
+     * fills the remainder of BAR0 so the driver's size check passes.
+     * When unset, bar0_ddr is a plain RAM region of the full size and
+     * bar0_tail is unused. */
     HostMemoryBackend *hostmem;
 
     MemoryRegion bar0_ddr;
+    MemoryRegion bar0_tail;
     MemoryRegion bar2_acp;
     MemoryRegion bar4_doorbell;
     MemoryRegion bar5_msix;
@@ -84,13 +104,48 @@ static void r100_npu_pci_realize(PCIDevice *pdev, Error **errp)
 
     /* BAR0 — DDR window. Declared at 64 GB (next pow2 >= 36 GB) so the
      * driver's rebel_check_pci_bars_size() passes. QEMU maps anonymous
-     * RAM with MAP_NORESERVE semantics here, so the host doesn't
-     * actually commit 64 GB unless the guest touches every page. */
-    memory_region_init_ram(&s->bar0_ddr, OBJECT(s), "r100.bar0.ddr",
-                           R100_BAR0_DDR_SIZE, &err);
-    if (err) {
-        error_propagate(errp, err);
-        return;
+     * RAM with MAP_NORESERVE semantics for the tail, so the host
+     * doesn't actually commit 64 GB unless the guest touches every
+     * page.
+     *
+     * If `memdev` is wired, splice the backend's MR over offset 0 so
+     * stores from the x86 guest land in the shared /dev/shm file that
+     * the NPU-side QEMU has mmap'd as well; a plain RAM subregion
+     * fills offsets [backend_size, BAR0_SIZE). Otherwise the whole BAR
+     * is one plain RAM MR (M3-compatible bring-up path). */
+    if (s->hostmem) {
+        MemoryRegion *shared = host_memory_backend_get_memory(s->hostmem);
+        uint64_t shared_size = memory_region_size(shared);
+        if (shared_size == 0 || shared_size > R100_BAR0_DDR_SIZE) {
+            error_setg(errp,
+                       "r100-npu-pci: memdev size 0x%" PRIx64
+                       " is out of range for BAR0 (max 0x%" PRIx64 ")",
+                       shared_size, (uint64_t)R100_BAR0_DDR_SIZE);
+            return;
+        }
+        memory_region_init(&s->bar0_ddr, OBJECT(s), "r100.bar0.ddr",
+                           R100_BAR0_DDR_SIZE);
+        memory_region_add_subregion(&s->bar0_ddr, 0, shared);
+        host_memory_backend_set_mapped(s->hostmem, true);
+        vmstate_register_ram(shared, DEVICE(s));
+        if (shared_size < R100_BAR0_DDR_SIZE) {
+            memory_region_init_ram(&s->bar0_tail, OBJECT(s),
+                                   "r100.bar0.tail",
+                                   R100_BAR0_DDR_SIZE - shared_size, &err);
+            if (err) {
+                error_propagate(errp, err);
+                return;
+            }
+            memory_region_add_subregion(&s->bar0_ddr, shared_size,
+                                        &s->bar0_tail);
+        }
+    } else {
+        memory_region_init_ram(&s->bar0_ddr, OBJECT(s), "r100.bar0.ddr",
+                               R100_BAR0_DDR_SIZE, &err);
+        if (err) {
+            error_propagate(errp, err);
+            return;
+        }
     }
     pci_register_bar(pdev, 0,
                      PCI_BASE_ADDRESS_SPACE_MEMORY |
@@ -157,6 +212,11 @@ static void r100_npu_pci_exit(PCIDevice *pdev)
 {
     R100NpuPciState *s = R100_NPU_PCI(pdev);
     msix_uninit(pdev, &s->bar5_msix, &s->bar5_msix);
+    if (s->hostmem) {
+        MemoryRegion *shared = host_memory_backend_get_memory(s->hostmem);
+        vmstate_unregister_ram(shared, DEVICE(s));
+        host_memory_backend_set_mapped(s->hostmem, false);
+    }
 }
 
 static Property r100_npu_pci_properties[] = {
