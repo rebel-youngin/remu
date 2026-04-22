@@ -93,10 +93,12 @@ output/
     uart{0..3}.log    # NPU UARTs (as in Phase 1)
     hils.log          # NPU HILS ring tail
     shm -> /dev/shm/remu-my-test/
-    doorbell.log      # NPU-side ASCII trace of every (offset, value) frame
+    doorbell.log      # NPU-side ASCII trace of every guest→NPU (offset, value) frame (M6)
+    msix.log          # host-side ASCII trace of every NPU→host (offset, db_data) frame (M7)
     npu/
       monitor.sock    # NPU HMP monitor (unix socket)
       info-mtree.log  # captured info mtree — chiplet0.dram splice
+      info-mtree-imsix.log  # captured info mtree — r100-imsix MMIO @ 0x1BFFFFF000 (M7)
       info-qtree.log  # captured info qtree — confirms r100-doorbell + r100-mailbox
     host/
       cmdline.txt     # x86 QEMU invocation
@@ -104,10 +106,12 @@ output/
       qemu.stderr.log
       serial.log      # x86 guest serial (SeaBIOS + "No bootable device" idle)
       monitor.sock    # host HMP monitor (unix socket)
-      doorbell.sock   # unix-socket chardev listener (host = server, NPU = client)
+      doorbell.sock   # unix-socket chardev listener (host = server, NPU = client; M6)
+      msix.sock       # unix-socket chardev listener (host = server, NPU = client; M7)
       info-pci.log    # captured info pci — lists 1eff:2030 endpoint
       info-mtree.log  # captured info mtree — BAR0 shm splice
       info-mtree-bar4.log  # captured info mtree — BAR4 MMIO overlay (M6)
+      info-mtree-bar5.log  # captured info mtree — BAR5 msix-table + msix-pba overlays (M7)
 ```
 
 Everything under `/dev/shm/remu-<name>/` is cleaned up on exit. If
@@ -314,6 +318,48 @@ frame the NPU actually received (one line per frame, format
 `doorbell off=0x... val=0x... count=N`). If it's empty after the host
 has written INTGR, the chardev bridge is down — check that both
 QEMUs are still up and that `output/<name>/host/doorbell.sock` exists.
+
+### MSI-X path (M7, FW → guest)
+
+The reverse direction of M6. A FW-side 4-byte store to
+`REBELH_PCIE_MSIX_ADDR` (`0x1B_FFFF_FFFC`) — the same address silicon's
+DW PCIe MAC snoops to emit an MSI-X TLP — is trapped by the chiplet-0
+`r100-imsix` sysbus device's 4 KB MMIO window at
+`R100_PCIE_IMSIX_BASE` (`0x1B_FFFF_F000`), offset `0xFFC`. The device
+serialises it as an 8-byte `(offset, db_data)` frame on the
+`msix.sock` unix-socket chardev (mirror of M6's wire format, opposite
+direction — host is server, NPU is `reconnect=1` client). The host-side
+`r100-npu-pci` receiver masks `vector = db_data & 0x7FF` and calls
+`msix_notify()`, which delivers the interrupt to the x86 guest via the
+MSI-X table on BAR5. Vectors ≥ 32 (beyond the BAR5 table) and writes
+at any other offset in the iMSIX page are counted as `oor` /
+`bad-offset` and also logged to `qemu.log` as `GUEST_ERROR` entries.
+
+Quick sanity poking from the monitor:
+
+```
+# NPU side: r100-imsix MMIO region must be mapped at 0x1BFFFFF000
+printf 'info mtree\nquit\n' \
+  | socat - UNIX-CONNECT:output/<name>/npu/monitor.sock \
+  | rg 'r100-imsix'
+
+# Host side: BAR5 must carry msix-table + msix-pba overlays
+printf 'info mtree\nquit\n' \
+  | socat - UNIX-CONNECT:output/<name>/host/monitor.sock \
+  | rg 'msix-(table|pba)'
+
+# Drive a synthetic frame end-to-end without the FW
+python3 tests/m7_msix_test.py
+```
+
+`output/<name>/msix.log` is the ASCII trace of every frame the host
+actually accepted or rejected (one line per frame, format
+`msix off=0x... db_data=0x... vector=N status={ok|oor|bad-offset} count=N`).
+If it's empty after the FW has written `REBELH_PCIE_MSIX_ADDR`, the
+chardev bridge is down — check that both QEMUs are up and that
+`output/<name>/host/msix.sock` exists. `./remucli run --host`
+auto-verifies both mtree checks on startup and prints pass/fail to
+stdout.
 
 ## Interpreting a boot log
 

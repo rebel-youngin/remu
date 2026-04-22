@@ -40,8 +40,8 @@ match the driver's size checks in `rebel_check_pci_bars_size`:
 |-----|------|------|
 | 0   | 64 GB (>= 36 GB `RBLN_DRAM_SIZE`) | DDR — first 128 MB = `/dev/shm` shared file, tail = lazy RAM |
 | 2   | 64 MB (= `RBLN_SRAM_SIZE`)        | ACP / SRAM / logbuf (lazy RAM) |
-| 4   | 8 MB  (= `RBLN_PERI_SIZE`)        | Doorbells (plain RAM — M6 swaps for eventfd MMIO) |
-| 5   | 1 MB  (= `RBLN_PCIE_SIZE`)        | MSI-X table (32 vectors) + PBA |
+| 4   | 8 MB  (= `RBLN_PERI_SIZE`)        | Doorbells — 4 KB MMIO head intercepts `MAILBOX_INTGR{0,1}` writes and forwards them to the NPU as 8-byte chardev frames (M6); rest is lazy RAM |
+| 5   | 1 MB  (= `RBLN_PCIE_SIZE`)        | MSI-X table (32 vectors) + PBA — `msix_notify()` target for frames coming back from the NPU `r100-imsix` device (M7) |
 
 Both QEMUs open the same 128 MB memory-backed file at
 `/dev/shm/remu-<name>/remu-shm` with `share=on`. The **same** backend is
@@ -67,19 +67,38 @@ serial redirected to `host/serial.log`. The host-side HMP monitor lives
 at `output/<name>/host/monitor.sock` (use `socat - UNIX-CONNECT:...` for
 interactive HMP).
 
-`./remucli run --host` auto-verifies the bridge end-to-end:
-  - `info pci` on host must list `1eff:2030` (logged to `host/info-pci.log`);
-  - `info mtree` on host must place the `remushm` subregion at offset 0
-    of `r100.bar0.ddr` (logged to `host/info-mtree.log`);
-  - `info mtree` on the NPU must place the same `remushm` subregion at
-    offset 0 of `r100.chiplet0.dram` (logged to `npu/info-mtree.log`);
-  - both QEMU PIDs must have the shm file in `/proc/<pid>/maps`.
+`./remucli run --host` auto-verifies every bridge end-to-end:
+  - **M4**: `info pci` on host must list `1eff:2030` (logged to
+    `host/info-pci.log`);
+  - **M4**: `info mtree` on host must place the `remushm` subregion at
+    offset 0 of `r100.bar0.ddr` (logged to `host/info-mtree.log`);
+  - **M5**: `info mtree` on the NPU must place the same `remushm`
+    subregion at offset 0 of `r100.chiplet0.dram` (logged to
+    `npu/info-mtree.log`);
+  - **M4/M5**: both QEMU PIDs must have the shm file in
+    `/proc/<pid>/maps`;
+  - **M6**: `info mtree` on host must show the `r100.bar4.mmio`
+    priority-10 overlay, and `info qtree` on the NPU must list both
+    `r100-doorbell` and `r100-mailbox` (logged to
+    `host/info-mtree-bar4.log` + `npu/info-qtree.log`);
+  - **M7**: `info mtree` on the NPU must list the `r100-imsix`
+    MemoryRegion at `0x1BFFFFF000`, and `info mtree` on host must show
+    `msix-table` + `msix-pba` overlaying `r100.bar5.msix` (logged to
+    `npu/info-mtree-imsix.log` + `host/info-mtree-bar5.log`).
 
 Any check failing prints to the terminal — the NPU still boots for
-post-mortem poking. `tests/m5_dataflow_test.py` is an end-to-end
-sanity script: it writes a magic pattern to `/dev/shm/.../remu-shm` at
-offset 0x07F00000 (past the FW image region) and asserts `xp /4wx` on
-both monitors returns the same bytes.
+post-mortem poking. End-to-end sanity scripts, one per milestone
+bridge:
+  - `tests/m5_dataflow_test.py` writes a magic pattern to
+    `/dev/shm/.../remu-shm` at offset 0x07F00000 and asserts `xp /4wx`
+    on both monitors returns the same bytes.
+  - `tests/m6_doorbell_test.py` drives 8-byte `(offset, value)`
+    frames on `host/doorbell.sock` and checks `doorbell.log` plus
+    `GUEST_ERROR` entries for rejected frames.
+  - `tests/m7_msix_test.py` does the reverse: connects as an NPU-
+    impersonating client to `host/msix.sock` (test IS the NPU in this
+    scenario), emits 5 frames (3 `ok` + 1 `oor` + 1 `bad-offset`),
+    and checks `msix.log` plus `GUEST_ERROR` entries.
 
 All `./remucli run` invocations write into `output/<name>/` (or
 `output/run-<timestamp>/` if `--name` is omitted). Never pass paths

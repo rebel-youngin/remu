@@ -480,7 +480,7 @@ def _make_run_dir(name, output_root):
 
 def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
                    npu_monitor_sock=None, doorbell_sock=None,
-                   doorbell_log=None):
+                   doorbell_log=None, msix_sock=None, msix_log=None):
     """Assemble the aarch64 QEMU cmdline for the R100 NPU side.
     Matches the previous in-line flow exactly; extracted so that
     --host can extend it (Phase 2) without duplicating boot-image
@@ -501,7 +501,17 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
     matching server on the host side) and wires it into the r100-soc
     machine's `doorbell` option. When `doorbell_log` is a path, a file
     chardev is also attached and fed to the machine's `doorbell-debug`
-    option so every received frame appends an ASCII line to it."""
+    option so every received frame appends an ASCII line to it.
+
+    msix_sock / msix_log: M7 plumbing — reverse-direction (FW → host
+    MSI-X) chardev. When `msix_sock` is a path, the NPU attaches a
+    client socket chardev (host owns the listener, mirror of the M6
+    doorbell socket) and wires it into the r100-soc machine's `msix`
+    option. On FW stores to REBELH_PCIE_MSIX_ADDR (0x1BFFFFFFFC) the
+    r100-imsix device emits an 8-byte (offset, db_data) frame on this
+    chardev; the host's r100-npu-pci consumes it and fires
+    msix_notify(). An optional `msix_log` file chardev echoes every
+    emitted frame as an ASCII line for humans and tests."""
     uart0_log = run_dir / "uart0.log"
     hils_log = run_dir / "hils.log"
 
@@ -512,6 +522,10 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
         machine_opt += ",doorbell=doorbell"
         if doorbell_log is not None:
             machine_opt += ",doorbell-debug=doorbell_dbg"
+    if msix_sock is not None:
+        machine_opt += ",msix=msix"
+        if msix_log is not None:
+            machine_opt += ",msix-debug=msix_dbg"
 
     cmd = [
         str(QEMU_BIN),
@@ -538,6 +552,20 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
             cmd += [
                 "-chardev",
                 "file,id=doorbell_dbg,path=%s,mux=off" % doorbell_log,
+            ]
+    if msix_sock is not None:
+        # Same client/server pattern as doorbell — host QEMU owns the
+        # listener so the PCI device side has the r100-npu-pci
+        # realize-time set_handlers path already installed by the time
+        # the NPU opens the socket.
+        cmd += [
+            "-chardev",
+            "socket,id=msix,path=%s,reconnect=1" % msix_sock,
+        ]
+        if msix_log is not None:
+            cmd += [
+                "-chardev",
+                "file,id=msix_dbg,path=%s,mux=off" % msix_log,
             ]
     click.echo("  Chiplet 0 UART -> stdio (log: %s)" % uart0_log)
 
@@ -604,7 +632,7 @@ def _setup_shm(run_name, size):
 
 
 def _build_host_cmd(host_dir, shm_file, shm_size, monitor_sock, mem,
-                    doorbell_sock=None):
+                    doorbell_sock=None, msix_sock=None, msix_log=None):
     """Assemble the x86_64 QEMU cmdline for the Phase-2 host side.
 
     M3 upgraded the placeholder ivshmem-plain to our own `r100-npu-pci`
@@ -620,13 +648,20 @@ def _build_host_cmd(host_dir, shm_file, shm_size, monitor_sock, mem,
     MAILBOX_INTGR0/INTGR1 emit 8-byte (offset, value) frames on a
     Unix socket that the NPU QEMU is connected to.
 
+    M7 adds the reverse-direction `msix` chardev: when `msix_sock` is
+    set, the r100-npu-pci device receives 8-byte (offset, db_data)
+    frames from the NPU-side r100-imsix peripheral (FW stores to
+    REBELH_PCIE_MSIX_ADDR) and fires msix_notify() for the encoded
+    vector. `msix_log`, when set, is a file chardev wired to the
+    device's `msix-debug` option so every frame leaves an ASCII trail.
+
     SeaBIOS IS allowed to run (no `-S`) so the BAR addresses get
     programmed — the automated verify queries `info mtree`, which
     only shows BAR subregions after they're placed into the pci
     address space. The guest hangs harmlessly at "No bootable
     device" afterwards in an HLT idle loop (serial to file, no
     stdout pollution). KVM disabled; later milestones swap the
-    bootrom-only setup for a real Linux guest (M7).
+    bootrom-only setup for a real Linux guest (M8+).
     """
     stdout_log = host_dir / "qemu.stdout.log"
     stderr_log = host_dir / "qemu.stderr.log"
@@ -643,6 +678,18 @@ def _build_host_cmd(host_dir, shm_file, shm_size, monitor_sock, mem,
             "socket,id=doorbell,path=%s,server=on,wait=off" % doorbell_sock,
         ]
         device_arg += ",doorbell=doorbell"
+    if msix_sock is not None:
+        chardevs += [
+            "-chardev",
+            "socket,id=msix,path=%s,server=on,wait=off" % msix_sock,
+        ]
+        device_arg += ",msix=msix"
+        if msix_log is not None:
+            chardevs += [
+                "-chardev",
+                "file,id=msix_dbg,path=%s,mux=off" % msix_log,
+            ]
+            device_arg += ",msix-debug=msix_dbg"
 
     cmd = [
         str(QEMU_BIN_X86),
@@ -897,6 +944,70 @@ def _verify_doorbell_wired(host_monitor_sock, npu_monitor_sock,
     return snippet
 
 
+def _verify_msix_wired(host_monitor_sock, npu_monitor_sock,
+                       host_mtree_log, npu_mtree_log,
+                       poll_timeout=10.0):
+    """Prove the M7 iMSIX plumbing is alive on both sides.
+
+    NPU side: `info mtree` must list the `r100-imsix` MemoryRegion
+    (placed in the global sysmem at R100_PCIE_IMSIX_BASE by the
+    machine whenever `-machine r100-soc,msix=<chardev>` is set).
+    Absence means the machine option didn't take (bad chardev id) or
+    the device failed realize.
+
+    Host side: `info mtree` must show BAR5 (`r100.bar5.msix`) placed
+    in the pci address space by SeaBIOS, with the `msix-table` /
+    `msix-pba` subregions overlayed on it — those are created by the
+    `msix_init()` call in r100_npu_pci_realize, which only succeeds
+    if the device was wired with room for the 32 vectors. SeaBIOS can
+    take ~1-2 s to program the BAR addresses, so we poll.
+
+    Raises RuntimeError with an actionable message on failure. Log
+    files are always written (empty if the query itself errored out).
+    """
+    npu_mtree = ""
+    deadline = time.time() + poll_timeout
+    while time.time() < deadline:
+        npu_mtree = _hmp_query(npu_monitor_sock, "info mtree",
+                               timeout=10.0)
+        if "r100-imsix" in npu_mtree:
+            break
+        time.sleep(0.3)
+    npu_mtree_log.write_text(npu_mtree + "\n")
+    if "r100-imsix" not in npu_mtree:
+        raise RuntimeError(
+            "NPU-side r100-imsix MMIO region missing from info mtree; "
+            "see %s" % npu_mtree_log)
+
+    npu_snippet_lines = [ln for ln in npu_mtree.splitlines()
+                         if "r100-imsix" in ln]
+    npu_snippet = "\n".join(npu_snippet_lines) or npu_mtree
+
+    host_mtree = ""
+    deadline = time.time() + poll_timeout
+    while time.time() < deadline:
+        host_mtree = _hmp_query(host_monitor_sock, "info mtree",
+                                timeout=10.0)
+        if "r100.bar5.msix" in host_mtree and "msix-table" in host_mtree:
+            break
+        time.sleep(0.3)
+    host_mtree_log.write_text(host_mtree + "\n")
+    if "r100.bar5.msix" not in host_mtree:
+        raise RuntimeError(
+            "host r100.bar5.msix not present in info mtree (SeaBIOS "
+            "BAR5 programming never completed); see %s" % host_mtree_log)
+    if "msix-table" not in host_mtree:
+        raise RuntimeError(
+            "host msix-table overlay missing on BAR5 (msix_init did "
+            "not run); see %s" % host_mtree_log)
+
+    host_snippet = _extract_mtree_container(host_mtree, "r100.bar5.msix") \
+        or "\n".join(ln for ln in host_mtree.splitlines()
+                     if "r100.bar5" in ln or "msix-" in ln)
+
+    return npu_snippet + "\n" + host_snippet
+
+
 def _verify_npu_shared_mapping(npu_monitor_sock, mtree_log):
     """Prove the shared memory-backend-file is spliced over chiplet 0
     DRAM on the NPU side (M5).
@@ -972,12 +1083,18 @@ def run(name, output_root, gdb, trace, chiplets, memory,
       shm               symlink → /dev/shm/remu-<name>/
       npu/monitor.sock  NPU HMP monitor (unix socket)
       npu/info-mtree.log captured `info mtree` on the NPU (chiplet0.dram splice)
+      npu/info-mtree-imsix.log `info mtree` snippet showing r100-imsix (M7)
       host/cmdline.txt  the full x86 QEMU command
       host/qemu.*.log   x86 QEMU stdout / stderr
       host/serial.log   x86 guest serial
       host/monitor.sock host HMP monitor (unix socket)
       host/info-pci.log captured `info pci` HMP output (auto-verified)
       host/info-mtree.log captured `info mtree` on the host (BAR0 splice)
+      host/info-mtree-bar5.log `info mtree` snippet showing BAR5 msix-table (M7)
+      host/doorbell.sock M6 NPU→host-visible doorbell socket
+      host/msix.sock     M7 NPU→host MSI-X reverse-direction socket
+      doorbell.log       ASCII tail of doorbell frames received by NPU (M6)
+      msix.log           ASCII tail of MSI-X frames emitted by NPU (M7)
 
     `<output-root>/latest` is updated to point at the most recent run.
     """
@@ -993,28 +1110,38 @@ def run(name, output_root, gdb, trace, chiplets, memory,
     npu_monitor_sock = None
     doorbell_sock = None
     doorbell_log = None
+    msix_sock = None
+    msix_log = None
     if with_host:
         npu_dir = run_dir / "npu"
         npu_dir.mkdir(exist_ok=True)
         npu_monitor_sock = npu_dir / "monitor.sock"
-        # M6 doorbell: server socket lives under host/ (host QEMU is
-        # the listener), ASCII tail under run root so users can tail
-        # it directly. Stale sock path would make the host bind EADDRINUSE.
+        # M6 doorbell and M7 iMSIX use the same host-as-server +
+        # NPU-as-client pattern; sockets live under host/ so they
+        # survive alongside the other host-owned artifacts. ASCII
+        # debug tails sit at run root so users can tail them without
+        # guessing which side "owns" them. Stale sock paths would
+        # make the host bind EADDRINUSE; clean both before launch.
         host_dir_early = run_dir / "host"
         host_dir_early.mkdir(exist_ok=True)
         doorbell_sock = host_dir_early / "doorbell.sock"
-        if doorbell_sock.exists():
-            try:
-                doorbell_sock.unlink()
-            except OSError:
-                pass
+        msix_sock = host_dir_early / "msix.sock"
+        for p in (doorbell_sock, msix_sock):
+            if p.exists():
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
         doorbell_log = run_dir / "doorbell.log"
+        msix_log = run_dir / "msix.log"
 
     npu_cmd, found = _build_npu_cmd(run_dir, gdb, trace,
                                     with_host=with_host,
                                     npu_monitor_sock=npu_monitor_sock,
                                     doorbell_sock=doorbell_sock,
-                                    doorbell_log=doorbell_log)
+                                    doorbell_log=doorbell_log,
+                                    msix_sock=msix_sock,
+                                    msix_log=msix_log)
 
     if found == 0:
         click.secho("Warning: no firmware images in %s/" % IMAGES_DIR,
@@ -1051,12 +1178,16 @@ def run(name, output_root, gdb, trace, chiplets, memory,
         monitor_sock = host_dir / "monitor.sock"
         host_cmd, host_stdout, host_stderr = _build_host_cmd(
             host_dir, shm_file, shm_size, monitor_sock, host_mem,
-            doorbell_sock=doorbell_sock)
+            doorbell_sock=doorbell_sock,
+            msix_sock=msix_sock,
+            msix_log=msix_log)
         (host_dir / "cmdline.txt").write_text(
             " \\\n  ".join(host_cmd) + "\n")
         click.echo("  Host QEMU   -> SeaBIOS idle (monitor: %s)" % monitor_sock)
         click.echo("  Doorbell    -> %s (debug tail: %s)"
                    % (doorbell_sock, doorbell_log))
+        click.echo("  MSI-X       -> %s (debug tail: %s)"
+                   % (msix_sock, msix_log))
 
     (run_dir / "cmdline.txt").write_text(" \\\n  ".join(npu_cmd) + "\n")
 
@@ -1116,6 +1247,11 @@ def run(name, output_root, gdb, trace, chiplets, memory,
         if doorbell_sock and doorbell_sock.exists():
             try:
                 doorbell_sock.unlink()
+            except OSError:
+                pass
+        if msix_sock and msix_sock.exists():
+            try:
+                msix_sock.unlink()
             except OSError:
                 pass
 
@@ -1224,6 +1360,22 @@ def run(name, output_root, gdb, trace, chiplets, memory,
                 "  doorbell chardev wired: BAR4 MMIO overlay on host + "
                 "r100-doorbell → r100-mailbox on NPU", fg="green")
             for ln in db_snip.splitlines():
+                click.echo("    " + ln)
+            click.echo()
+        except Exception as e:
+            click.secho("  %s" % e, fg="red")
+
+        # M7: Verify the MSI-X reverse-direction plumbing.
+        try:
+            msix_snip = _verify_msix_wired(
+                host_dir / "monitor.sock", npu_monitor_sock,
+                host_dir / "info-mtree-bar5.log",
+                npu_dir / "info-mtree-imsix.log",
+            )
+            click.secho(
+                "  msix chardev wired: r100-imsix on NPU + "
+                "msix-table overlay on host BAR5", fg="green")
+            for ln in msix_snip.splitlines():
                 click.echo("    " + ln)
             click.echo()
         except Exception as e:

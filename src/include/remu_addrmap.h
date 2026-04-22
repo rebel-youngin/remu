@@ -438,4 +438,46 @@
 #define R100_PCIE_MBX_GROUP0_SPI    184
 #define R100_PCIE_MBX_GROUP1_SPI    185
 
+/*
+ * Integrated MSI-X trigger (iMSIX-DB) — FW→host reverse-direction
+ * interrupt path (Phase 2, M7).
+ *
+ * On silicon the DW PCIe controller has two MSIX_ADDRESS_MATCH_*
+ * registers that programmed the MAC to snoop all writes to a specific
+ * physical address on the internal fabric; a matching write is turned
+ * into a real MSI-X TLP on the wire. The FW (q-sys/q-cp) uses this
+ * mechanism to signal the host driver: see pcie_msix_trigger() in
+ *   external/ssw-bundle/.../FreeRTOS/Source/rbln/msix.c
+ * and the matching DW driver pcie_raise_msix_irq() in
+ *   external/ssw-bundle/.../drivers/pcie/pcie_dw_msix.c
+ *
+ * The snooped address is hard-coded by the FW (BAT.h / msix.h):
+ *
+ *   PCIE_IMSIX_BASE   = 0x1B_FFFF_F000   (4 KB-aligned base)
+ *   PCIE_IMSIX_OFFSET = 0x          FFC   (trigger word at end of page)
+ *   REBELH_PCIE_MSIX_ADDR = 0x1B_FFFF_FFFC
+ *
+ * The 32-bit value written encodes which function + vector to fire:
+ *
+ *   | 31:29 Rsvd | 28:24 PF | 23:16 VF | 15 VF-Act | 14:12 TC |
+ *   | 11 Rsvd    | 10:0 Vector |
+ *
+ * On REMU the NPU-side `r100-imsix` device (src/machine/r100_imsix.c)
+ * overlays an MMIO region at PCIE_IMSIX_BASE on the chiplet-0 CPU view
+ * (single PF today); on a 4-byte write to offset IMSIX_OFFSET it emits
+ * an 8-byte (offset, db_data) frame to a chardev that the host-side
+ * r100-npu-pci consumes (same frame format as the M6 doorbell, just
+ * flowing in the opposite direction). On the host side, the frame
+ * handler extracts (db_data & IMSIX_VECTOR_MASK) and calls
+ * msix_notify() on the PCI device.
+ *
+ * PF/VF/TC bits are accepted but ignored for now — CR03 exposes a
+ * single PF and the KMD uses vectors 0..31 only. Revisit once M9 adds
+ * VF-aware routing.
+ */
+#define R100_PCIE_IMSIX_BASE        0x1BFFFFF000ULL
+#define R100_PCIE_IMSIX_SIZE        0x0000001000ULL   /* 4 KB page */
+#define R100_PCIE_IMSIX_DB_OFFSET   0x00000FFCU       /* trigger word */
+#define R100_PCIE_IMSIX_VECTOR_MASK 0x000007FFU       /* db_data[10:0] */
+
 #endif /* REMU_ADDRMAP_H */

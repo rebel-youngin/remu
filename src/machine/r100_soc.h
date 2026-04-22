@@ -51,6 +51,20 @@ struct R100SoCMachineState {
      * echoes each received frame to as an ASCII line. Used by the
      * M6 verification test and humans; does not affect signalling. */
     char *doorbell_debug_chardev_id;
+
+    /* `-machine r100-soc,msix=<chardev-id>` : M7 reverse-direction
+     * egress. When set, the machine instantiates an `r100-imsix`
+     * device overlayed at R100_PCIE_IMSIX_BASE on the chiplet-0 CPU
+     * view. FW writes to the IMSIX doorbell (offset 0xFFC) get
+     * forwarded as 8-byte (offset, value) frames to this chardev,
+     * matching the M6 frame format but in the opposite direction —
+     * host-side r100-npu-pci consumes them and calls msix_notify().
+     * Resolved to a Chardev at machine-init time (same late-binding
+     * reason as memdev / doorbell). */
+    char *msix_chardev_id;
+    /* Optional debug tail for r100-imsix (one ASCII line per frame
+     * emitted). Mirror of doorbell_debug_chardev_id. */
+    char *msix_debug_chardev_id;
 };
 
 typedef struct R100SoCMachineState R100SoCMachineState;
@@ -73,6 +87,7 @@ DECLARE_INSTANCE_CHECKER(R100SoCMachineState, R100_SOC_MACHINE,
 #define TYPE_R100_RBDMA         "r100-rbdma"
 #define TYPE_R100_DOORBELL      "r100-doorbell"
 #define TYPE_R100_MAILBOX       "r100-mailbox"
+#define TYPE_R100_IMSIX         "r100-imsix"
 #define TYPE_R100_UNIMPL        "r100-unimpl"
 
 #define R100_RBC_BLOCK_SIZE     0x80000ULL  /* 512KB per RBC block */
@@ -320,6 +335,23 @@ DECLARE_INSTANCE_CHECKER(R100MailboxState, R100_MAILBOX, TYPE_R100_MAILBOX)
  * matching qemu_irq when INTMSR goes non-zero.
  */
 void r100_mailbox_raise_intgr(R100MailboxState *s, int group, uint32_t val);
+
+/* ========================================================================
+ * Integrated MSI-X trigger (iMSIX-DB) — FW→host reverse-direction.
+ *
+ * Overlays a 4 KB MMIO page at R100_PCIE_IMSIX_BASE on the chiplet-0
+ * CPU view. On a 4-byte write to offset R100_PCIE_IMSIX_DB_OFFSET
+ * (0xFFC), emits an 8-byte little-endian frame (offset, value) over
+ * its chardev — same wire format as the M6 doorbell, just inverted.
+ * The host-side r100-npu-pci consumes these frames and calls
+ * msix_notify() for the encoded vector.
+ *
+ * The device state is private to src/machine/r100_imsix.c (matching
+ * the r100-doorbell pattern); only the QOM type name is exported so
+ * the machine can instantiate it. Instantiation is conditional on
+ * `-machine r100-soc,msix=<chardev-id>` being set (single-QEMU
+ * bring-up paths are unaffected).
+ * ======================================================================== */
 
 /* ========================================================================
  * Unimplemented region (catch-all for unmapped config space reads)

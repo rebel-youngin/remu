@@ -1308,6 +1308,68 @@ static void r100_soc_init(MachineState *machine)
     }
 
     /*
+     * --- Integrated MSI-X trigger (chiplet-0 FW→host, optional) ---
+     *
+     * Silicon's DW PCIe controller programs its MSIX_ADDRESS_MATCH_*
+     * registers with 0x1B_FFFF_F000 + 0xFFC (REBELH_PCIE_MSIX_ADDR);
+     * FW stores to that address are snooped and turned into real
+     * MSI-X TLPs. See src/machine/r100_imsix.c for the full rationale
+     * and pcie_msix_trigger() / pcie_dw_msix.c in the FW tree for the
+     * canonical reference.
+     *
+     * On REMU the r100-imsix sysbus device owns that 4 KB window;
+     * writes to offset 0xFFC get forwarded as 8-byte (offset, value)
+     * frames on the `msix` chardev, which the host-side r100-npu-pci
+     * converts into msix_notify() calls. We place it on the global
+     * sysmem so chiplet-0's CPU view picks it up through its
+     * sysmem_alias; other chiplets see the same page at the same
+     * offset (they don't own a PCIe controller in silicon either,
+     * but the FW paths only run on chiplet-0's CPU/CM7).
+     *
+     * Only instantiated when `-machine r100-soc,msix=<chardev-id>`
+     * is set — M1-M6 single-QEMU runs and pre-M7 dual-QEMU runs
+     * without the msix chardev are unaffected.
+     */
+    {
+        R100SoCMachineState *r100m = R100_SOC_MACHINE(machine);
+
+        if (r100m->msix_chardev_id != NULL &&
+            *r100m->msix_chardev_id != '\0') {
+            Chardev *chr = qemu_chr_find(r100m->msix_chardev_id);
+            Chardev *dbg = NULL;
+            DeviceState *imsix;
+
+            if (chr == NULL) {
+                error_report("r100-soc: msix chardev '%s' not found",
+                             r100m->msix_chardev_id);
+                exit(1);
+            }
+            if (r100m->msix_debug_chardev_id != NULL &&
+                *r100m->msix_debug_chardev_id != '\0') {
+                dbg = qemu_chr_find(r100m->msix_debug_chardev_id);
+                if (dbg == NULL) {
+                    error_report("r100-soc: msix debug chardev "
+                                 "'%s' not found",
+                                 r100m->msix_debug_chardev_id);
+                    exit(1);
+                }
+            }
+
+            imsix = qdev_new(TYPE_R100_IMSIX);
+            qdev_prop_set_chr(imsix, "chardev", chr);
+            if (dbg) {
+                qdev_prop_set_chr(imsix, "debug-chardev", dbg);
+            }
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(imsix), &error_fatal);
+            /* Priority 10 to outrank the chiplet catch-all windows
+             * (private-alias overlay and cfg_mr unimplemented stubs
+             * all mount at lower priorities). */
+            sysbus_mmio_map_overlap(SYS_BUS_DEVICE(imsix), 0,
+                                    R100_PCIE_IMSIX_BASE, 10);
+        }
+    }
+
+    /*
      * --- Shared inter-chiplet mailbox RAM ---
      * TF-A's `mailbox_data[]` table pairs each IDX_MAILBOX_* instance
      * with an absolute base. ipm_samsung_write/receive dereference
@@ -1402,6 +1464,33 @@ static void r100_soc_set_doorbell_debug(Object *obj, const char *value,
     r100m->doorbell_debug_chardev_id = g_strdup(value);
 }
 
+static char *r100_soc_get_msix(Object *obj, Error **errp)
+{
+    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
+    return g_strdup(r100m->msix_chardev_id);
+}
+
+static void r100_soc_set_msix(Object *obj, const char *value, Error **errp)
+{
+    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
+    g_free(r100m->msix_chardev_id);
+    r100m->msix_chardev_id = g_strdup(value);
+}
+
+static char *r100_soc_get_msix_debug(Object *obj, Error **errp)
+{
+    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
+    return g_strdup(r100m->msix_debug_chardev_id);
+}
+
+static void r100_soc_set_msix_debug(Object *obj, const char *value,
+                                    Error **errp)
+{
+    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
+    g_free(r100m->msix_debug_chardev_id);
+    r100m->msix_debug_chardev_id = g_strdup(value);
+}
+
 static void r100_soc_machine_instance_init(Object *obj)
 {
     object_property_add_str(obj, "memdev",
@@ -1426,6 +1515,23 @@ static void r100_soc_machine_instance_init(Object *obj)
     object_property_set_description(obj, "doorbell-debug",
         "Optional chardev id that receives an ASCII trace of every "
         "doorbell frame observed by the NPU (one line per frame).");
+
+    object_property_add_str(obj, "msix",
+                            r100_soc_get_msix, r100_soc_set_msix);
+    object_property_set_description(obj, "msix",
+        "Optional chardev id the chiplet-0 r100-imsix device emits "
+        "8-byte (offset, db_data) frames on whenever FW stores to "
+        "REBELH_PCIE_MSIX_ADDR (0x1BFFFFFFFC). The Phase-2 x86 host "
+        "QEMU's r100-npu-pci consumes these frames and calls "
+        "msix_notify() for the encoded vector — FW → host MSI-X.");
+
+    object_property_add_str(obj, "msix-debug",
+                            r100_soc_get_msix_debug,
+                            r100_soc_set_msix_debug);
+    object_property_set_description(obj, "msix-debug",
+        "Optional chardev id that receives an ASCII trace of every "
+        "iMSIX doorbell write observed on the NPU (one line per "
+        "frame emitted).");
 }
 
 static void r100_soc_machine_instance_finalize(Object *obj)
@@ -1434,6 +1540,8 @@ static void r100_soc_machine_instance_finalize(Object *obj)
     g_free(r100m->memdev_id);
     g_free(r100m->doorbell_chardev_id);
     g_free(r100m->doorbell_debug_chardev_id);
+    g_free(r100m->msix_chardev_id);
+    g_free(r100m->msix_debug_chardev_id);
 }
 
 /*

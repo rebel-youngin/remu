@@ -14,7 +14,7 @@ The R100 is a multi-chiplet NPU with:
 - **8 ARM CA73 cores per chiplet**: 2 clusters (CP0, CP1) x 4 cores = 32 cores total
 - **Per-chiplet peripherals**: CMU (clocks), PMU (power), HBM3 (memory), DNC (compute), HDMA (DMA)
 - **Inter-chiplet links**: UCIe via 6 RBC blocks, QSPI bridge for register access
-- **Host interface**: PCIe endpoint with BAR-mapped DRAM, config, and doorbell regions
+- **Host interface**: PCIe endpoint with BAR-mapped DRAM, config, and doorbell regions; MSI-X for FW-to-host interrupts
 
 Real hardware:
 
@@ -58,9 +58,10 @@ the single pinned QEMU tree (`./remucli build` → `qemu-system-aarch64`
 │    └─ BAR0 backed by /dev/shm/remu-* (M4) ✓      │
 │    └─ BAR2/5 lazy RAM + MSI-X table (M3) ✓       │
 │    └─ BAR4 MMIO head → chardev frame (M6) ✓      │
-│    └─ MSI-X ← eventfd ← FW QEMU     (M7 pending) │
+│    └─ msix chardev → msix_notify()  (M7) ✓       │
 └────────────┬──────────┬──────────┬───────────────┘
-             │ shm      │ chardev  │ eventfd
+             │ shm      │ doorbell │ msix
+             │          │ chardev  │ chardev
 ┌────────────┴──────────────────┴──────────────────┐
 │  FW QEMU (aarch64, bare-metal)                   │
 │  32x CA73 vCPUs (cortex-a72 w/ MIDR=A73 r1p1)    │
@@ -84,6 +85,10 @@ the single pinned QEMU tree (`./remucli build` → `qemu-system-aarch64`
 │  │     @ R100_PCIE_MAILBOX_BASE               │  │
 │  │     INTMSR0 → GIC SPI 184 (chiplet 0)      │  │
 │  │     INTMSR1 → GIC SPI 185 (chiplet 0)      │  │
+│  │  r100-imsix — PCIe MSI-X address-match     │  │
+│  │    trap @ R100_PCIE_IMSIX_BASE (M7) ✓      │  │
+│  │    └─ 4-byte write @ off 0xFFC emits       │  │
+│  │       (offset, db_data) frame to host      │  │
 │  │  GIC600, per-chiplet 16550 UART, Timer     │  │
 │  └────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────┘
@@ -214,8 +219,9 @@ All device models follow the QEMU QOM (QEMU Object Model) pattern:
 | `r100_logbuf.c` | HILS ring tail | 1 (chiplet 0 only) | Polls DRAM `.logbuf` ring at 0x10000000 on a 50 ms timer, drains `RLOG_*`/`FLOG_*` entries to own chardev |
 | `r100_doorbell.c` | PCIe doorbell ingress | 1 (chiplet 0 only; M6) | Reassembles 8-byte `(BAR4 offset, value)` frames on a `CharBackend`, validates the offset is `MAILBOX_INTGR0` (0x8) or `MAILBOX_INTGR1` (0x1c), and calls `r100_mailbox_raise_intgr(group, val)` on the linked `r100-mailbox` (via `DEFINE_PROP_LINK`). No longer owns a `qemu_irq` — the mailbox owns the GIC line |
 | `r100_mailbox.c` | Samsung `ipm_samsung` SFR | 1 (chiplet 0 only; M6) | Full register model: `MCUCTRL`, `INTGR{0,1}` (write-1-to-set), `INTCR{0,1}` (write-1-to-clear), `INTMR{0,1}` (mask), `INTSR{0,1}` (raw pending), `INTMSR{0,1}` (`INTSR & ~INTMR`), `MIF_INIT`, `IS_VERSION`, `ISSR0..63`. Two `qemu_irq` outputs (`irq[0]` / `irq[1]`) track the non-zero state of INTMSR0 / INTMSR1. Exposes `r100_mailbox_raise_intgr(group, val)` helper so upstream devices (like `r100-doorbell`) can inject pending bits without round-tripping through MMIO |
-| `r100_npu_pci.c` (x86 side) | PCIe endpoint `0x1eff:0x2030` | 1 | Four BARs: BAR0 splices shared memdev at offset 0 (M4); BAR2 lazy RAM; BAR4 is a container with a 4 KB MMIO head overlay that intercepts `MAILBOX_INTGR0/1` writes and emits 8-byte frames on the `doorbell` chardev (M6), plus an 8 MB lazy-RAM fallback; BAR5 is MSI-X table + PBA + RAM fill (M3) |
-| `remu_addrmap.h` | — | — | All address constants (from `g_sys_addrmap.h`), plus M6 doorbell offsets, `R100_PCIE_MAILBOX_BASE`, and `R100_PCIE_MBX_GROUP{0,1}_SPI` |
+| `r100_imsix.c` | PCIe MSI-X address-match trap | 1 (chiplet 0 only; M7) | 4 KB MMIO window at `R100_PCIE_IMSIX_BASE` (`0x1B_FFFF_F000`). Traps 4-byte FW writes to offset `0xFFC` (`R100_PCIE_IMSIX_DB_OFFSET` = `REBELH_PCIE_MSIX_ADDR & 0xFFF`) — the same 32-bit store that DW PCIe `MSIX_ADDRESS_MATCH_*` logic snoops on silicon — and emits 8-byte `(offset, db_data)` frames on the `msix` chardev. Non-doorbell offsets fall through to a local 1 KB register file so FW side-probes don't spam QEMU's unimplemented-device log. Optional `msix-debug` chardev echoes every frame for observability |
+| `r100_npu_pci.c` (x86 side) | PCIe endpoint `0x1eff:0x2030` | 1 | Four BARs: BAR0 splices shared memdev at offset 0 (M4); BAR2 lazy RAM; BAR4 is a container with a 4 KB MMIO head overlay that intercepts `MAILBOX_INTGR0/1` writes and emits 8-byte frames on the `doorbell` chardev (M6), plus an 8 MB lazy-RAM fallback; BAR5 is MSI-X table + PBA + RAM fill (M3); on the reverse direction (M7), the `msix` chardev consumes 8-byte `(offset, db_data)` frames emitted by `r100-imsix`, decodes `vector = db_data & 0x7FF`, and calls `msix_notify()` |
+| `remu_addrmap.h` | — | — | All address constants (from `g_sys_addrmap.h`), plus M6 doorbell offsets (`R100_PCIE_MAILBOX_BASE`, `R100_PCIE_MBX_GROUP{0,1}_SPI`) and M7 iMSIX-DB offsets (`R100_PCIE_IMSIX_BASE`, `R100_PCIE_IMSIX_DB_OFFSET`, `R100_PCIE_IMSIX_VECTOR_MASK`) |
 
 ## FW Source References
 
