@@ -202,7 +202,7 @@ All device models follow the QEMU QOM (QEMU Object Model) pattern:
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| QEMU CPU model | `cortex-a72` + MIDR override to 0x411FD091 (CA73 r1p1) | Functionally closest to CA73 in QEMU; r1p1 MIDR skips CA73 errata workarounds that probe IMP_DEF sysregs cortex-a72 doesn't model |
+| QEMU CPU model | `cortex-a72` + MIDR override to 0x411FD091 (CA73 r1p1) + per-CPU IMPDEF sysreg stubs (`r100_cortex_a73_impdef_regs` in `r100_soc.c`) | Functionally closest to CA73 in QEMU. r1p1 MIDR skips the *revision-gated* CA73 errata whose workarounds probe IMPDEF sysregs cortex-a72 doesn't model. The remaining CA73 workarounds that TF-A compiles in **unconditionally** (notably CVE-2018-3639, `erratum_cortex_a73_3639_wa`) still read/write `S3_0_C15_C0_{0,1,2}` — we register those encodings as RAZ/WI via `define_arm_cp_regs()` so BL1 no longer traps with "Undefined Instruction" before the UART comes up. Cache-timing side-channel mitigations are a no-op on an emulator without a cache model, so RAZ/WI is behaviorally correct. |
 | GIC model | Single GICv3 for all 32 CPUs | Simpler than per-chiplet GIC; sufficient for Phase 1 |
 | QSPI bridge | Address-space read/write | Uses QEMU's `address_space_read/write` for cross-chiplet access |
 | UART priority | `memory_region_add_subregion_overlap` prio=10 | UART must take precedence over config space container |
@@ -214,7 +214,7 @@ All device models follow the QEMU QOM (QEMU Object Model) pattern:
 
 | File | Device | Instances | Key Behavior |
 |------|--------|-----------|--------------|
-| `r100_soc.c` | Machine type | 1 | Creates chiplets, per-chiplet CPU views, CPUs, GIC, per-chiplet UARTs, mailbox RAM |
+| `r100_soc.c` | Machine type | 1 | Creates chiplets, per-chiplet CPU views, CPUs, GIC, per-chiplet UARTs, mailbox RAM. Per CPU: spoofs MIDR to CA73 r1p1 and installs two IMPDEF sysreg tables via `define_arm_cp_regs()` — `r100_samsung_impdef_regs` (Samsung L1/L2 cache-flush SYS op at `S1_1_C15_C14_0`) and `r100_cortex_a73_impdef_regs` (A73 `CPUACTLR/ECTLR/MERRSR_EL1` at `S3_0_C15_C0_{0,1,2}`; unblocks TF-A's CVE-2018-3639 WA) |
 | `r100_cmu.c` | CMU (Clock) | 20 per chiplet | PLL lock = instant, mux_busy = 0 |
 | `r100_pmu.c` | PMU (Power) | 1 per chiplet | Cold reset, all CPUs/clusters ON; `CPU_CONFIGURATION` → `arm_set_cpu_on(mpidr, RVBAR, target_el=3)` at FW-written RVBAR (covers BL1's QSPI-driven cold-boot release, BL2's direct CP1 release, and BL31's PSCI CPU_ON warm-boot release); `read_rvbar()` indexes `SYSREG_CP0_PRIVATE + cluster * PER_SYSREG_CP` so the same path serves CP0 and CP1; DCL config→status mirror |
 | `r100_sysreg.c` | SYSREG | 1 per chiplet | Returns chiplet ID (0-3); CP0 and CP1 RAM triple-mounted per chiplet (private alias + cfg_mr alias + per-chiplet CPU view overlay) — CP0 at `0x1E01010000` / `0x1FF1010000`, CP1 at `0x1E01810000` / `0x1FF1810000` |

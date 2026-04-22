@@ -75,6 +75,51 @@ static const ARMCPRegInfo r100_samsung_impdef_regs[] = {
 };
 
 /*
+ * Cortex-A73 IMPDEF system registers used by the R100 FW.
+ *
+ * The R100 CP is A73-equivalent silicon, but QEMU has no cortex-a73 model —
+ * we use cortex-a72 with MIDR spoofed to r1p1 (see cpuobj init below). QEMU's
+ * stock cortex-regs.c exposes only the A72/A57/A53 encodings of CPU/L2
+ * control registers (op1=1, CRn=15, CRm=2, *). On A73 these registers live
+ * at a different encoding (op1=0, CRn=15, CRm=0, *), which cortex-a72 does
+ * not implement, so any MRS/MSR against them traps as "Undefined Instruction".
+ *
+ * The regs we need to cover, per TF-A's `cortex_a73.S` and runtime errata
+ * checks (`lib/cpus/aarch64/cortex_a73.S`):
+ *
+ *   S3_0_C15_C0_0   CPUACTLR_EL1      — CPU Auxiliary Control; touched
+ *                                       unconditionally by the CVE-2018-3639
+ *                                       workaround (erratum_cortex_a73_3639_wa)
+ *                                       which sets bit 3.
+ *   S3_0_C15_C0_1   CPUECTLR_EL1      — CPU Extended Control; touched by
+ *                                       cpu_get_rev_var helpers and a few
+ *                                       runtime errata paths (gated on r0pX
+ *                                       via MIDR; skipped on our r1p1 spoof,
+ *                                       but model it anyway for safety).
+ *   S3_0_C15_C0_2   CPUMERRSR_EL1     — Memory-error syndrome (RO on silicon).
+ *
+ * Refs:
+ *   external/.../tf-a/lib/cpus/aarch64/cortex_a73.S (erratum_cortex_a73_3639_wa)
+ *   Cortex-A73 TRM §4.5 (System register summary, op1=0 block)
+ *
+ * We model them as RAZ/WI (ARM_CP_CONST, resetvalue=0). The workaround is a
+ * cache-timing side-channel mitigation that has no observable effect in an
+ * emulator without a cache model, so ignoring the store / returning 0 on
+ * load is behaviorally correct.
+ */
+static const ARMCPRegInfo r100_cortex_a73_impdef_regs[] = {
+    { .name = "A73_CPUACTLR_EL1",  .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 0, .opc2 = 0,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "A73_CPUECTLR_EL1",  .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 0, .opc2 = 1,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "A73_CPUMERRSR_EL1", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 0, .opc2 = 2,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+};
+
+/*
  * Per-chiplet CMU block base addresses.
  * Each CMU block is 64KB. The FW initializes PLLs in these blocks
  * during BL1/BL2 boot and polls for lock status.
@@ -1036,10 +1081,12 @@ static void r100_soc_init(MachineState *machine)
          * reset_handler if get_cpu_ops_ptr returns NULL (MIDR mismatch).
          * QEMU has no cortex-a73 model — cortex-a72 is the closest match.
          *
-         * r1p1 (variant=1, revision=1) is past the range of all CA73 errata
-         * workarounds. Otherwise the workarounds (e.g. 852427) try to access
-         * implementation-defined system registers like S3_0_C15_C0_1 that
-         * cortex-a72 doesn't model, triggering an UNDEF exception.
+         * r1p1 (variant=1, revision=1) is past the runtime-gated range of
+         * all CA73 errata workarounds, so the revision-checked paths skip
+         * their IMPDEF register pokes (e.g. erratum 852427). The few WAs
+         * that are compile-time unconditional (notably CVE-2018-3639) still
+         * touch A73 IMPDEF regs — we cover those separately via
+         * r100_cortex_a73_impdef_regs below.
          */
         object_property_set_int(cpuobj, "midr", 0x411FD091, &error_fatal);
 
@@ -1077,6 +1124,11 @@ static void r100_soc_init(MachineState *machine)
 
         /* Install Samsung IMPDEF system-reg stubs (cache flush IMPDEF). */
         define_arm_cp_regs(ARM_CPU(cpuobj), r100_samsung_impdef_regs);
+
+        /* Install Cortex-A73 IMPDEF sysreg stubs (CPUACTLR/ECTLR/MERRSR_EL1)
+         * that the cortex-a72 model doesn't cover. Needed for TF-A's
+         * unconditional CVE-2018-3639 workaround and friends. */
+        define_arm_cp_regs(ARM_CPU(cpuobj), r100_cortex_a73_impdef_regs);
     }
 
     /*

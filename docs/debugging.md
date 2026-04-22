@@ -252,6 +252,31 @@ The `cfg_mr` / `private_alias` catch-alls in `r100_soc.c` absorb most
 undefined accesses silently; anything surfacing in `qemu.log` means the
 miss fell outside even those regions and is genuinely unmapped.
 
+### Early-boot UNDEFs on IMPDEF sysregs
+
+If BL1 produces **zero** bytes of UART output and `--trace`'s
+`qemu.log` shows lines like:
+
+```
+read access to unsupported AArch64 system register op0:3 op1:0 crn:15 crm:<C> op2:<O>
+Taking exception 1 [Undefined Instruction] with ELR 0x1e000xxxxx
+```
+
+…the FW has hit an A73 implementation-defined CPU control register
+that `cortex-a72` doesn't model. The known cases are handled by
+`r100_cortex_a73_impdef_regs[]` in `r100_soc.c` (`S3_0_C15_C0_{0,1,2}`
+= CPUACTLR/ECTLR/MERRSR_EL1), which are registered as RAZ/WI to
+unblock TF-A's unconditional CVE-2018-3639 workaround. If a new TF-A
+release or a new FreeRTOS task ever probes a *different* IMPDEF reg,
+the fix is to extend that table — not to disable the workaround in the
+FW build. Grep any FW ELF for new encodings with:
+
+```
+aarch64-none-elf-objdump -d path/to/binary.elf \
+  | rg -i 's3_[0-9]_c1[15]_c[0-9]+_[0-9]+' \
+  | awk '{print $NF}' | sort -u
+```
+
 ## QEMU monitor (address-map debugging)
 
 Chiplet 0's UART is muxed with the QEMU monitor on stdio. Press
