@@ -194,6 +194,26 @@ void r100_mailbox_set_issr(R100MailboxState *s, uint32_t idx, uint32_t val)
     s->issr_ingress_writes++;
 }
 
+/*
+ * CM7-stub egress: mimic an ISSR write that would normally originate
+ * from the PCIE_CM7 subcontroller's FW. Used by r100-doorbell to
+ * implement the REMU CM7-relay shortcut — on silicon, a host SOFT_RESET
+ * doorbell ends in pcie_soft_reset_handler on CM7, which writes
+ * FW_BOOT_DONE back into PF.ISSR[4] via MMIO; that MMIO write is what
+ * we're simulating here. Updates the backing store *and* emits the
+ * egress frame so the host BAR4 shadow converges, exactly as if CM7
+ * had done `sfr->issr4 = 0xFB0D` on the real chip.
+ */
+void r100_mailbox_cm7_stub_write_issr(R100MailboxState *s, uint32_t idx,
+                                      uint32_t val)
+{
+    if (!s || idx >= R100_MBX_ISSR_COUNT) {
+        return;
+    }
+    s->issr[idx] = val;
+    r100_mailbox_issr_emit(s, idx, val);
+}
+
 static uint64_t r100_mailbox_read(void *opaque, hwaddr addr, unsigned size)
 {
     R100MailboxState *s = R100_MAILBOX(opaque);

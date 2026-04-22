@@ -236,11 +236,19 @@ static uint64_t r100_bar4_mmio_read(void *opaque, hwaddr addr, unsigned size)
 {
     R100NpuPciState *s = opaque;
     uint32_t idx = (uint32_t)(addr >> 2);
+    uint32_t v;
 
     if (idx >= ARRAY_SIZE(s->bar4_mmio_regs)) {
         return 0;
     }
-    return s->bar4_mmio_regs[idx];
+    v = s->bar4_mmio_regs[idx];
+    /* REMU_HOST_TRACE: log reads of the FW_BOOT_DONE slot so we can
+     * correlate KMD poll timing with issr_deliver timestamps. */
+    if (addr >= 0x80 && addr < 0x180) {
+        fprintf(stderr, "REMU-TRACE: bar4_mmio_read off=0x%x -> 0x%x\n",
+                (uint32_t)addr, v);
+    }
+    return v;
 }
 
 static void r100_bar4_mmio_write(void *opaque, hwaddr addr, uint64_t val,
@@ -252,6 +260,13 @@ static void r100_bar4_mmio_write(void *opaque, hwaddr addr, uint64_t val,
 
     if (idx < ARRAY_SIZE(s->bar4_mmio_regs)) {
         s->bar4_mmio_regs[idx] = v32;
+        /* REMU_HOST_TRACE: log KMD writes to the mailbox region so
+         * we can spot a late clear that would overwrite the
+         * 0xfb0d emitted by the NPU. */
+        if (addr >= 0x80 && addr < 0x180) {
+            fprintf(stderr, "REMU-TRACE: bar4_mmio_write off=0x%x val=0x%x\n",
+                    (uint32_t)addr, v32);
+        }
     }
 
     /*
@@ -452,6 +467,15 @@ static void r100_issr_deliver(R100NpuPciState *s, uint32_t off, uint32_t val)
     s->bar4_mmio_regs[off >> 2] = val;
     s->issr_frames_received++;
     r100_issr_emit_debug(s, off, val, "ok");
+    /* REMU_HOST_TRACE: stderr visible in remucli run output.
+     * Echoes the post-write read so we can tell apart
+     *   (a) chardev callback didn't fire
+     *   (b) it fired but the store to bar4_mmio_regs was clobbered later
+     * when FW_BOOT_DONE isn't reaching the guest. */
+    fprintf(stderr, "REMU-TRACE: issr_deliver off=0x%x val=0x%x "
+            "stored=0x%x received=%" PRIu64 "\n",
+            off, val, s->bar4_mmio_regs[off >> 2],
+            s->issr_frames_received);
 }
 
 static void r100_issr_receive(void *opaque, const uint8_t *buf, int size)

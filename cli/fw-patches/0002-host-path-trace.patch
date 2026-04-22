@@ -1,0 +1,268 @@
+diff --git a/drivers/mailbox/mailbox.c b/drivers/mailbox/mailbox.c
+index e4e377d8c..41946845b 100755
+--- a/drivers/mailbox/mailbox.c
++++ b/drivers/mailbox/mailbox.c
+@@ -8,6 +8,11 @@
+ #include "rebel_h_platform.h"
+ #include "rebel_h_chiplet.h"
+ 
++/* REMU_HOST_TRACE — see bootdone_service.c for the rationale. Mirrored
++ * here because the CM7 mailbox ISR is the other half of the breadcrumb
++ * trail and we want the same on/off switch to flip both. */
++#define REMU_HOST_TRACE
++
+ #if defined __TARGET_PCIE
+ #include "rebel_h_baseoffset.h"
+ #include "pcie/pcie_mailbox_callback.h"
+@@ -367,10 +372,30 @@ void ipm_samsung_isr(struct ipm_device *d)
+ 	else
+ 		sfr->intcr1.val |= BIT(chan);
+ 
++#ifdef REMU_HOST_TRACE
++	/*
++	 * REMU: trace every mailbox IRQ the CM7 ISR is about to dispatch.
++	 * Under --host the kmd rings doorbells long before bootdone_task has
++	 * a chance to emit FW_BOOT_DONE, and we need a ground-truth breadcrumb
++	 * that (a) the IRQ actually reached the CA73 (INTMSR decoded, GIC
++	 * delivered, our mailbox/doorbell chardev bridge ordering is right)
++	 * and (b) which channel / cpu_id the callback is about to run with,
++	 * independent of whatever RLOG-ring drain state the boot happens to
++	 * be in. printf goes straight to UART so it survives FreeRTOS being
++	 * wedged in the very ISR we are tracing.
++	 */
++	printf("REMU-TRACE: ipm_isr inst=%d cpu=%d chan=%d\r\n",
++	       inst, (int)d->cpu_id, chan);
++#endif
++
+ 	if (d->callback) {
+ 		d->callback(inst, chan);
+ 	}
+ 
++#ifdef REMU_HOST_TRACE
++	printf("REMU-TRACE: ipm_isr inst=%d chan=%d done\r\n", inst, chan);
++#endif
++
+ 	enable_all_interrupts();
+ }
+ 
+diff --git a/drivers/pcie/pcie_mailbox_callback.c b/drivers/pcie/pcie_mailbox_callback.c
+index 46bf88b07..d6c407f15 100644
+--- a/drivers/pcie/pcie_mailbox_callback.c
++++ b/drivers/pcie/pcie_mailbox_callback.c
+@@ -41,6 +41,7 @@
+ #include "rebel_h_img_info.h"
+ #include "rebel_h_bootmgr.h"
+ #include <rbln/bits.h>
++#include <rbln/doorbell.h>
+ #include "rl_sizes.h"
+ #include "pcie_dw_iatu.h"
+ #include "ats.h"
+@@ -51,6 +52,16 @@
+ #include "pcie_rebelh.h"
+ #include "sysreg_buscsr_cp.h"
+ 
++/* REMU_HOST_TRACE — see bootdone_service.c for the rationale. On CA73
++ * FreeRTOS builds this whole file is excluded by the driver's
++ * CMakeLists.txt (see gate on FREERTOS_PORT != GCC_ARM_CA73), so the
++ * breadcrumbs below are latent in the tree — they start producing
++ * uart-visible output the moment REMU grows a CM7 model and compiles
++ * this file in for that target. Until then, the host-side SOFT_RESET
++ * handshake is short-circuited entirely in QEMU by the CM7-stub in
++ * src/machine/r100_doorbell.c. */
++#define REMU_HOST_TRACE
++
+ static soft_reset_ctrl_t g_soft_reset_ctrl[MAX_CHIPLET_COUNT] = { 0, };
+ 
+ /* error injection helper function. */
+@@ -132,6 +143,20 @@ int32_t soft_reset_handler(uint8_t reset_flag, uint32_t timeout)
+ 	volatile struct sysreg_buscsr_cp_register *buscsr_cp0 =
+ 		(void *)IP_BLK_PRIV_REG_BAT_BASE + SYSREG_BUSCSR_CP0_REG_OFFSET;
+ 
++#ifdef REMU_HOST_TRACE
++	/*
++	 * REMU: soft_reset_handler drives PMU cluster down/up sequencing that
++	 * the QEMU PMU model does not emulate — every pmu_wait_chiplet_cluster_*
++	 * will spin 10M iterations on a register that never changes value and
++	 * return RL_TIMEOUT. Trace entry / exit so we can prove that (a) the
++	 * kmd's SOFT_RESET doorbell actually reached here, (b) how long the
++	 * RL_TIMEOUT fallbacks take, and (c) which of the chained waits
++	 * returned early (the first RL_TIMEOUT short-circuits the whole thing).
++	 */
++	printf("REMU-TRACE: soft_reset_handler enter flag=0x%x timeout=%u\r\n",
++	       reset_flag, timeout);
++#endif
++
+ 	pmu_set_local_chiplet_reset_status(CL_RST_EVENT);
+ 
+ 	pcie_dbg_log("pcie_soft_reset_handler called. reset_flag=0x%x\n", reset_flag);
+@@ -278,6 +303,9 @@ int32_t soft_reset_handler(uint8_t reset_flag, uint32_t timeout)
+ 			return RL_TIMEOUT;
+ 	}
+ 
++#ifdef REMU_HOST_TRACE
++	printf("REMU-TRACE: soft_reset_handler exit RL_OK\r\n");
++#endif
+ 	return RL_OK;
+ }
+ 
+@@ -338,6 +366,19 @@ static void pcie_soft_reset_handler(const int inst, const int val)
+ {
+ 	uint8_t reset_flag = 0xF;
+ 	uint32_t num_vfs = pcie_get_vfnum();
++#ifdef REMU_HOST_TRACE
++	int32_t ret = 0;
++
++	/*
++	 * REMU: the host kmd's rbln_init always rings SOFT_RESET on probe.
++	 * Trace the outer dispatch so we can differentiate "the handler was
++	 * called but the inner wait timed out" from "the ISR never reached
++	 * here at all" — two very different failure modes on a run where the
++	 * host dmesg reports FW_BOOT_DONE=0 after 3 s.
++	 */
++	printf("REMU-TRACE: pcie_soft_reset_handler inst=%d val=0x%x nvfs=%u\r\n",
++	       inst, val, num_vfs);
++#endif
+ 
+ 	pcie_dbg_log("pcie_reset_handler val: %d\n", val);
+ 	switch (val) {
+@@ -350,13 +391,22 @@ static void pcie_soft_reset_handler(const int inst, const int val)
+ 				return;
+ 			}
+ 		}
++#ifdef REMU_HOST_TRACE
++		ret = soft_reset_handler(reset_flag, 10000000);
++		printf("REMU-TRACE: soft_reset_handler returned %d (flag=0x%x)\r\n",
++		       ret, reset_flag);
++#else
+ 		soft_reset_handler(reset_flag, 10000000);
++#endif
+ 		break;
+ 	default:
+ 		pcie_err_log("pcie_reset_handler error val: %d\n", val);
+ 		break;
+ 	}
+ 	pcie_dbg_log("pcie_reset_handler end\n");
++#ifdef REMU_HOST_TRACE
++	printf("REMU-TRACE: pcie_soft_reset_handler end\r\n");
++#endif
+ }
+ 
+ #define REBEL_EVENT_IRQ_NUMBER	8
+@@ -437,15 +487,34 @@ void pcie_host2cm7_callback(const int inst, const int channel)
+ {
+ 	uint32_t val;
+ 
++#ifdef REMU_HOST_TRACE
++	/*
++	 * REMU: every host→CM7 doorbell takes exactly one trip through this
++	 * dispatcher. Log inst + channel *before* the bounds check so we can
++	 * see host-side REBEL_DOORBELL_UEVENT (channel 6 on INTGR1, beyond
++	 * PCIE_DOORBELL_NUM=4) being rejected by the err_log path as well
++	 * as the in-range channels that actually dispatch.
++	 */
++	printf("REMU-TRACE: host2cm7 inst=%d ch=%d\r\n", inst, channel);
++#endif
++
+ 	if (channel >= PCIE_DOORBELL_NUM) {
+ 		pcie_err_log("pcie_host2cm7_callback error channel: %d\n", channel);
+ 		return;
+ 	}
+ 
+ 	ipm_samsung_receive(inst, &val, sizeof(val), channel + 32);
++#ifdef REMU_HOST_TRACE
++	printf("REMU-TRACE: host2cm7 inst=%d ch=%d val=0x%x -> cb\r\n",
++	       inst, channel, val);
++#endif
+ 	pcie_doorbell_cb_table[channel](inst, val);
+ 	val = 0;
+ 	ipm_samsung_write(inst, CHIPLET_ID, &val, sizeof(val), channel + 32);
++
++#ifdef REMU_HOST_TRACE
++	printf("REMU-TRACE: host2cm7 inst=%d ch=%d done\r\n", inst, channel);
++#endif
+ }
+ 
+ int pcie_mailbox_init(void)
+diff --git a/osl/FreeRTOS/Source/services/bootdone_service/bootdone_service.c b/osl/FreeRTOS/Source/services/bootdone_service/bootdone_service.c
+index 94a870b67..022154a8c 100644
+--- a/osl/FreeRTOS/Source/services/bootdone_service/bootdone_service.c
++++ b/osl/FreeRTOS/Source/services/bootdone_service/bootdone_service.c
+@@ -66,6 +66,25 @@ REGISTER_FILE_NUM(LOG_ID_BOOTDONE_TASK);
+ #define FW_LOAD_MASK				0x0000ffff
+ #define FW_BOOT_DONE				0xFB0D	/* D2H */
+ 
++/*
++ * REMU_FAST_BOOTDONE — shortcut for the REMU functional emulator.
++ *
++ * The late-boot phases gated by bootdone_task (SPI sysinfo retrieval, RoT
++ * handshake via request_to_cmrt, DVFS voltage request, rl_sysinfo_broadcast,
++ * CL3 FW sync over IPM) rely on silicon blocks REMU does not model. Running
++ * them inside QEMU either returns -EBUSY from a synchronous SPI stub or
++ * blocks forever on a mailbox wait, preventing bootdone_task from ever
++ * reaching bootdone_notify_to_host(PCIE_PF).
++ *
++ * When REMU_FAST_BOOTDONE is defined (always, in-tree, carried as a
++ * versioned patch under cli/fw-patches/), CL0 skips directly from the
++ * pf_bootdone_status poll (which succeeds because set_chiplet_bootdone_status
++ * is called on every chiplet) to bootdone_notify_to_host(PCIE_PF), emitting
++ * FW_BOOT_DONE to ISSR[4] on the PF mailbox. This is what the host-side kmd
++ * actually polls for, so for REMU's Phase 1 + Phase 2 scope it is sufficient.
++ */
++#define REMU_FAST_BOOTDONE
++
+ void update_sw_ver_info(bool secureboot_done)
+ {
+ 	int ret = RL_ERROR;
+@@ -410,6 +429,13 @@ exit:
+ 	taskEXIT_CRITICAL();
+ }
+ 
++/*
++ * REMU_HOST_TRACE — UART breadcrumbs on the --host boot path. See
++ * cli/fw-patches/0002-host-path-trace.patch for the rationale; it is
++ * carried in-tree next to REMU_FAST_BOOTDONE so both flip together.
++ */
++#define REMU_HOST_TRACE
++
+ void bootdone_task(void *param)
+ {
+ 	uint32_t cl_id, boot_state;
+@@ -424,6 +450,17 @@ void bootdone_task(void *param)
+ 	uint32_t num_vfs = 0;
+ #endif
+ 
++#ifdef REMU_HOST_TRACE
++	/*
++	 * REMU: the HILS ring is drained asynchronously every 50 ms, so a
++	 * single RLOG at task entry can be lost if the scheduler wedges
++	 * almost immediately afterwards. A plain printf hits UART0 straight
++	 * from the FreeRTOS task context and survives ISR-disabled spin
++	 * loops downstream. This is our primary ground-truth signal that
++	 * bootdone_task ever reached the CPU under --host.
++	 */
++	printf("REMU-TRACE: bootdone_task enter\r\n");
++#endif
+ 	RLOG_DBG("bootdone task is started\r\n");
+ 	cl_id = CHIPLET_ID;
+ 	RLOG_DBG("%s: chiplet[%d]\r\n", __func__, cl_id);
+@@ -514,6 +551,20 @@ void bootdone_task(void *param)
+ 				goto ret;
+ 			}
+ 		}
++#ifdef REMU_FAST_BOOTDONE
++		/*
++		 * REMU: skip the unmodelled late-boot phases (SPI sysinfo /
++		 * RoT request_to_cmrt / DVFS / rl_sysinfo_broadcast / CL3 FW
++		 * sync over IPM) and jump straight to notifying the host.
++		 * See the REMU_FAST_BOOTDONE block comment at the top of this
++		 * file for the rationale.
++		 */
++		printf("REMU: fast bootdone path\r\n");
++		RLOG_DBG("REMU: fast bootdone path\r\n");
++		bootdone_notify_to_host(PCIE_PF);
++		rl_bootstat_set_boot_done();
++		goto ret;
++#endif
+ #if defined(CP_SERVICE_ENABLED) && !defined(CP_ENABLE_SANITY)
+ 		/* Poll hils_check_product_info_ready until it returns RL_OK for 3 seconds */
+ 		{

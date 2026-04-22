@@ -36,6 +36,7 @@ QEMU_BUILD = REMU_ROOT / "build" / "qemu"
 QEMU_BIN = QEMU_BUILD / "qemu-system-aarch64"
 QEMU_BIN_X86 = QEMU_BUILD / "qemu-system-x86_64"
 QEMU_PATCHES = REMU_ROOT / "cli" / "qemu-patches"
+FW_PATCHES = REMU_ROOT / "cli" / "fw-patches"
 MACHINE_SRC = REMU_ROOT / "src" / "machine"
 HOST_SRC = REMU_ROOT / "src" / "host"
 INCLUDE_SRC = REMU_ROOT / "src" / "include"
@@ -202,14 +203,14 @@ def _patch_meson():
     return changed
 
 
-def _apply_qemu_patches():
-    """Idempotently apply every *.patch file under cli/qemu-patches/ to
-    external/qemu. Uses `git apply --check` to decide whether a patch is
-    already present (reverse-apply check) and skips it in that case, so
+def _apply_patches(patches_dir, target_dir, label):
+    """Idempotently apply every *.patch file under `patches_dir` to the
+    git tree at `target_dir`. `git apply --reverse --check` decides
+    whether a patch is already present and skips it in that case, so
     repeat builds and fresh clones both end up in the same state."""
-    if not QEMU_PATCHES.is_dir():
+    if not patches_dir.is_dir():
         return
-    patches = sorted(QEMU_PATCHES.glob("*.patch"))
+    patches = sorted(patches_dir.glob("*.patch"))
     if not patches:
         return
     for patch in patches:
@@ -217,22 +218,39 @@ def _apply_qemu_patches():
         # current tree matches the post-patch state.
         reverse_check = subprocess.run(
             ["git", "apply", "--reverse", "--check", str(patch)],
-            cwd=QEMU_SRC, capture_output=True,
+            cwd=target_dir, capture_output=True,
         )
         if reverse_check.returncode == 0:
             continue
         # Confirm the patch applies cleanly to the current tree before doing it.
         forward_check = subprocess.run(
             ["git", "apply", "--check", str(patch)],
-            cwd=QEMU_SRC, capture_output=True,
+            cwd=target_dir, capture_output=True,
         )
         if forward_check.returncode != 0:
-            click.secho("  Patch %s does not apply cleanly:" % patch.name,
-                        fg="red")
+            click.secho("  %s patch %s does not apply cleanly:" %
+                        (label, patch.name), fg="red")
             click.echo(forward_check.stderr.decode("utf-8", "replace"))
             raise SystemExit(1)
-        subprocess.run(["git", "apply", str(patch)], cwd=QEMU_SRC, check=True)
-        click.echo("  Applied %s" % patch.name)
+        subprocess.run(["git", "apply", str(patch)],
+                       cwd=target_dir, check=True)
+        click.echo("  Applied %s %s" % (label, patch.name))
+
+
+def _apply_qemu_patches():
+    """Idempotently apply every *.patch file under cli/qemu-patches/ to
+    external/qemu."""
+    _apply_patches(QEMU_PATCHES, QEMU_SRC, "qemu")
+
+
+def _apply_fw_patches():
+    """Idempotently apply every *.patch file under cli/fw-patches/ to the
+    q-sys firmware submodule (external/ssw-bundle/products/rebel/q/sys).
+    These carry the REMU-side tweaks that let the unmodified upstream
+    firmware boot all the way to FW_BOOT_DONE inside a purely functional
+    emulator (skipping unmodelled RoT / SPI / DVFS / sysinfo-broadcast
+    paths that would otherwise deadlock bootdone_task)."""
+    _apply_patches(FW_PATCHES, SSW_SYS, "fw")
 
 
 def _run(cmd, cwd=None, check=True, **kwargs):
@@ -433,6 +451,13 @@ def fw_build(components, platform, mode, chiplets, clean, install):
                (",".join(targets), platform, mode, chiplets))
     click.echo("  ARM64: %s" % env["COMPILER_PATH_ARM64"])
     click.echo("  ARM32: %s" % env["COMPILER_PATH_ARM32"])
+
+    # Apply REMU-side firmware patches before invoking build.sh so the
+    # shortcut-through-unmodelled-silicon tweaks (e.g. REMU_FAST_BOOTDONE
+    # in bootdone_service.c) are baked into every build without relying
+    # on an out-of-tree manual edit of the submodule.
+    click.echo("Applying FW source patches...")
+    _apply_fw_patches()
 
     for i, target in enumerate(targets):
         click.echo()
@@ -1540,7 +1565,9 @@ def run(name, output_root, gdb, trace, chiplets, memory,
                 break
         click.echo()
 
-        npu_proc = subprocess.Popen(npu_cmd)
+        npu_stderr_log = npu_dir / "qemu.stderr.log"
+        _npu_se = open(npu_stderr_log, "wb")
+        npu_proc = subprocess.Popen(npu_cmd, stderr=_npu_se)
 
         # Wait for both QEMUs to actually mmap the shared file. QEMU
         # does this very early (before CPU start), so a short poll is

@@ -42,7 +42,7 @@ match the driver's size checks in `rebel_check_pci_bars_size`:
 |-----|------|------|
 | 0   | 64 GB (>= 36 GB `RBLN_DRAM_SIZE`) | DDR — first 128 MB = `/dev/shm` shared file, tail = lazy RAM |
 | 2   | 64 MB (= `RBLN_SRAM_SIZE`)        | ACP / SRAM / logbuf (lazy RAM) |
-| 4   | 8 MB  (= `RBLN_PERI_SIZE`)        | Doorbells — 4 KB MMIO head intercepts `MAILBOX_INTGR{0,1}` writes (M6) and `MAILBOX_BASE` payload writes (M8a, host → NPU ISSR) and forwards them to the NPU as 8-byte chardev frames on the same `doorbell` socket; the `MAILBOX_BASE` range also acts as a read-through shadow of the NPU's ISSR state, fed by frames arriving on the `issr` chardev (M8a, NPU → host ISSR); rest is lazy RAM |
+| 4   | 8 MB  (= `RBLN_PERI_SIZE`)        | Doorbells — 4 KB MMIO head intercepts `MAILBOX_INTGR{0,1}` writes (M6) and `MAILBOX_BASE` payload writes (M8a, host → NPU ISSR) and forwards them to the NPU as 8-byte chardev frames on the same `doorbell` socket; the `MAILBOX_BASE` range also acts as a read-through shadow of the NPU's ISSR state, fed by frames arriving on the `issr` chardev (M8a, NPU → host ISSR); on the NPU side, `INTGR0` bit 0 (`SOFT_RESET`) triggers the QEMU-side CM7-stub shortcut (M8b Stage 3a), which synthesises `FW_BOOT_DONE` back into PF.ISSR[4] without involving the unmodelled PCIE_CM7 subcontroller; rest is lazy RAM |
 | 5   | 1 MB  (= `RBLN_PCIE_SIZE`)        | MSI-X table (32 vectors) + PBA — `msix_notify()` target for frames coming back from the NPU `r100-imsix` device (M7) |
 
 Both QEMUs open the same 128 MB memory-backed file at
@@ -155,6 +155,27 @@ platform is `silicon` / `zebu` / `zebu_ci` / `zebu_vdk`; `--install` (default
 on) copies the 6 CA73 binaries into `images/`. Toolchains are taken from
 `COMPILER_PATH_ARM64` / `COMPILER_PATH_ARM32` env vars, with defaults under
 `/mnt/data/tools/...`.
+
+Before invoking `build.sh`, `fw-build` idempotently applies every
+`cli/fw-patches/*.patch` to the q-sys submodule — same
+forward/reverse check dance as `cli/qemu-patches/`. These carry the
+REMU-side tweaks that let the unmodified upstream firmware boot all
+the way to `FW_BOOT_DONE` inside a purely functional emulator:
+
+- `0001-bootdone-remu-fast-path.patch`: `REMU_FAST_BOOTDONE` shortcut in
+  `bootdone_service.c` — skips the unmodelled late-boot phases (RoT
+  handshake, DVFS voltage, sysinfo broadcast over HBM mailboxes) that
+  would otherwise block `bootdone_task` short of
+  `bootdone_notify_to_host(PCIE_PF)`.
+- `0002-host-path-trace.patch`: `REMU_HOST_TRACE` breadcrumbs in
+  `ipm_samsung_isr`, `bootdone_task`, and (latent, not compiled on
+  CA73) the PCIe soft-reset dispatch path — prints entry/exit with
+  `inst` / `cpu_id` / `chan` / `val` so the NPU's soft-reset sequence
+  is traceable on `uart0.log`.
+
+The runtime-side counterpart to the firmware `SOFT_RESET` handler is
+the CM7-stub in `src/machine/r100_doorbell.c` (M8b Stage 3a) — see
+the BAR4 row above and `docs/debugging.md` for the handshake recipe.
 
 ## Project layout
 

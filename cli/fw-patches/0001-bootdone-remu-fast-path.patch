@@ -1,0 +1,70 @@
+REMU: bootdone_service — fast-path to FW_BOOT_DONE on CL0
+
+REMU is a purely functional emulator and does not model the silicon blocks
+that bootdone_task consults after pf_bootdone_status converges (SPI sysinfo
+flash, CMRT-backed RoT handshake via request_to_cmrt, DVFS HW_CFG voltage,
+rl_sysinfo_broadcast over HBM mailboxes, CL3 dedicated-flash sync over IPM).
+In QEMU, these either return -EBUSY from a synchronous SPI stub or block
+forever on a mailbox wait, so bootdone_task never reaches
+bootdone_notify_to_host(PCIE_PF) — which is precisely what the host kmd
+polls for (FW_BOOT_DONE = 0xFB0D in ISSR[4] on the PF mailbox).
+
+Add a REMU_FAST_BOOTDONE shortcut that, on CL0 and once every chiplet's
+set_chiplet_bootdone_status(cl_id) has flagged PF bootdone-mask convergence,
+skips all the unmodelled phases and emits the host notification directly.
+CL1/2/3 still fall through to the hils_reg_base setup they need.
+
+This patch lives under cli/fw-patches/ and is auto-applied by
+./remucli fw-build so it cannot be silently lost on a submodule refresh.
+
+diff --git a/osl/FreeRTOS/Source/services/bootdone_service/bootdone_service.c b/osl/FreeRTOS/Source/services/bootdone_service/bootdone_service.c
+index 94a870b67..c659843d6 100644
+--- a/osl/FreeRTOS/Source/services/bootdone_service/bootdone_service.c
++++ b/osl/FreeRTOS/Source/services/bootdone_service/bootdone_service.c
+@@ -66,6 +66,25 @@ REGISTER_FILE_NUM(LOG_ID_BOOTDONE_TASK);
+ #define FW_LOAD_MASK				0x0000ffff
+ #define FW_BOOT_DONE				0xFB0D	/* D2H */
+ 
++/*
++ * REMU_FAST_BOOTDONE — shortcut for the REMU functional emulator.
++ *
++ * The late-boot phases gated by bootdone_task (SPI sysinfo retrieval, RoT
++ * handshake via request_to_cmrt, DVFS voltage request, rl_sysinfo_broadcast,
++ * CL3 FW sync over IPM) rely on silicon blocks REMU does not model. Running
++ * them inside QEMU either returns -EBUSY from a synchronous SPI stub or
++ * blocks forever on a mailbox wait, preventing bootdone_task from ever
++ * reaching bootdone_notify_to_host(PCIE_PF).
++ *
++ * When REMU_FAST_BOOTDONE is defined (always, in-tree, carried as a
++ * versioned patch under cli/fw-patches/), CL0 skips directly from the
++ * pf_bootdone_status poll (which succeeds because set_chiplet_bootdone_status
++ * is called on every chiplet) to bootdone_notify_to_host(PCIE_PF), emitting
++ * FW_BOOT_DONE to ISSR[4] on the PF mailbox. This is what the host-side kmd
++ * actually polls for, so for REMU's Phase 1 + Phase 2 scope it is sufficient.
++ */
++#define REMU_FAST_BOOTDONE
++
+ void update_sw_ver_info(bool secureboot_done)
+ {
+ 	int ret = RL_ERROR;
+@@ -514,6 +533,20 @@ void bootdone_task(void *param)
+ 				goto ret;
+ 			}
+ 		}
++#ifdef REMU_FAST_BOOTDONE
++		/*
++		 * REMU: skip the unmodelled late-boot phases (SPI sysinfo /
++		 * RoT request_to_cmrt / DVFS / rl_sysinfo_broadcast / CL3 FW
++		 * sync over IPM) and jump straight to notifying the host.
++		 * See the REMU_FAST_BOOTDONE block comment at the top of this
++		 * file for the rationale.
++		 */
++		printf("REMU: fast bootdone path\r\n");
++		RLOG_DBG("REMU: fast bootdone path\r\n");
++		bootdone_notify_to_host(PCIE_PF);
++		rl_bootstat_set_boot_done();
++		goto ret;
++#endif
+ #if defined(CP_SERVICE_ENABLED) && !defined(CP_ENABLE_SANITY)
+ 		/* Poll hils_check_product_info_ready until it returns RL_OK for 3 seconds */
+ 		{

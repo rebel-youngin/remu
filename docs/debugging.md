@@ -99,6 +99,9 @@ output/
     issr.log          # host-side ASCII trace of every NPU→host ISSR (offset, value) frame (M8a)
     npu/
       monitor.sock    # NPU HMP monitor (unix socket)
+      qemu.stderr.log # NPU QEMU stderr — captures fprintf(stderr, ...) breadcrumbs from
+                      #   device models (r100-doorbell, r100-mailbox, r100-npu-pci), the
+                      #   only way to see QEMU-internal state that doesn't flow through UART
       info-mtree.log  # captured info mtree — chiplet0.dram splice
       info-mtree-imsix.log  # captured info mtree — r100-imsix MMIO @ 0x1BFFFFF000 (M7)
       info-qtree.log  # captured info qtree — confirms r100-doorbell + r100-mailbox
@@ -472,6 +475,86 @@ that both QEMUs are up and that `output/<name>/host/issr.sock` exists.
 prints pass/fail to stdout (non-fatal — the NPU still boots for
 post-mortem poking if the wiring is missing).
 
+### KMD soft-reset handshake — CM7-stub (M8b Stage 3a)
+
+The host `kmd`'s `rbln_init` probe path always rings
+`REBEL_DOORBELL_SOFT_RESET` on BAR4 `MAILBOX_INTGR0` bit 0 and then
+blocks in `rebel_reset_done` waiting for PF.ISSR[4] to re-become
+`FW_BOOT_DONE` (0xFB0D). On silicon this is the PCIe CM7
+subcontroller's job — it catches the INTGR on SPI 184, runs
+`pcie_soft_reset_handler` (PMU cluster down/up, then
+`bootdone_task` reruns and rewrites ISSR[4] on the way back up).
+REMU models neither the CM7 nor the PMU reset sequence, and on
+CA73 FreeRTOS builds the PCIe mailbox ISR resolves to `default_cb`
+(`drivers/pcie/pcie_mailbox_callback.c` is gated
+`FREERTOS_PORT != GCC_ARM_CA73` by its `CMakeLists.txt`). Net
+effect without a fix: kmd times out after 3 s and the probe
+fails.
+
+The fix lives **entirely in QEMU** as a CM7-stub in
+`src/machine/r100_doorbell.c`. Schematic of the shortcut:
+
+```
+host guest           (silicon)         REMU shortcut
+   │                   │                   │
+   │ BAR4+0x08 = 1     │                   │
+   │──────────────────▶│ SPI 184 → CM7     │ ──┐
+                       │ ipm_samsung_isr   │   │  intercept at
+                       │ pcie_host2cm7_cb  │   │  doorbell frame
+                       │ pcie_soft_reset   │   │  decode
+                       │ PMU down/up       │   │
+                       │ bootdone_task     │   │
+                       │ PF.ISSR[4]=0xFB0D │◀──┘  r100_mailbox_cm7_stub_write_issr
+                                                  updates state + emits issr frame
+                   ▲                        ▲
+                   └──── same visible ──────┘
+                         side-effect
+```
+
+Concretely, on an `INTGR0` frame with bit 0 set the doorbell
+calls `r100_mailbox_cm7_stub_write_issr(pf_mailbox, 4, 0xFB0D)` —
+a helper in `r100_mailbox.c` that updates PF.ISSR[4] **and**
+emits the NPU→host `issr` egress frame so the host BAR4 shadow
+converges. Other bits in the same write are relayed onto
+VF0.INTGR1 for CA73-ISR visibility (`default_cb` is a no-op, but
+the IRQ trace is still useful). The `pf-mailbox` `DEFINE_PROP_LINK`
+on the doorbell is wired from `r100_soc.c` at machine-init time.
+
+Quick verification recipe (after `./remucli run --host` has
+settled):
+
+```
+# 1. host guest saw FW_BOOT_DONE in dmesg?
+rg -nE 'rebel_soft_reset|FW_BOOT_DONE' output/<name>/host/serial.log
+#   → [... .XXXXXX] rebellions rbln0: [rbln-rbl] rebel_soft_reset + 0
+#   → [... .XXXXXX] rebellions rbln0: [rbln-rbl] FW_BOOT_DONE
+
+# 2. ISSR egress actually fired?
+grep '0x90.*0xfb0d' output/<name>/issr.log
+#   → issr off=0x90 val=0xfb0d status=ok count=1
+
+# 3. Doorbell bit pattern from the kmd?
+rg 'doorbell_deliver' output/<name>/npu/qemu.stderr.log | head
+#   → REMU-TRACE: doorbell_deliver off=0x8 val=0x1 count=3
+#     (bit 0 set = SOFT_RESET, triggers the stub)
+```
+
+If step 1 shows `rebel_soft_reset + 0` but no `FW_BOOT_DONE`
+follow-up, walk step 2 (egress frame) → step 3 (doorbell frame
+actually arrived) → the M8a shadow-check recipe above (host BAR4
+`xp /1wx` on `0xfe000090` must read `0xfb0d`) to localise the
+break. Empty `qemu.stderr.log` means the `./remucli run --host`
+redirect failed to open the file — confirm the run directory
+exists and is writable.
+
+The stub is deliberately silicon-agnostic: it does not simulate
+the PMU reset or re-run `bootdone_task`, it only reproduces the
+one externally-visible side-effect the host kmd is actually
+polling for. When REMU eventually grows a CM7 model, the
+`REMU_HOST_TRACE` breadcrumbs in
+`drivers/pcie/pcie_mailbox_callback.c` light up automatically and
+this shortcut can be retired.
+
 ### x86 Linux guest boot (M8b Stage 2)
 
 Until M8b Stage 2, the x86 side of `./remucli run --host` stopped at
@@ -550,7 +633,7 @@ CLI overrides (all on `./remucli run`):
 | `--no-guest-boot`       | Skip all of the above, stay on SeaBIOS idle      |
 | `--guest-cmdline-extra` | Extra kernel cmdline tokens (e.g. `loglevel=7`)  |
 
-**Expected `output/<name>/host/serial.log` timeline on a healthy Stage 2 run:**
+**Expected `output/<name>/host/serial.log` timeline on a healthy Stage 3a run:**
 
 ```
 Linux version 6.8.0-107-generic … boot banner
@@ -567,13 +650,32 @@ rebellions 0000:00:05.0: [BAR-2/ACP]      size 0x4000000
 rebellions 0000:00:05.0: [BAR-4/DOORBELL] size 0x800000
 rebellions 0000:00:05.0: [BAR-5/PCIE]     size 0x100000
 rebellions rbln0: msix vectors count: requested 32, supported 32
-rebellions rbln0: FW_BOOT_DONE                           ← success marker
+rebellions rbln0: [rbln-rbl] rebel_soft_reset + 0         ← kmd rings INTGR0 SOFT_RESET
+rebellions rbln0: [rbln-rbl] FW_BOOT_DONE                 ← CM7-stub responded (Stage 3a)
 ```
 
 If `FW_BOOT_DONE` never shows up, walk the NPU side: `issr.log`
 should contain `off=0x90 val=0xfb0d`, then host-side `xp /1wx
-0xfe000090` on `monitor.sock` should read back `0xfb0d`. See M8a's
-section above for the shadow-check recipe.
+0xfe000090` on `monitor.sock` should read back `0xfb0d`. See the
+CM7-stub (Stage 3a) subsection above for the full shadow-check recipe.
+
+**Known next wait-state (M8b Stage 3b, in progress).** After
+`FW_BOOT_DONE`, kmd continues into `rebel_hw_init` where it hits a
+soft-lockup at t+25 s:
+
+```
+watchdog: BUG: soft lockup - CPU#0 stuck for 26s! [kworker/…:rbln_probe]
+…
+Call Trace:
+  rebel_hw_init+0x439/0xa60 [rebellions]
+  rbln_device_init_async+0x46/0x470 [rebellions]
+  rbln_async_probe_worker+0x42/0x2f0 [rebellions]
+```
+
+This is the subsequent unmodelled FW wait-state — decode what
+`rebel_hw_init` is polling for (likely another ISSR or the
+`TEST_IB` shared-DRAM ring handshake), then either wire it up on
+the FW side or synthesise it in QEMU analogous to the CM7-stub.
 
 ## Interpreting a boot log
 

@@ -81,6 +81,15 @@ struct R100DoorbellState {
     CharBackend chr;        /* ingress channel from host r100-npu-pci */
     CharBackend debug_chr;  /* optional: human-readable tail chardev */
     R100MailboxState *mailbox; /* link<r100-mailbox>: INTGR write sink */
+    /*
+     * Optional PF mailbox link for the REMU CM7-relay shortcut. On
+     * silicon, the host's INTGR0 SOFT_RESET doorbell is serviced by
+     * PCIE_CM7's pcie_soft_reset_handler, which re-emits FW_BOOT_DONE
+     * (0xFB0D) into PF.ISSR[4] via MMIO. REMU does not model CM7, so
+     * when this link is set we synthesise the same ISSR egress here
+     * in the doorbell path — see r100_doorbell_deliver().
+     */
+    R100MailboxState *pf_mailbox;
 
     /* Reassembly buffer: frames arrive as one write() on the host
      * side, but char-socket may still split a single frame across
@@ -127,6 +136,11 @@ static void r100_doorbell_deliver(R100DoorbellState *s,
     s->last_offset = off;
     s->last_value = val;
 
+    /* REMU_HOST_TRACE: visible in NPU qemu.stderr.log */
+    fprintf(stderr, "REMU-TRACE: doorbell_deliver off=0x%x val=0x%x count=%" PRIu64 "\n",
+            off, val, s->frames_received);
+    fflush(stderr);
+
     /*
      * BAR4 frames fall into three classes distinguished by offset:
      *
@@ -149,7 +163,48 @@ static void r100_doorbell_deliver(R100DoorbellState *s,
      *               traceable in the -D log.
      */
     if (off == R100_BAR4_MAILBOX_INTGR0) {
-        r100_mailbox_raise_intgr(s->mailbox, 0, val);
+        /*
+         * REMU CM7-relay shortcut.
+         *
+         * Silicon path: host BAR4 INTGR0 write → PCIE_CM7 fires on SPI
+         * 184 → ipm_samsung_isr → pcie_host2cm7_callback →
+         * pcie_doorbell_cb_table[channel]. Channel 0 (SOFT_RESET) runs
+         * pcie_soft_reset_handler, which tears clusters down + back up
+         * via PMU and eventually re-emits FW_BOOT_DONE to PF.ISSR[4].
+         *
+         * REMU path: we model neither CM7 nor the PMU reset sequence,
+         * and the CA73 q-sys ISR table binds IDX_MAILBOX_PCIE_VF0 to
+         * `default_cb` (the PCIE-specific handlers in
+         * external/.../drivers/pcie/pcie_mailbox_callback.c are
+         * compiled only for __TARGET_PCIE / CM7 — see that file's
+         * CMakeLists.txt). So we short-circuit CM7 right here in QEMU:
+         *
+         *   - SOFT_RESET (bit 0): write 0xFB0D (FW_BOOT_DONE) into
+         *     PF.ISSR[4] via the CM7 stub helper and emit the ISSR
+         *     egress frame, so the host BAR4 shadow at +0x90 converges
+         *     and `rebel_reset_done` observes the expected value.
+         *
+         *   - Other bits (VF2PF_RESET, HEARTBEAT, SOFT_RESET_CTRL,
+         *     ...): relay onto VF0.INTGR1 so the CA73 CP-side ISR at
+         *     least gets a visible IRQ + `REMU-TRACE: ipm_isr` entry
+         *     in uart0.log. default_cb won't do anything useful, but
+         *     we prefer a visible no-op over a silent drop.
+         *
+         * VF0.INTSR0/INTGR0 is intentionally left untouched — q-sys
+         * doesn't subscribe to SPI 184, and latching pending bits
+         * there would just noise up HMP dumps without any observer.
+         */
+        if ((val & 0x1) && s->pf_mailbox) {
+            /* PCIE_DOORBELL_SOFT_RESET == channel 0 (bit 0). */
+            #define REMU_FW_BOOT_DONE 0xFB0D
+            r100_mailbox_cm7_stub_write_issr(s->pf_mailbox, 4,
+                                             REMU_FW_BOOT_DONE);
+            #undef REMU_FW_BOOT_DONE
+        }
+        if (val & ~0x1U) {
+            /* Leftover non-SOFT_RESET bits (if any): raise on INTGR1. */
+            r100_mailbox_raise_intgr(s->mailbox, 1, val & ~0x1U);
+        }
     } else if (off == R100_BAR4_MAILBOX_INTGR1) {
         r100_mailbox_raise_intgr(s->mailbox, 1, val);
     } else if (off >= R100_BAR4_MAILBOX_BASE &&
@@ -250,6 +305,8 @@ static Property r100_doorbell_properties[] = {
     DEFINE_PROP_CHR("chardev", R100DoorbellState, chr),
     DEFINE_PROP_CHR("debug-chardev", R100DoorbellState, debug_chr),
     DEFINE_PROP_LINK("mailbox", R100DoorbellState, mailbox,
+                     TYPE_R100_MAILBOX, R100MailboxState *),
+    DEFINE_PROP_LINK("pf-mailbox", R100DoorbellState, pf_mailbox,
                      TYPE_R100_MAILBOX, R100MailboxState *),
     DEFINE_PROP_END_OF_LIST(),
 };

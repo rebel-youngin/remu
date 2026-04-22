@@ -1449,9 +1449,16 @@ static void r100_soc_init(MachineState *machine)
              * Link the doorbell to the VF0 block: REMU shortcuts the
              * silicon PCIE_CM7 relay by delivering host KMD INTGR
              * writes straight to the block whose SPI q-sys listens on.
+             *
+             * Also link the PF block so the doorbell can synthesise
+             * the CM7-side effect of SOFT_RESET — writing FW_BOOT_DONE
+             * back into PF.ISSR[4] and egressing it to the host BAR4
+             * shadow. See r100_doorbell_deliver() INTGR0 path.
              */
             object_property_set_link(OBJECT(db), "mailbox",
                                      OBJECT(mbx_vf0), &error_fatal);
+            object_property_set_link(OBJECT(db), "pf-mailbox",
+                                     OBJECT(mbx_pf_dev), &error_fatal);
             sysbus_realize_and_unref(SYS_BUS_DEVICE(db), &error_fatal);
         }
     }
