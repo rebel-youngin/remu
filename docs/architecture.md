@@ -78,8 +78,12 @@ the single pinned QEMU tree (`./remucli build` → `qemu-system-aarch64`
 │  │  PVT — idle/valid-bit stub (pvt_init)      │  │
 │  │  HILS ring tail — drains FreeRTOS .logbuf  │  │
 │  │  Mailbox RAM — inter-chiplet handshake     │  │
-│  │  r100-doorbell — chardev ingress →         │  │
-│  │     GIC SPI 63 on chiplet 0 (M6) ✓         │  │
+│  │  r100-doorbell — chardev ingress (M6) ✓    │  │
+│  │    └─ calls r100_mailbox_raise_intgr()     │  │
+│  │  r100-mailbox — Samsung ipm SFR (M6) ✓     │  │
+│  │     @ R100_PCIE_MAILBOX_BASE               │  │
+│  │     INTMSR0 → GIC SPI 184 (chiplet 0)      │  │
+│  │     INTMSR1 → GIC SPI 185 (chiplet 0)      │  │
 │  │  GIC600, per-chiplet 16550 UART, Timer     │  │
 │  └────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────┘
@@ -208,9 +212,10 @@ All device models follow the QEMU QOM (QEMU Object Model) pattern:
 | `r100_pvt.c` | PVT monitor | 5 per chiplet (ROT + 4 DCL) | `PVT_CON_STATUS=0x3` (idle), per-sensor `_valid=1`, rest RAM — unblocks FreeRTOS `pvt_init()` `PVT_ENABLE_{PROC,VOLT,TEMP}_CONTROLLER` polls |
 | `r100_dma.c` | PL330 DMA | 1 per chiplet | Fake completion on csr/dbgstatus/dbgcmd polls |
 | `r100_logbuf.c` | HILS ring tail | 1 (chiplet 0 only) | Polls DRAM `.logbuf` ring at 0x10000000 on a 50 ms timer, drains `RLOG_*`/`FLOG_*` entries to own chardev |
-| `r100_doorbell.c` | PCIe doorbell ingress | 1 (chiplet 0 only; M6) | Reassembles 8-byte `(BAR4 offset, value)` frames on a `CharBackend`, validates the offset is `MAILBOX_INTGR0` (0x8) or `MAILBOX_INTGR1` (0x1c), and pulses a sysbus IRQ wired to GIC SPI 63. Placeholder — replaced by full `r100-mailbox` peripheral in M7/M8 |
+| `r100_doorbell.c` | PCIe doorbell ingress | 1 (chiplet 0 only; M6) | Reassembles 8-byte `(BAR4 offset, value)` frames on a `CharBackend`, validates the offset is `MAILBOX_INTGR0` (0x8) or `MAILBOX_INTGR1` (0x1c), and calls `r100_mailbox_raise_intgr(group, val)` on the linked `r100-mailbox` (via `DEFINE_PROP_LINK`). No longer owns a `qemu_irq` — the mailbox owns the GIC line |
+| `r100_mailbox.c` | Samsung `ipm_samsung` SFR | 1 (chiplet 0 only; M6) | Full register model: `MCUCTRL`, `INTGR{0,1}` (write-1-to-set), `INTCR{0,1}` (write-1-to-clear), `INTMR{0,1}` (mask), `INTSR{0,1}` (raw pending), `INTMSR{0,1}` (`INTSR & ~INTMR`), `MIF_INIT`, `IS_VERSION`, `ISSR0..63`. Two `qemu_irq` outputs (`irq[0]` / `irq[1]`) track the non-zero state of INTMSR0 / INTMSR1. Exposes `r100_mailbox_raise_intgr(group, val)` helper so upstream devices (like `r100-doorbell`) can inject pending bits without round-tripping through MMIO |
 | `r100_npu_pci.c` (x86 side) | PCIe endpoint `0x1eff:0x2030` | 1 | Four BARs: BAR0 splices shared memdev at offset 0 (M4); BAR2 lazy RAM; BAR4 is a container with a 4 KB MMIO head overlay that intercepts `MAILBOX_INTGR0/1` writes and emits 8-byte frames on the `doorbell` chardev (M6), plus an 8 MB lazy-RAM fallback; BAR5 is MSI-X table + PBA + RAM fill (M3) |
-| `remu_addrmap.h` | — | — | All address constants (from `g_sys_addrmap.h`), plus M6 doorbell offsets + `R100_PCIE_DOORBELL_SPI` |
+| `remu_addrmap.h` | — | — | All address constants (from `g_sys_addrmap.h`), plus M6 doorbell offsets, `R100_PCIE_MAILBOX_BASE`, and `R100_PCIE_MBX_GROUP{0,1}_SPI` |
 
 ## FW Source References
 

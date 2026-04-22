@@ -407,13 +407,35 @@
  * registers at 0x8/0x1c and the MAILBOX_BASE body at 0x80..0x180. */
 #define R100_BAR4_MMIO_SIZE         0x1000u
 
-/* GIC SPI for the PCIe doorbell ingress on chiplet 0. Placeholder for
- * M6: the real silicon routes BAR4 MAILBOX_INTGR writes to the PCIe
- * CM7 subcontroller, which forwards a per-group SPI into the CA73 GIC
- * via the CFG mailbox table (see external/.../drivers/mailbox/mailbox.c
- * mailbox_data[] __TARGET_CP entries). Full modelling of that chain is
- * M8; until then we pick SPI 63, which is unused in the CA73-side
- * mailbox IRQ allocation (UART is 33, mailbox block starts at 144+). */
-#define R100_PCIE_DOORBELL_SPI      63
+/*
+ * Chiplet-0 PCIe mailbox SPI wiring.
+ *
+ * The r100-mailbox peripheral at R100_PCIE_MAILBOX_BASE has two
+ * per-group IRQ outputs that follow INTMSR0 / INTMSR1 (see
+ * src/machine/r100_mailbox.c). Each of its two groups gets its own
+ * SPI on chiplet 0's GIC:
+ *
+ *   - Group 1 (INTMSR1) → SPI 185: matches mailbox_data[
+ *     IDX_MAILBOX_PCIE_VF0] in external/.../drivers/mailbox/mailbox.c
+ *     for __TARGET_CP==0 (cpu_id=CPU1, irq_num_low=185). That is the
+ *     line CP0's FreeRTOS is prepared to accept PCIE-mailbox IRQs on
+ *     when it eventually runs the q-cp ISR for this device. Host KMD
+ *     writes to BAR4 MAILBOX_INTGR1 (idx < 32 in rebel_doorbell_write)
+ *     land here.
+ *
+ *   - Group 0 (INTMSR0) → SPI 184: placeholder one-below-185. On
+ *     silicon this IRQ terminates in the PCIE_CM7 subcontroller (not
+ *     modelled yet), so wiring it to the CA73 GIC is diagnostic only:
+ *     host writes to BAR4 MAILBOX_INTGR0 (idx >= 32, VF → CM7 path)
+ *     will leave a GIC-visible assertion we can trace from HMP, but
+ *     no FW ISR handles it. Revisit once M8 adds the full PCIE_CM7
+ *     model.
+ *
+ * SPI numbers live below the 256-IRQ cap configured on each chiplet's
+ * arm-gicv3 (num-irq=256), well clear of the SPI-33 UART and the
+ * 144+ mailbox block the FW uses for its own internal mailboxes.
+ */
+#define R100_PCIE_MBX_GROUP0_SPI    184
+#define R100_PCIE_MBX_GROUP1_SPI    185
 
 #endif /* REMU_ADDRMAP_H */

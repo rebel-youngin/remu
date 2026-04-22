@@ -1,5 +1,5 @@
 /*
- * R100 NPU-side PCIe doorbell ingress (Phase 2, M6).
+ * R100 NPU-side PCIe doorbell ingress (Phase 2, M6 + M7 mailbox refactor).
  *
  * This sysbus device terminates the cross-process doorbell channel that
  * originates in the x86 host guest's r100-npu-pci BAR4. On the host side
@@ -11,12 +11,16 @@
  *           INTGR group; see rebel_doorbell_write() in
  *           external/ssw-bundle/.../kmd/rebellions/rebel/rebel.c:108)
  *
- * On receipt of a complete frame we pulse a sysbus IRQ output line that
- * the machine wires into chiplet 0's GIC at a dedicated SPI (see
- * R100_PCIE_DOORBELL_SPI in src/include/remu_addrmap.h). For M6 that is
- * enough to prove the host-to-NPU signalling path lands as a real GIC
- * injection — the FW-side demuxing (which db_idx fired, what handler to
- * run) is M7/M8 territory.
+ * On receipt of a complete frame we inject the written value into the
+ * linked `r100-mailbox` instance's INTGR register (group 0 for offset
+ * 0x08, group 1 for offset 0x1c). The mailbox's standard group→SPI
+ * assertion then fires the chiplet-0 GIC SPI that FW listens on,
+ * exactly as it would if the FW had issued a cfg-space store to
+ * MAILBOX_PCIE_PRIVATE + INTGR{0,1} from inside the NPU. Before this
+ * refactor the doorbell pulsed a placeholder SPI directly and
+ * bypassed the mailbox entirely — useful as an M6 bring-up hack but
+ * it hid the real FW register surface from the emulator and meant
+ * any MSI-X reply path (M7) would need a second ad-hoc mechanism.
  *
  * Optional debug tail chardev: if the `debug-chardev` property is set,
  * every received frame is echoed as an ASCII line ("doorbell off=0x%x
@@ -25,9 +29,10 @@
  * observed a particular ring without parsing GIC state.
  *
  * The device is instantiated by r100_soc_init when
- * `-machine r100-soc,doorbell=<chardev-id>` is set (see r100_soc.c). With
- * no chardev the device simply doesn't exist — M1-M5 single-QEMU runs
- * are unaffected.
+ * `-machine r100-soc,doorbell=<chardev-id>` is set (see r100_soc.c).
+ * That same init path creates the chiplet-0 r100-mailbox instance
+ * this device links to. With no chardev the device simply doesn't
+ * exist — M1-M5 single-QEMU runs are unaffected.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -55,7 +60,7 @@ struct R100DoorbellState {
 
     CharBackend chr;        /* ingress channel from host r100-npu-pci */
     CharBackend debug_chr;  /* optional: human-readable tail chardev */
-    qemu_irq irq;           /* → chiplet 0 GIC SPI (wired by r100_soc) */
+    R100MailboxState *mailbox; /* link<r100-mailbox>: INTGR write sink */
 
     /* Reassembly buffer: frames arrive as one write() on the host
      * side, but char-socket may still split a single frame across
@@ -98,22 +103,33 @@ static void r100_doorbell_emit_debug(R100DoorbellState *s,
 static void r100_doorbell_deliver(R100DoorbellState *s,
                                   uint32_t off, uint32_t val)
 {
+    int group;
+
     s->frames_received++;
     s->last_offset = off;
     s->last_value = val;
 
-    if (off != R100_BAR4_MAILBOX_INTGR0 && off != R100_BAR4_MAILBOX_INTGR1) {
+    switch (off) {
+    case R100_BAR4_MAILBOX_INTGR0:
+        group = 0;
+        break;
+    case R100_BAR4_MAILBOX_INTGR1:
+        group = 1;
+        break;
+    default:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "r100-doorbell: unexpected frame off=0x%x val=0x%x\n",
                       off, val);
         return;
     }
 
-    /* Pulse-inject: level GIC inputs require a later lower to
-     * re-arm, and the FW is expected to EOI + clear the source
-     * register anyway; a pulse matches silicon-latched behavior
-     * closely enough for M6 and avoids spurious re-entry. */
-    qemu_irq_pulse(s->irq);
+    /* The mailbox is the single ground-truth for host→FW signalling:
+     * it latches pending bits in INTGR/INTSR, masks via INTMR, and
+     * asserts its per-group SPI (wired by r100_soc_init). A later
+     * INTCR write by the ISR clears the pending bit and deasserts
+     * the line — no need for the ad-hoc pulse we used in pre-M7 M6. */
+    r100_mailbox_raise_intgr(s->mailbox, group, val);
+
     r100_doorbell_emit_debug(s, off, val);
 }
 
@@ -142,15 +158,17 @@ static void r100_doorbell_receive(void *opaque, const uint8_t *buf, int size)
 static void r100_doorbell_realize(DeviceState *dev, Error **errp)
 {
     R100DoorbellState *s = R100_DOORBELL(dev);
-    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
 
     if (!qemu_chr_fe_backend_connected(&s->chr)) {
         error_setg(errp,
                    "r100-doorbell: 'chardev' property is required");
         return;
     }
-
-    sysbus_init_irq(sbd, &s->irq);
+    if (s->mailbox == NULL) {
+        error_setg(errp,
+                   "r100-doorbell: 'mailbox' link property is required");
+        return;
+    }
 
     qemu_chr_fe_set_handlers(&s->chr,
                              r100_doorbell_can_receive,
@@ -198,6 +216,8 @@ static const VMStateDescription r100_doorbell_vmstate = {
 static Property r100_doorbell_properties[] = {
     DEFINE_PROP_CHR("chardev", R100DoorbellState, chr),
     DEFINE_PROP_CHR("debug-chardev", R100DoorbellState, debug_chr),
+    DEFINE_PROP_LINK("mailbox", R100DoorbellState, mailbox,
+                     TYPE_R100_MAILBOX, R100MailboxState *),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -205,7 +225,7 @@ static void r100_doorbell_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->desc = "R100 PCIe doorbell ingress (host BAR4 → GIC SPI)";
+    dc->desc = "R100 PCIe doorbell ingress (host BAR4 → mailbox INTGR)";
     dc->realize = r100_doorbell_realize;
     dc->unrealize = r100_doorbell_unrealize;
     dc->vmsd = &r100_doorbell_vmstate;
@@ -213,8 +233,8 @@ static void r100_doorbell_class_init(ObjectClass *klass, void *data)
     device_class_set_props(dc, r100_doorbell_properties);
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
     /* Must be instantiated by the machine (see r100_soc.c); no
-     * `-device r100-doorbell` from the cmdline, since the SPI wiring
-     * is part of the SoC topology. */
+     * `-device r100-doorbell` from the cmdline, since the mailbox
+     * link is part of the SoC topology. */
     dc->user_creatable = false;
 }
 

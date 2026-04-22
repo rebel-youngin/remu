@@ -72,6 +72,7 @@ DECLARE_INSTANCE_CHECKER(R100SoCMachineState, R100_SOC_MACHINE,
 #define TYPE_R100_DNC_CLUSTER   "r100-dnc-cluster"
 #define TYPE_R100_RBDMA         "r100-rbdma"
 #define TYPE_R100_DOORBELL      "r100-doorbell"
+#define TYPE_R100_MAILBOX       "r100-mailbox"
 #define TYPE_R100_UNIMPL        "r100-unimpl"
 
 #define R100_RBC_BLOCK_SIZE     0x80000ULL  /* 512KB per RBC block */
@@ -265,6 +266,60 @@ struct R100PVTState {
 typedef struct R100PVTState R100PVTState;
 
 DECLARE_INSTANCE_CHECKER(R100PVTState, R100_PVT, TYPE_R100_PVT)
+
+/* ========================================================================
+ * Samsung IPM mailbox SFR block
+ *
+ * One 4 KB SFR at a fixed chiplet-relative base. Layout matches
+ * struct ipm_samsung in external/ssw-bundle/.../drivers/mailbox/
+ * ipm_samsung.h. We emulate MCUCTRL + the two INTGR/INTCR/INTMR/INTSR/
+ * INTMSR register groups + 64 x 32-bit ISSR scratch registers. See
+ * r100_mailbox.c for the full semantics.
+ *
+ * Two qemu_irq outputs follow INTMSR0 / INTMSR1 (group 0 targets the
+ * "CPU0-side" receiver, group 1 the "CPU1-side"). The machine wires
+ * whichever lines are active for the mailbox instance's silicon role;
+ * for chiplet 0's PCIE mailbox only group 1 lands on a CA73 GIC SPI
+ * (matching mailbox_data[IDX_MAILBOX_PCIE_VF0] cpu_id=CPU1 in the
+ * __TARGET_CP==0 table).
+ * ======================================================================== */
+
+#define R100_MBX_SFR_SIZE       0x1000   /* 4 KB per SFR block */
+#define R100_MBX_ISSR_COUNT     64
+
+struct R100MailboxState {
+    SysBusDevice parent_obj;
+
+    MemoryRegion iomem;
+    qemu_irq irq[2];            /* [0] = INTMSR0, [1] = INTMSR1 */
+    char *name;                 /* e.g. "pcie.chiplet0" for debug */
+
+    uint32_t mcuctrl;
+    /* Combined INTGR/INTSR storage: INTGR is W1S into `pending`, INTSR
+     * and INTGR reads both return it. */
+    uint32_t pending[2];
+    uint32_t intmr[2];
+    uint32_t mif_init;
+    uint32_t is_version;
+    uint32_t issr[R100_MBX_ISSR_COUNT];
+
+    /* Observability counters (survive reset, inspectable via HMP). */
+    uint64_t intgr_writes[2];
+};
+
+typedef struct R100MailboxState R100MailboxState;
+
+DECLARE_INSTANCE_CHECKER(R100MailboxState, R100_MAILBOX, TYPE_R100_MAILBOX)
+
+/*
+ * Inject a pending-bit set from outside the MMIO path. Used by the
+ * M6 doorbell bridge: a chardev frame from the x86 host's BAR4
+ * MAILBOX_INTGR write arrives on the NPU side, and we want the same
+ * effect as if the FW had issued a store to this mailbox's INTGR
+ * register at offset 0x8 (group=0) / 0x1c (group=1). Asserts the
+ * matching qemu_irq when INTMSR goes non-zero.
+ */
+void r100_mailbox_raise_intgr(R100MailboxState *s, int group, uint32_t val);
 
 /* ========================================================================
  * Unimplemented region (catch-all for unmapped config space reads)

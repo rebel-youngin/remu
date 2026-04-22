@@ -93,17 +93,21 @@ output/
     uart{0..3}.log    # NPU UARTs (as in Phase 1)
     hils.log          # NPU HILS ring tail
     shm -> /dev/shm/remu-my-test/
+    doorbell.log      # NPU-side ASCII trace of every (offset, value) frame
     npu/
       monitor.sock    # NPU HMP monitor (unix socket)
       info-mtree.log  # captured info mtree — chiplet0.dram splice
+      info-qtree.log  # captured info qtree — confirms r100-doorbell + r100-mailbox
     host/
       cmdline.txt     # x86 QEMU invocation
       qemu.stdout.log
       qemu.stderr.log
       serial.log      # x86 guest serial (SeaBIOS + "No bootable device" idle)
       monitor.sock    # host HMP monitor (unix socket)
+      doorbell.sock   # unix-socket chardev listener (host = server, NPU = client)
       info-pci.log    # captured info pci — lists 1eff:2030 endpoint
       info-mtree.log  # captured info mtree — BAR0 shm splice
+      info-mtree-bar4.log  # captured info mtree — BAR4 MMIO overlay (M6)
 ```
 
 Everything under `/dev/shm/remu-<name>/` is cleaned up on exit. If
@@ -273,6 +277,43 @@ offsets become `0xE000000000 + <shm offset>`. On the NPU side,
 chiplet-0 DRAM starts at physical `0x0`, so the same bytes live at
 `<shm offset>`. `tests/m5_dataflow_test.py` is the canonical
 end-to-end check.
+
+### Doorbell + mailbox path (M6)
+
+A host-guest write to `BAR4 + MAILBOX_INTGR{0,1}` (offsets `0x8` / `0x1c`) is
+intercepted by `r100-npu-pci`'s 4 KB MMIO overlay, serialised as an 8-byte
+`(offset, value)` frame on the `doorbell.sock` unix-socket chardev, and
+consumed by the NPU-side `r100-doorbell` sysbus device. The doorbell no
+longer asserts a placeholder SPI directly — it now calls
+`r100_mailbox_raise_intgr(group, val)` on the chiplet-0 `r100-mailbox`
+peripheral mapped at `R100_PCIE_MAILBOX_BASE` (`0x1FF8160000`). That sets
+the corresponding bits in `INTSR{0,1}`, and if the mask allows it
+(`INTMSR = INTSR & ~INTMR`), the mailbox raises chiplet-0 GIC
+SPI 184 (Group0) / SPI 185 (Group1). This matches the silicon routing
+described in the `ipm_samsung` driver.
+
+Quick sanity poking from the monitor:
+
+```
+# Host side: MMIO overlay must be present and priority 10
+printf 'info mtree\nquit\n' \
+  | socat - UNIX-CONNECT:output/<name>/host/monitor.sock \
+  | rg 'r100.bar4'
+
+# NPU side: both r100-doorbell and r100-mailbox must be in qtree
+printf 'info qtree\nquit\n' \
+  | socat - UNIX-CONNECT:output/<name>/npu/monitor.sock \
+  | rg 'r100-(doorbell|mailbox)'
+
+# Drive a synthetic frame end-to-end without the kmd
+python3 tests/m6_doorbell_test.py
+```
+
+`output/<name>/doorbell.log` is the ASCII trace of every
+frame the NPU actually received (one line per frame, format
+`doorbell off=0x... val=0x... count=N`). If it's empty after the host
+has written INTGR, the chardev bridge is down — check that both
+QEMUs are still up and that `output/<name>/host/doorbell.sock` exists.
 
 ## Interpreting a boot log
 

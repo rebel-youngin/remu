@@ -13,6 +13,7 @@ arm_ss.add(files(
     'r100_dnc.c',
     'r100_doorbell.c',
     'r100_logbuf.c',
+    'r100_mailbox.c',
     'r100_pmu.c',
     'r100_pvt.c',
     'r100_smmu.c',

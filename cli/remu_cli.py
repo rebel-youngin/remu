@@ -848,12 +848,14 @@ def _verify_doorbell_wired(host_monitor_sock, npu_monitor_sock,
     on the r100-npu-pci BAR4 container, which only exists when the
     `doorbell` chardev property was wired.
 
-    NPU side: `info qtree` must list a `r100-doorbell` device instance.
-    Presence of the device + a realized `chardev` property is the
-    server-coming-up ack. The socket connect itself is async (host is
-    server, NPU is reconnect=1 client), but the device being realized
-    means the machine chose to instantiate it from our `-machine
-    r100-soc,doorbell=doorbell` option.
+    NPU side: `info qtree` must list both a `r100-doorbell` (conditional
+    on our `-machine r100-soc,doorbell=<chardev>` option) and a
+    `r100-mailbox` instance (unconditional; the doorbell links to it
+    to deliver INTGR writes). Presence of both + a realized `chardev`
+    property on the doorbell is the server-coming-up ack. The socket
+    connect itself is async (host is server, NPU is reconnect=1
+    client), but the device being realized means the machine chose
+    to instantiate it from our machine option.
 
     Raises RuntimeError with an actionable message on failure. Log
     files are always written (empty if the query itself errored out)
@@ -881,13 +883,16 @@ def _verify_doorbell_wired(host_monitor_sock, npu_monitor_sock,
             if "r100.bar4" in ln
         )
 
-    # NPU side: confirm r100-doorbell was instantiated.
+    # NPU side: confirm both r100-doorbell (chardev ingress) and
+    # r100-mailbox (the PCIE_PRIVATE SFR the doorbell now targets)
+    # are in the device tree.
     qtree = _hmp_query(npu_monitor_sock, "info qtree", timeout=10.0)
     npu_qtree_log.write_text(qtree + "\n")
-    if "r100-doorbell" not in qtree:
-        raise RuntimeError(
-            "NPU-side r100-doorbell device not found in info qtree; see %s"
-            % npu_qtree_log)
+    for dev in ("r100-doorbell", "r100-mailbox"):
+        if dev not in qtree:
+            raise RuntimeError(
+                "NPU-side %s device not found in info qtree; see %s"
+                % (dev, npu_qtree_log))
 
     return snippet
 
@@ -1217,7 +1222,7 @@ def run(name, output_root, gdb, trace, chiplets, memory,
             )
             click.secho(
                 "  doorbell chardev wired: BAR4 MMIO overlay on host + "
-                "r100-doorbell on NPU", fg="green")
+                "r100-doorbell → r100-mailbox on NPU", fg="green")
             for ln in db_snip.splitlines():
                 click.echo("    " + ln)
             click.echo()

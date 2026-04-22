@@ -1233,18 +1233,46 @@ static void r100_soc_init(MachineState *machine)
     }
 
     /*
-     * --- PCIe doorbell ingress (Phase 2, M6) ---
+     * --- Chiplet-0 PCIE mailbox + optional doorbell ingress ---
      *
-     * Instantiated only when `-machine r100-soc,doorbell=<chardev-id>`
-     * is set. The chardev is a client Unix socket (see cli/remu_cli.py
-     * _build_npu_cmd) wired to the x86 host-side r100-npu-pci's
-     * matching server socket, so 8-byte (offset, value) frames emitted
-     * on BAR4 MAILBOX_INTGR writes arrive here and pulse
-     * R100_PCIE_DOORBELL_SPI on chiplet 0's GIC. See
-     * src/machine/r100_doorbell.c for the wire format.
+     * Silicon places a Samsung IPM mailbox SFR at MAILBOX_PCIE (0x1FF8160000
+     * on chiplet 0). The FW drives it via both directions:
+     *   - CA73 / PCIE_CM7 → INTGR writes (see ipm_samsung_send) to signal
+     *     the peer, with ISSR0..63 carrying the message payload.
+     *   - Host (x86 guest) writes BAR4 + MAILBOX_INTGR{0,1} which the
+     *     PCIe endpoint forwards into the same SFR.
+     *
+     * We instantiate the mailbox unconditionally — it's a real device
+     * FW may probe regardless of whether the host half of the bridge
+     * is wired. INTMSR0 and INTMSR1 drive two chiplet-0 GIC SPIs (see
+     * R100_PCIE_MBX_GROUP{0,1}_SPI in remu_addrmap.h).
+     *
+     * The r100-doorbell ingress is still conditional on
+     * `-machine r100-soc,doorbell=<chardev-id>`: when present it
+     * decodes 8-byte (offset, value) frames from the host process and
+     * routes them into the mailbox's INTGR via
+     * r100_mailbox_raise_intgr(). See src/machine/r100_mailbox.c and
+     * src/machine/r100_doorbell.c for details.
      */
     {
         R100SoCMachineState *r100m = R100_SOC_MACHINE(machine);
+        DeviceState *mbx_dev;
+        R100MailboxState *mbx;
+
+        mbx_dev = qdev_new(TYPE_R100_MAILBOX);
+        qdev_prop_set_string(mbx_dev, "name", "pcie.chiplet0");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(mbx_dev), &error_fatal);
+        /* Priority 10 to outrank chiplet-0's cfg_mr container (pri 0)
+         * which covers this address as part of its catch-all. */
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(mbx_dev), 0,
+                                R100_PCIE_MAILBOX_BASE, 10);
+        sysbus_connect_irq(SYS_BUS_DEVICE(mbx_dev), 0,
+                           qdev_get_gpio_in(gic_dev[0],
+                                            R100_PCIE_MBX_GROUP0_SPI));
+        sysbus_connect_irq(SYS_BUS_DEVICE(mbx_dev), 1,
+                           qdev_get_gpio_in(gic_dev[0],
+                                            R100_PCIE_MBX_GROUP1_SPI));
+        mbx = R100_MAILBOX(mbx_dev);
 
         if (r100m->doorbell_chardev_id != NULL &&
             *r100m->doorbell_chardev_id != '\0') {
@@ -1273,10 +1301,9 @@ static void r100_soc_init(MachineState *machine)
             if (dbg) {
                 qdev_prop_set_chr(db, "debug-chardev", dbg);
             }
+            object_property_set_link(OBJECT(db), "mailbox", OBJECT(mbx),
+                                     &error_fatal);
             sysbus_realize_and_unref(SYS_BUS_DEVICE(db), &error_fatal);
-            sysbus_connect_irq(SYS_BUS_DEVICE(db), 0,
-                               qdev_get_gpio_in(gic_dev[0],
-                                                R100_PCIE_DOORBELL_SPI));
         }
     }
 
@@ -1389,8 +1416,9 @@ static void r100_soc_machine_instance_init(Object *obj)
     object_property_set_description(obj, "doorbell",
         "Optional chardev id that receives 8-byte (BAR4 offset, value) "
         "frames from the Phase-2 x86 host QEMU's r100-npu-pci BAR4 and "
-        "injects them as GIC SPI " G_STRINGIFY(R100_PCIE_DOORBELL_SPI)
-        " on chiplet 0.");
+        "injects them into chiplet 0's PCIE mailbox INTGR — the mailbox "
+        "then asserts its per-group GIC SPI as a side-effect (see "
+        "R100_PCIE_MBX_GROUP{0,1}_SPI in remu_addrmap.h).");
 
     object_property_add_str(obj, "doorbell-debug",
                             r100_soc_get_doorbell_debug,
