@@ -61,9 +61,20 @@
 #define SR_RFNE             (1 << 3)  /* RX FIFO not empty */
 
 /* QSPI instructions used by the bridge driver */
-#define QSPI_INST_READ_24WAIT   0x70
-#define QSPI_INST_WRITE         0x80
-#define QSPI_INST_WRITE_16WORD  0x83
+#define QSPI_INST_READ_24WAIT           0x70
+#define QSPI_INST_WRITE                 0x80
+#define QSPI_INST_WRITE_16WORD          0x83
+#define QSPI_INST_WRITE_STATUS_2WAIT    0xD0
+
+/*
+ * WRITESTATUS response byte. The FW driver (qspi_bridge_wait_write_complete)
+ * expects bit[7] READY (0x80) after every 1-word or 16-word write completes
+ * on the AHB side of the remote slave. bit[6] ERROR (0x40) signals an AHB
+ * error. Since our write path is synchronous (qspi_remote_write runs
+ * inline), every write has effectively already completed by the time the FW
+ * polls, so we always return READY.
+ */
+#define QSPI_WRITE_STATUS_READY         0x80
 
 #define QSPI_BURST16_WORDS      16
 
@@ -296,7 +307,20 @@ static void r100_qspi_write(void *opaque, hwaddr addr, uint64_t val,
         switch (s->xfer_state) {
         case QSPI_STATE_IDLE:
             s->instruction = (uint32_t)val;
-            s->xfer_state = QSPI_STATE_GOT_INSTRUCTION;
+            if (s->instruction == QSPI_INST_WRITE_STATUS_2WAIT) {
+                /*
+                 * WRITESTATUS2 is address-less: the FW pushes only the
+                 * instruction byte and then polls RXFLR for a single 8-bit
+                 * status response. Because our qspi_remote_write path is
+                 * synchronous, the remote AHB write has already landed by
+                 * the time the FW reads this back, so return READY.
+                 */
+                s->rx_data = QSPI_WRITE_STATUS_READY;
+                s->rx_data_valid = true;
+                s->xfer_state = QSPI_STATE_IDLE;
+            } else {
+                s->xfer_state = QSPI_STATE_GOT_INSTRUCTION;
+            }
             break;
 
         case QSPI_STATE_GOT_INSTRUCTION:
