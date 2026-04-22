@@ -1,0 +1,87 @@
+From: REMU project <noreply@example.com>
+Subject: [PATCH] hw/intc/arm_gicv3_cpuif: seed CPU interface reset state after init
+
+gicv3_init_cpuif() defines the ICC_*_EL1 coproc registers on each ARM
+CPU via define_arm_cp_regs(). The ICC_PMR_EL1 ARMCPRegInfo entry carries
+icc_reset() as its .resetfn, which seeds architecturally-required reset
+values on the GICv3CPUState -- most notably:
+
+    cs->icc_bpr[GICV3_G0]   = icc_min_bpr(cs);      // 7 - prebits
+    cs->icc_bpr[GICV3_G1]   = icc_min_bpr(cs);
+    cs->icc_bpr[GICV3_G1NS] = icc_min_bpr_ns(cs);   // icc_min_bpr + 1
+    cs->icc_ctlr_el1[{S,NS}] = ...pribits-derived...
+    cs->icc_ctlr_el3          = ...pribits-derived...
+    cs->ich_vmcr_el2          = ...vprebits-derived...
+
+all of which read cs->pribits / prebits / vpribits / vprebits -- values
+that are set only *inside* gicv3_init_cpuif() itself, *after* the
+define_arm_cp_regs() call. The resetfn therefore cannot run correctly
+until after gicv3_init_cpuif() has finished setting up the CPU
+interface.
+
+In the common upstream case (machines that create CPUs and then a GIC
+from within a single machine-init function, followed by QEMU's
+end-of-init qemu_system_reset()), the CPU is cold-reset at least once
+more after gicv3_init_cpuif() has completed, so icc_reset() eventually
+fires with the proper pribits/prebits in place. That second reset,
+however, is not guaranteed by anything gicv3_init_cpuif() itself does
+-- it is a happy side-effect of the typical machine-boot flow. Any ARM
+CPU that is realized (and cold-reset once) *before* its GIC is realized
+and that does not subsequently get re-reset (e.g. a machine's bootstrap
+CPU that runs straight into firmware, with no PSCI CPU_ON warm-boot and
+no explicit post-init reset) will therefore see ICC_* registers stuck
+at C-zero-init values.
+
+The most visible failure is icc_gprio_mask() tripping its spec-mandated
+assert(bpr > 0) for GICV3_G1NS on the very first Group-1 NS SPI that
+reaches that CPU, because ICC_BPR1_EL1 was never written to its
+architectural reset value (minimum 1; typically 3 for prebits == 5).
+icc_bpr_write() clamps software writes to that minimum, so the only
+way the register can be 0 at the point of IRQ delivery is if icc_reset
+never ran.
+
+Fix this inside gicv3_init_cpuif() itself: once pribits / prebits /
+vpribits / vprebits and all CPRegs are in place, call icc_reset()
+directly on the CPU's env. This makes the CPU interface self-seed its
+own reset state without relying on an externally-triggered CPU reset.
+
+icc_reset() does not read its ARMCPRegInfo argument, so passing NULL is
+safe.
+
+Signed-off-by: REMU project <noreply@example.com>
+---
+ hw/intc/arm_gicv3_cpuif.c | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/hw/intc/arm_gicv3_cpuif.c b/hw/intc/arm_gicv3_cpuif.c
+index ea1d1b3..6506df7 100644
+--- a/hw/intc/arm_gicv3_cpuif.c
++++ b/hw/intc/arm_gicv3_cpuif.c
+@@ -3174,5 +3174,27 @@ void gicv3_init_cpuif(GICv3State *s)
+             assert(!arm_feature(&cpu->env, ARM_FEATURE_EL2));
+             assert(!arm_feature(&cpu->env, ARM_FEATURE_EL3));
+         }
++
++        /*
++         * Seed ICC/ICH CPU-interface reset state now that pribits /
++         * prebits / vpribits / vprebits / num_list_regs are final and
++         * every CPReg (including the ICC_PMR_EL1 entry that carries
++         * icc_reset as its .resetfn) has been registered on the CPU.
++         *
++         * The .resetfn machinery would handle this automatically IF the
++         * CPU was guaranteed to see a cold reset after gicv3_init_cpuif()
++         * returns. But that is a property of the surrounding boot flow,
++         * not of this function: a bootstrap CPU that was cold-reset at
++         * qdev_realize() time and never goes through PSCI CPU_ON would
++         * otherwise keep icc_bpr[G1NS] == 0 and trip icc_gprio_mask()'s
++         * assert(bpr > 0) on the first Group-1 NS SPI it ever takes.
++         *
++         * Calling icc_reset() directly here makes the CPU interface own
++         * its own reset-state seeding, so it is correct regardless of
++         * whether anyone resets the CPU again later.
++         *
++         * icc_reset() does not read its ARMCPRegInfo argument.
++         */
++        icc_reset(&cpu->env, NULL);
+     }
+ }
