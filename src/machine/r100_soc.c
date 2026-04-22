@@ -1233,80 +1233,138 @@ static void r100_soc_init(MachineState *machine)
     }
 
     /*
-     * --- Chiplet-0 PCIE mailbox + optional doorbell ingress ---
+     * --- Chiplet-0 PCIE mailbox cluster + optional doorbell ingress ---
      *
-     * Silicon places a Samsung IPM mailbox SFR at MAILBOX_PCIE (0x1FF8160000
-     * on chiplet 0). The FW drives it via both directions:
-     *   - CA73 / PCIE_CM7 → INTGR writes (see ipm_samsung_send) to signal
-     *     the peer, with ISSR0..63 carrying the message payload.
-     *   - Host (x86 guest) writes BAR4 + MAILBOX_INTGR{0,1} which the
-     *     PCIe endpoint forwards into the same SFR.
+     * Silicon places a cluster of 17 identical Samsung IPM mailbox SFR
+     * blocks at MAILBOX_PCIE (0x1FF8160000 on chiplet 0), arranged as
+     * VF0..VF15 then PF at a 0x1000 stride:
      *
-     * We instantiate the mailbox unconditionally — it's a real device
-     * FW may probe regardless of whether the host half of the bridge
-     * is wired. INTMSR0 and INTMSR1 drive two chiplet-0 GIC SPIs (see
-     * R100_PCIE_MBX_GROUP{0,1}_SPI in remu_addrmap.h).
+     *    0x1FF8160000  VF0   ← q-sys CA73 listens here (CPU1 IRQ 185)
+     *    0x1FF8161000  VF1
+     *     …
+     *    0x1FF816F000  VF15
+     *    0x1FF8170000  PF    ← PCIE_CM7 listens here (CPU0 IRQ 13), and
+     *                         q-sys's bootdone_notify_to_host(PCIE_PF)
+     *                         writes FW_BOOT_DONE into PF.ISSR[4]
+     *
+     * Each block has its own INTGR/INTCR/INTMR/INTSR/INTMSR groups and
+     * its own 64 x 32-bit ISSR0..63 scratch register array. The FW /
+     * KMD use different blocks for different flows:
+     *   - KMD doorbell writes (BAR4 + MAILBOX_INTGR{0,1}) land on PF
+     *     on silicon (BAR4 physically decodes to the PF SFR window);
+     *     PCIE_CM7 ISR then relays to q-sys via a VF0 store.
+     *   - q-sys writes FW_BOOT_DONE / reset-counter to PF.ISSR[] via
+     *     mb_write(PCIE_PF, …); the KMD polls BAR4 + MAILBOX_BASE for
+     *     those.
+     *   - q-cp PCIe message rings end up on VF0 between q-cp and the
+     *     KMD (relayed by PCIE_CM7 on silicon).
+     *
+     * REMU models two blocks today: VF0 and PF. Both share the same
+     * `issr` chardev so FW→host ISSR egress from either block emerges
+     * at the host's BAR4 shadow register file identically (the host
+     * side keys off BAR4 offset, not which SFR the write originated
+     * from). INTMSR SPIs are only wired for VF0 — that is where q-sys
+     * CA73's PCIE mailbox ISR expects to see interrupts (SPI 185 for
+     * CPU1, matching mailbox_data[IDX_MAILBOX_PCIE_VF0].irq_num_low in
+     * external/ssw-bundle/.../drivers/mailbox/mailbox.c for
+     * __TARGET_CP==0). PF's interrupts would target PCIE_CM7 on
+     * silicon, but REMU does not model that sub-controller; FW stores
+     * to PF.INTGR are therefore latched-but-unrouted today.
      *
      * The r100-doorbell ingress is still conditional on
      * `-machine r100-soc,doorbell=<chardev-id>`: when present it
      * decodes 8-byte (offset, value) frames from the host process and
      * routes them into the mailbox's INTGR via
-     * r100_mailbox_raise_intgr(). See src/machine/r100_mailbox.c and
-     * src/machine/r100_doorbell.c for details.
+     * r100_mailbox_raise_intgr(). The REMU shortcut wires the doorbell
+     * to the VF0 block so kmd INTGR writes directly fire the SPI q-sys
+     * is prepared to service, bypassing the silicon PCIE_CM7 relay.
+     * See src/machine/r100_mailbox.c and src/machine/r100_doorbell.c
+     * for details.
      */
     {
         R100SoCMachineState *r100m = R100_SOC_MACHINE(machine);
-        DeviceState *mbx_dev;
-        R100MailboxState *mbx;
+        DeviceState *mbx_vf0_dev;
+        DeviceState *mbx_pf_dev;
+        R100MailboxState *mbx_vf0;
+        Chardev *issr_chr = NULL;
+        Chardev *issr_dbg = NULL;
 
-        mbx_dev = qdev_new(TYPE_R100_MAILBOX);
-        qdev_prop_set_string(mbx_dev, "name", "pcie.chiplet0");
         /*
-         * M8: optional NPU→host ISSR shadow-egress. The mailbox
-         * accepts both a primary chardev (binary 8-byte frames) and
-         * a debug chardev (ASCII per-write trace). Both must be set
-         * BEFORE realize() so the backing CharBackends latch in.
-         * Single-QEMU runs leave these unset and the egress is a
-         * no-op (the qemu_chr_fe_backend_connected check in
-         * r100_mailbox_issr_emit short-circuits).
+         * Resolve the optional issr/debug chardevs ONCE so both
+         * mailbox blocks can latch the same backends before realize.
+         * Single-QEMU bring-up runs leave these unset and the egress
+         * path in r100_mailbox_issr_emit short-circuits on the
+         * qemu_chr_fe_backend_connected check.
          */
         if (r100m->issr_chardev_id != NULL &&
             *r100m->issr_chardev_id != '\0') {
-            Chardev *chr = qemu_chr_find(r100m->issr_chardev_id);
-            Chardev *dbg = NULL;
-
-            if (chr == NULL) {
+            issr_chr = qemu_chr_find(r100m->issr_chardev_id);
+            if (issr_chr == NULL) {
                 error_report("r100-soc: issr chardev '%s' not found",
                              r100m->issr_chardev_id);
                 exit(1);
             }
             if (r100m->issr_debug_chardev_id != NULL &&
                 *r100m->issr_debug_chardev_id != '\0') {
-                dbg = qemu_chr_find(r100m->issr_debug_chardev_id);
-                if (dbg == NULL) {
+                issr_dbg = qemu_chr_find(r100m->issr_debug_chardev_id);
+                if (issr_dbg == NULL) {
                     error_report("r100-soc: issr debug chardev "
                                  "'%s' not found",
                                  r100m->issr_debug_chardev_id);
                     exit(1);
                 }
             }
-            qdev_prop_set_chr(mbx_dev, "issr-chardev", chr);
-            if (dbg) {
-                qdev_prop_set_chr(mbx_dev, "issr-debug-chardev", dbg);
-            }
         }
-        sysbus_realize_and_unref(SYS_BUS_DEVICE(mbx_dev), &error_fatal);
+
+        /*
+         * VF0 block — q-sys CA73 listens on this one (SPI 185).
+         *
+         * We intentionally do NOT wire the `issr-chardev` here: QEMU's
+         * CharBackend is single-frontend, so two mailbox devices can't
+         * both hold the same chardev. PF is the authoritative FW→host
+         * ISSR egress path (bootdone_notify_to_host(PCIE_PF) and
+         * reset-counter writes both go through PF), so routing egress
+         * there exclusively avoids any frontend-sharing gymnastics.
+         * VF0's ISSR register file is still inspectable via HMP `xp`
+         * on the NPU monitor for tests like m8_issr_test.py (which
+         * drives r100_mailbox_set_issr through the doorbell ingress).
+         */
+        mbx_vf0_dev = qdev_new(TYPE_R100_MAILBOX);
+        qdev_prop_set_string(mbx_vf0_dev, "name", "pcie.vf0.chiplet0");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(mbx_vf0_dev), &error_fatal);
         /* Priority 10 to outrank chiplet-0's cfg_mr container (pri 0)
          * which covers this address as part of its catch-all. */
-        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(mbx_dev), 0,
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(mbx_vf0_dev), 0,
                                 R100_PCIE_MAILBOX_BASE, 10);
-        sysbus_connect_irq(SYS_BUS_DEVICE(mbx_dev), 0,
+        sysbus_connect_irq(SYS_BUS_DEVICE(mbx_vf0_dev), 0,
                            qdev_get_gpio_in(gic_dev[0],
                                             R100_PCIE_MBX_GROUP0_SPI));
-        sysbus_connect_irq(SYS_BUS_DEVICE(mbx_dev), 1,
+        sysbus_connect_irq(SYS_BUS_DEVICE(mbx_vf0_dev), 1,
                            qdev_get_gpio_in(gic_dev[0],
                                             R100_PCIE_MBX_GROUP1_SPI));
-        mbx = R100_MAILBOX(mbx_dev);
+        mbx_vf0 = R100_MAILBOX(mbx_vf0_dev);
+
+        /*
+         * PF block — bootdone_notify_to_host(PCIE_PF) writes here, and
+         * on silicon this is also where KMD BAR4 PCIe TLPs physically
+         * land. Shares the same `issr` chardev as VF0 so FW ISSR
+         * stores from either block flow out the same BAR4 mirror on
+         * the host side. No SPI wiring: q-sys CA73 does not subscribe
+         * to PF IRQs (only PCIE_CM7 does on silicon; we don't model
+         * CM7). Writes to PF.INTGR therefore just set pending bits in
+         * the shadow and stay there.
+         */
+        mbx_pf_dev = qdev_new(TYPE_R100_MAILBOX);
+        qdev_prop_set_string(mbx_pf_dev, "name", "pcie.pf.chiplet0");
+        if (issr_chr) {
+            qdev_prop_set_chr(mbx_pf_dev, "issr-chardev", issr_chr);
+        }
+        if (issr_dbg) {
+            qdev_prop_set_chr(mbx_pf_dev, "issr-debug-chardev", issr_dbg);
+        }
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(mbx_pf_dev), &error_fatal);
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(mbx_pf_dev), 0,
+                                R100_PCIE_MAILBOX_PF_BASE, 10);
 
         if (r100m->doorbell_chardev_id != NULL &&
             *r100m->doorbell_chardev_id != '\0') {
@@ -1335,8 +1393,13 @@ static void r100_soc_init(MachineState *machine)
             if (dbg) {
                 qdev_prop_set_chr(db, "debug-chardev", dbg);
             }
-            object_property_set_link(OBJECT(db), "mailbox", OBJECT(mbx),
-                                     &error_fatal);
+            /*
+             * Link the doorbell to the VF0 block: REMU shortcuts the
+             * silicon PCIE_CM7 relay by delivering host KMD INTGR
+             * writes straight to the block whose SPI q-sys listens on.
+             */
+            object_property_set_link(OBJECT(db), "mailbox",
+                                     OBJECT(mbx_vf0), &error_fatal);
             sysbus_realize_and_unref(SYS_BUS_DEVICE(db), &error_fatal);
         }
     }
@@ -1423,8 +1486,30 @@ static void r100_soc_init(MachineState *machine)
      *
      * See external/.../tf-a/drivers/mailbox/mailbox.c:mailbox_data[].
      * Priority 10 outranks each chiplet's cfg_mr catch-all.
+     *
+     * In addition (M8b Stage 1), q-cp's CP1 FreeRTOS workers spin in
+     * cs_task1/2/3 -> taskmgr_fetch_dnc_task_master_cp1() (see
+     * external/.../q/cp/src/task_mgr/cp1/{fetch_task.c,mb_task_queue.c})
+     * polling MBTQ_PI_IDX (= ISSR[0], offset 0x80) of the four DNC
+     * command-stream mailboxes PERI{0,1}_MAILBOX_M{9,10}. Without
+     * backing RAM each poll returns through the unimplemented-device
+     * catch-all + LOG_UNIMP and the runaway logging starves CL0's
+     * CP0 FreeRTOS core of emulated time, never letting
+     * bootdone_notify_to_host() fire. We don't actually have a DNC
+     * to push tasks here; plain RAM is enough — pi==ci==0 keeps the
+     * queues empty, the tight loop runs at MMIO speed, and CP0 gets
+     * its slice back.
      */
     {
+        static const uint64_t r100_per_chiplet_mbox_offsets[] = {
+            0x1FF9140000ULL, /* PERI0_MAILBOX_M9 */
+            0x1FF9150000ULL, /* PERI0_MAILBOX_M10 */
+            0x1FF9940000ULL, /* PERI1_MAILBOX_M9 */
+            0x1FF9950000ULL, /* PERI1_MAILBOX_M10 */
+        };
+        static const char *r100_per_chiplet_mbox_tags[] = {
+            "peri0_m9", "peri0_m10", "peri1_m9", "peri1_m10",
+        };
         static const struct {
             uint64_t base;
             const char *name;
@@ -1445,6 +1530,25 @@ static void r100_soc_init(MachineState *machine)
             memory_region_add_subregion_overlap(sysmem,
                                                 r100_mbox_slots[i].base,
                                                 mr, 10);
+        }
+
+        for (int cl = 0; cl < R100_NUM_CHIPLETS; cl++) {
+            for (size_t j = 0;
+                 j < ARRAY_SIZE(r100_per_chiplet_mbox_offsets);
+                 j++) {
+                MemoryRegion *mr = g_new(MemoryRegion, 1);
+                char nm[64];
+
+                snprintf(nm, sizeof(nm), "r100.mbox_cl%d_%s",
+                         cl, r100_per_chiplet_mbox_tags[j]);
+                memory_region_init_ram(mr, NULL, nm, 0x10000,
+                                       &error_fatal);
+                memory_region_add_subregion_overlap(
+                    sysmem,
+                    (uint64_t)cl * R100_CHIPLET_OFFSET +
+                        r100_per_chiplet_mbox_offsets[j],
+                    mr, 10);
+            }
         }
     }
 }

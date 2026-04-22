@@ -98,10 +98,41 @@ static void r100_pmu_set_defaults(R100PMUState *s)
     s->regs[R100_PMU_DCL1_CONFIG >> 2] = R100_PMU_LOCAL_PWR_ON;
 }
 
+/*
+ * BOOT_LOG register (CPMU_PRIVATE + 0x980) is a shared status word owned
+ * jointly by TF-A (CP0), q-cp (CP1), the RoT CMRT (on CL0/CL3), and the
+ * CM7 PCIe sub-controller FW. Each writer uses BOOT_FLAG (+0x984) as a
+ * semaphore and RMWs only its own (bin, step) bit-field — see
+ * rebel_h_bootmgr.h:_SET_BOOT_LOG / BOOT_LOG().
+ *
+ * REMU boots TF-A / FreeRTOS end-to-end on every chiplet, and we emulate
+ * the RoT only as stubs, so the CP0 / ROT / CP1 fields of BOOT_LOG reach
+ * their BOOT_DONE values on their own. The Cortex-M7 PCIe sub-controller
+ * is a different story — we don't run CM7 firmware at all (see
+ * r100_create_pcie_subctrl() for the small RAM stub that covers the
+ * handful of SFRs BL1 polls). As a result bits 10-13 (CM7 step) and
+ * bits 21-22 (CM7 bin = BOOT_TBOOT_P0) never get set on chiplet 0, and
+ * bootdone_task bails at `BOOT_FAIL` before calling
+ * bootdone_notify_to_host(), which is the CPU-visible half of the M8a
+ * FW_BOOT_DONE handshake kmd needs.
+ *
+ * IS_CM7 is defined as IS_PRIMARY_CHIPLET (see
+ * common/headers/fw/common/rebel_h_chiplet.h), so only chiplet 0
+ * requires the CM7 fields to be set. We OR CM7_BOOT_DONE_STATE into the
+ * read value on chiplet 0 so every reader observes CM7 done without
+ * touching the backing store; subsequent RMW writes from TF-A / q-cp
+ * mask off only their own fields and preserve the CM7 bits on the next
+ * read. No writer on chiplet 0 targets CM7 bits, so the backing store
+ * stays consistent with silicon's "CM7 writes these bits".
+ */
+#define R100_PMU_BOOT_LOG_OFFSET        0x980
+#define R100_PMU_CM7_BOOT_DONE_STATE    0x00203C00u /* bits 10-13 | bit 21 */
+
 static uint64_t r100_pmu_read(void *opaque, hwaddr addr, unsigned size)
 {
     R100PMUState *s = R100_PMU(opaque);
     uint32_t reg_idx = addr >> 2;
+    uint32_t val;
 
     if (reg_idx >= R100_PMU_REG_COUNT) {
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -110,7 +141,11 @@ static uint64_t r100_pmu_read(void *opaque, hwaddr addr, unsigned size)
         return 0;
     }
 
-    return s->regs[reg_idx];
+    val = s->regs[reg_idx];
+    if (s->chiplet_id == 0 && addr == R100_PMU_BOOT_LOG_OFFSET) {
+        val |= R100_PMU_CM7_BOOT_DONE_STATE;
+    }
+    return val;
 }
 
 /*

@@ -107,7 +107,10 @@ output/
       cmdline.txt     # x86 QEMU invocation
       qemu.stdout.log
       qemu.stderr.log
-      serial.log      # x86 guest serial (SeaBIOS + "No bootable device" idle)
+      serial.log      # x86 guest serial:
+                      #   - SeaBIOS + "No bootable device" idle (default),  OR
+                      #   - Linux boot log + setup.sh trace + kmd dmesg (M8b Stage 2,
+                      #     when images/x86_guest/bzImage + initramfs.cpio.gz exist)
       monitor.sock    # host HMP monitor (unix socket)
       doorbell.sock   # unix-socket chardev listener (host = server, NPU = client; M6+M8a)
       msix.sock       # unix-socket chardev listener (host = server, NPU = client; M7)
@@ -443,6 +446,109 @@ that both QEMUs are up and that `output/<name>/host/issr.sock` exists.
 `./remucli run --host` auto-verifies both qtree checks on startup and
 prints pass/fail to stdout (non-fatal — the NPU still boots for
 post-mortem poking if the wiring is missing).
+
+### x86 Linux guest boot (M8b Stage 2)
+
+Until M8b Stage 2, the x86 side of `./remucli run --host` stopped at
+SeaBIOS's "No bootable device" idle loop. Stage 2 adds the ability
+to boot a real Linux kernel that loads the Rebellions kmd
+(`rebellions.ko`) against our emulated PCI endpoint, so the
+`FW_BOOT_DONE` handshake ends up in guest dmesg instead of just on
+`issr.log`.
+
+**Artifacts staged under `images/x86_guest/` (gitignored):**
+
+```
+images/x86_guest/
+  bzImage              # Ubuntu HWE distro kernel, ~15 MB
+  initramfs.cpio.gz    # busybox + 9p modules + /init, ~1.3 MB
+```
+
+Both are produced by `./guest/build-guest-image.sh`, which uses
+`apt-get download` to fetch `linux-{image,modules}-$(uname -r)` and
+`busybox-static` from the Ubuntu archive (no sudo, nothing installed
+system-wide), `dpkg-deb -x` to extract them, cherry-picks the 4
+modules needed for virtio-9p (`netfs`, `9pnet`, `9pnet_virtio`, `9p`
+— virtio-pci is builtin in Ubuntu HWE kernels), and assembles a
+minimal cpio initramfs with a `/init` that mounts the share and runs
+`setup.sh`.
+
+**Shared folder (`guest/`, tracked in git):**
+
+```
+guest/
+  README.md
+  build-guest-image.sh     # produces images/x86_guest/{bzImage,initramfs.cpio.gz}
+  build-kmd.sh             # produces rebellions.ko + rblnfs.ko against host kernel headers
+  setup.sh                 # runs INSIDE the guest; insmod + FW_BOOT_DONE probe
+  rebellions.ko            # gitignored; rebuilt by build-kmd.sh for current kernel
+  rblnfs.ko                # gitignored; companion module (depends on rebellions)
+  output/                  # gitignored; setup.sh inside the guest drops dmesg/lspci here
+```
+
+Exposed to the guest via `-fsdev local,path=<repo>/guest,id=remu
+-device virtio-9p-pci,fsdev=remu,mount_tag=remu`. Because this is a
+9p pass-through (not a disk image), anything `setup.sh` writes to
+`/mnt/remu/output/` inside the guest lands in `guest/output/` on the
+host in real time.
+
+**One-time setup (host):**
+
+```
+./guest/build-guest-image.sh   # stages images/x86_guest/{bzImage,initramfs.cpio.gz}
+./guest/build-kmd.sh           # stages guest/rebellions.ko and guest/rblnfs.ko
+```
+
+If either file under `images/x86_guest/` is missing, `./remucli run
+--host` silently falls back to the pre-M8b SeaBIOS-idle behaviour —
+all earlier-milestone tests (M5/M6/M7/M8a) keep working untouched.
+
+**Auto-wiring in `./remucli run --host`:**
+
+- Adds `-kernel <bzImage> -initrd <initramfs.cpio.gz>
+  -append "console=ttyS0 rdinit=/init earlyprintk=serial"`.
+- Adds `-fsdev local,id=remu,path=guest/,security_model=none
+  -device virtio-9p-pci,fsdev=remu,mount_tag=remu`.
+- Flips `-cpu qemu64 → -cpu max` on the x86 QEMU. The stock kmd is
+  built with `-march=native` and emits BMI2-encoded instructions
+  (e.g. BZHI) that trap as `#UD` on the minimal `qemu64` CPU,
+  killing `rbln_init` immediately. `-cpu max` exposes every TCG
+  feature so the unmodified .ko runs with no patching.
+
+CLI overrides (all on `./remucli run`):
+
+| Flag                    | Effect                                           |
+|-------------------------|--------------------------------------------------|
+| `--guest-kernel PATH`   | Use a different bzImage                          |
+| `--guest-initrd PATH`   | Use a different initramfs                        |
+| `--guest-share PATH`    | Share a different host dir (default: `guest/`)   |
+| `--no-guest-boot`       | Skip all of the above, stay on SeaBIOS idle      |
+| `--guest-cmdline-extra` | Extra kernel cmdline tokens (e.g. `loglevel=7`)  |
+
+**Expected `output/<name>/host/serial.log` timeline on a healthy Stage 2 run:**
+
+```
+Linux version 6.8.0-107-generic … boot banner
+[init] kernel 6.8.0-107-generic up — loading 9p modules
+9p: Installing v9fs 9p2000 file system support
+[init] mounting 9p share 'remu' at /mnt/remu
+[init] 9p mount OK
+[init] running /mnt/remu/setup.sh
+[setup] found CR03 quad at 0000:00:05.0
+[setup] insmod rebellions.ko
+rebellions 0000:00:05.0: pci main[1eff,2030] sub[1af4,1100] rev[1]
+rebellions 0000:00:05.0: [BAR-0/DDR]      size 0x1000000000
+rebellions 0000:00:05.0: [BAR-2/ACP]      size 0x4000000
+rebellions 0000:00:05.0: [BAR-4/DOORBELL] size 0x800000
+rebellions 0000:00:05.0: [BAR-5/PCIE]     size 0x100000
+rebellions rbln0: msix vectors count: requested 32, supported 32
+rebellions rbln0: FW_BOOT_DONE                           ← success marker
+```
+
+If `FW_BOOT_DONE` never shows up, walk the NPU side: `issr.log`
+should contain `off=0x90 val=0xfb0d`, then host-side `xp /1wx
+0xfe000090` on `monitor.sock` should read back `0xfb0d`. See M8a's
+section above for the shadow-check recipe.
 
 ## Interpreting a boot log
 

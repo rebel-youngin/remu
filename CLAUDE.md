@@ -23,6 +23,8 @@ wrapper around `cli/remu_cli.py`. **No install step** — just make sure
 ./remucli run --name my-test        # Phase 1: boot NPU only; logs land in output/my-test/
 ./remucli run --name dbg --gdb      # Phase 1: boot paused, wait for GDB on :1234
 ./remucli run --host --name pair    # Phase 2: launch NPU + x86 host QEMUs with r100-npu-pci bridge
+./guest/build-guest-image.sh        # M8b Stage 2: stage images/x86_guest/{bzImage,initramfs.cpio.gz}
+./guest/build-kmd.sh                # M8b Stage 2: rebuild rebellions.ko + rblnfs.ko against host kernel
 ```
 
 `./remucli build` produces two QEMU binaries from one pinned source
@@ -62,10 +64,24 @@ that layer the shared file at offset 0 and lazy RAM over the tail:
 The NPU QEMU's HMP monitor is exposed on a second unix socket at
 `output/<name>/npu/monitor.sock` (on top of the existing stdio-muxed
 readline monitor on uart0). SeaBIOS is allowed to run so the x86 BAR
-addresses get programmed; the guest idles at "No bootable device" with
-serial redirected to `host/serial.log`. The host-side HMP monitor lives
-at `output/<name>/host/monitor.sock` (use `socat - UNIX-CONNECT:...` for
-interactive HMP).
+addresses get programmed; by default the guest then idles at "No
+bootable device" with serial redirected to `host/serial.log`. The
+host-side HMP monitor lives at `output/<name>/host/monitor.sock` (use
+`socat - UNIX-CONNECT:...` for interactive HMP).
+
+**M8b Stage 2 (x86 Linux guest):** when the artifacts
+`images/x86_guest/bzImage` and `images/x86_guest/initramfs.cpio.gz`
+exist (staged by `./guest/build-guest-image.sh`), the same
+`--host` invocation auto-adds `-kernel / -initrd` + a virtio-9p
+`-fsdev local,path=guest/,mount_tag=remu` share and flips the x86
+CPU to `-cpu max`. The guest then boots a real Ubuntu HWE kernel
+with a busybox initramfs that mounts `guest/` at `/mnt/remu` and
+runs `setup.sh` (which insmod's `rebellions.ko` and waits for the
+kmd to print `FW_BOOT_DONE` in dmesg). Overrides:
+`--guest-kernel`, `--guest-initrd`, `--guest-share`,
+`--no-guest-boot`, `--guest-cmdline-extra`. `-cpu max` is required
+because the stock kmd is built with `-march=native` and emits BMI2
+instructions that trap `#UD` on the minimal `qemu64` CPU.
 
 `./remucli run --host` auto-verifies every bridge end-to-end:
   - **M4**: `info pci` on host must list `1eff:2030` (logged to
@@ -151,7 +167,10 @@ cli/remu_cli.py       Click-based CLI implementation (invoked by ./remucli)
 tests/                Test binaries and test scripts
 docs/                 Architecture, roadmap, debugging docs
 external/             Read-only: ssw-bundle (q-sys, q-cp, kmd, umd, ...), qemu
+guest/                M8b Stage 2: virtio-9p share mounted by the x86 Linux guest
+                      (build-guest-image.sh, build-kmd.sh, setup.sh; rebellions.ko + rblnfs.ko are gitignored)
 images/               FW binaries (bl1.bin, bl31_cp0.bin, freertos_cp0.bin, ...)
+images/x86_guest/     M8b Stage 2: staged x86 guest kernel + initramfs (gitignored)
 build/qemu/           QEMU build output (gitignored)
 output/               Per-run log directories (gitignored; see docs/debugging.md)
 ```

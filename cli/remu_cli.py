@@ -59,6 +59,17 @@ SHM_ROOT = Path("/dev/shm")
 SHM_SIZE_DEFAULT = 128 * 1024 * 1024
 HOST_MEM_DEFAULT = "512M"
 
+# M8b Stage 2: x86 guest boot artifacts produced by
+# guest/build-guest-image.sh. When both files exist `./remucli run
+# --host` auto-wires -kernel/-initrd + a virtio-9p share mapped at
+# guest/ so the guest boots straight into /mnt/remu/setup.sh and
+# tries to insmod rebellions.ko. Absent either file, the host QEMU
+# keeps its M3-era SeaBIOS idle behavior.
+X86_GUEST_DIR = REMU_ROOT / "images" / "x86_guest"
+X86_GUEST_KERNEL = X86_GUEST_DIR / "bzImage"
+X86_GUEST_INITRD = X86_GUEST_DIR / "initramfs.cpio.gz"
+X86_GUEST_SHARE = REMU_ROOT / "guest"
+
 # q-sys (CP firmware) build paths
 SSW_SYS = REMU_ROOT / "external" / "ssw-bundle" / "products" / "rebel" / "q" / "sys"
 SSW_SYS_BUILD = SSW_SYS / "build.sh"
@@ -664,7 +675,9 @@ def _setup_shm(run_name, size):
 
 def _build_host_cmd(host_dir, shm_file, shm_size, monitor_sock, mem,
                     doorbell_sock=None, msix_sock=None, msix_log=None,
-                    issr_sock=None, issr_log=None):
+                    issr_sock=None, issr_log=None,
+                    kernel=None, initrd=None, share_dir=None,
+                    cmdline_extra=None):
     """Assemble the x86_64 QEMU cmdline for the Phase-2 host side.
 
     M3 upgraded the placeholder ivshmem-plain to our own `r100-npu-pci`
@@ -744,10 +757,17 @@ def _build_host_cmd(host_dir, shm_file, shm_size, monitor_sock, mem,
             ]
             device_arg += ",issr-debug=issr_dbg"
 
+    # `qemu64` is a minimal CPU model missing BMI2/AVX2/etc. Our kmd
+    # (rebellions.ko) is built on the host with `-march=native` and
+    # emits VEX-encoded BMI2 instructions (e.g. BZHI) that trap as
+    # #UD on qemu64, killing `rbln_init` immediately. `max` under TCG
+    # exposes every feature QEMU can emulate so the stock .ko just
+    # works without patching the kmd Makefile.
+    cpu_model = "max" if kernel is not None else "qemu64"
     cmd = [
         str(QEMU_BIN_X86),
         "-M", "pc",
-        "-cpu", "qemu64",
+        "-cpu", cpu_model,
         "-m", mem,
         "-display", "none",
         "-nographic",
@@ -755,6 +775,34 @@ def _build_host_cmd(host_dir, shm_file, shm_size, monitor_sock, mem,
         "-object",
         "memory-backend-file,id=remushm,mem-path=%s,size=%d,share=on"
         % (shm_file, shm_size),
+    ]
+
+    # Boot a real Linux guest (M8b Stage 2): prebuilt distro kernel +
+    # tiny busybox/initramfs (see guest/build-guest-image.sh). Without
+    # these args the guest stays at the SeaBIOS "No bootable device"
+    # prompt so earlier milestone tests keep working unchanged.
+    if kernel is not None:
+        append = "console=ttyS0 rdinit=/init earlyprintk=serial"
+        if cmdline_extra:
+            append += " " + cmdline_extra
+        cmd += [
+            "-kernel", str(kernel),
+            "-append", append,
+        ]
+        if initrd is not None:
+            cmd += ["-initrd", str(initrd)]
+
+    # virtio-9p pass-through so the guest's /init can mount the repo's
+    # guest/ directory at /mnt/remu and drop its kmd-insmod +
+    # FW_BOOT_DONE probe artifacts right back onto the host FS.
+    if share_dir is not None:
+        cmd += [
+            "-fsdev",
+            "local,id=remu,path=%s,security_model=none" % share_dir,
+            "-device", "virtio-9p-pci,fsdev=remu,mount_tag=remu",
+        ]
+
+    cmd += [
         *chardevs,
         "-device", device_arg,
         "-chardev",
@@ -1181,8 +1229,25 @@ def _verify_npu_shared_mapping(npu_monitor_sock, mtree_log):
 @click.option("--shm-size", type=int, default=SHM_SIZE_DEFAULT,
               help="Bytes for the shared-memory backing file "
                    "(default: 128 MB). M4+ will alias this into BAR0.")
+@click.option("--guest-kernel", type=click.Path(dir_okay=False), default=None,
+              help="Path to x86 guest bzImage. Default: "
+                   "images/x86_guest/bzImage if present.")
+@click.option("--guest-initrd", type=click.Path(dir_okay=False), default=None,
+              help="Path to x86 guest initramfs. Default: "
+                   "images/x86_guest/initramfs.cpio.gz if present.")
+@click.option("--guest-share", type=click.Path(file_okay=False), default=None,
+              help="Host directory to expose over virtio-9p (tag 'remu'). "
+                   "Default: guest/ at the repo root.")
+@click.option("--no-guest-boot", is_flag=True,
+              help="Force SeaBIOS-only boot on the x86 side even if "
+                   "images/x86_guest/{bzImage,initramfs.cpio.gz} exist.")
+@click.option("--guest-cmdline-extra", default=None,
+              help="Extra tokens to append to the guest kernel cmdline "
+                   "(e.g. `debug loglevel=7`).")
 def run(name, output_root, gdb, trace, chiplets, memory,
-        with_host, host_mem, shm_size):
+        with_host, host_mem, shm_size,
+        guest_kernel, guest_initrd, guest_share, no_guest_boot,
+        guest_cmdline_extra):
     """Boot R100 firmware on the emulated SoC.
 
     Every invocation gets a dedicated output directory under
@@ -1309,16 +1374,53 @@ def run(name, output_root, gdb, trace, chiplets, memory,
         host_dir = run_dir / "host"
         host_dir.mkdir(exist_ok=True)
         monitor_sock = host_dir / "monitor.sock"
+
+        # Resolve the x86 guest boot artifacts. Explicit CLI paths win;
+        # otherwise auto-detect under images/x86_guest/. --no-guest-boot
+        # preserves the M3-era SeaBIOS idle mode for regression runs.
+        kernel_path = None
+        initrd_path = None
+        share_path = None
+        if not no_guest_boot:
+            if guest_kernel is not None:
+                kernel_path = Path(guest_kernel).resolve()
+            elif X86_GUEST_KERNEL.exists():
+                kernel_path = X86_GUEST_KERNEL
+            if kernel_path is not None and not kernel_path.exists():
+                click.secho(
+                    "Warning: guest kernel %s not found — falling back "
+                    "to SeaBIOS idle boot" % kernel_path, fg="yellow")
+                kernel_path = None
+            if guest_initrd is not None:
+                initrd_path = Path(guest_initrd).resolve()
+            elif kernel_path is not None and X86_GUEST_INITRD.exists():
+                initrd_path = X86_GUEST_INITRD
+            if guest_share is not None:
+                share_path = Path(guest_share).resolve()
+            elif kernel_path is not None and X86_GUEST_SHARE.is_dir():
+                share_path = X86_GUEST_SHARE
         host_cmd, host_stdout, host_stderr = _build_host_cmd(
             host_dir, shm_file, shm_size, monitor_sock, host_mem,
             doorbell_sock=doorbell_sock,
             msix_sock=msix_sock,
             msix_log=msix_log,
             issr_sock=issr_sock,
-            issr_log=issr_log)
+            issr_log=issr_log,
+            kernel=kernel_path,
+            initrd=initrd_path,
+            share_dir=share_path,
+            cmdline_extra=guest_cmdline_extra)
         (host_dir / "cmdline.txt").write_text(
             " \\\n  ".join(host_cmd) + "\n")
-        click.echo("  Host QEMU   -> SeaBIOS idle (monitor: %s)" % monitor_sock)
+        if kernel_path is not None:
+            click.echo("  Host QEMU   -> Linux guest (monitor: %s)" % monitor_sock)
+            click.echo("    kernel    -> %s" % kernel_path)
+            if initrd_path is not None:
+                click.echo("    initrd    -> %s" % initrd_path)
+            if share_path is not None:
+                click.echo("    9p share  -> %s (tag: remu)" % share_path)
+        else:
+            click.echo("  Host QEMU   -> SeaBIOS idle (monitor: %s)" % monitor_sock)
         click.echo("  Doorbell    -> %s (debug tail: %s)"
                    % (doorbell_sock, doorbell_log))
         click.echo("  MSI-X       -> %s (debug tail: %s)"

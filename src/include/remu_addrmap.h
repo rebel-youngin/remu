@@ -219,7 +219,23 @@
 #define R100_PCIE_INTMEM_BASE       0x1FF8000000ULL
 #define R100_PCIE_CMU_BASE          0x1FF8100000ULL
 #define R100_PCIE_SYSREG_BASE       0x1FF8110000ULL
-#define R100_PCIE_MAILBOX_BASE      0x1FF8160000ULL
+/*
+ * PCIe Samsung-IPM mailbox cluster: 17 contiguous 4 KB SFR blocks at
+ * 0x1FF8160000..0x1FF8170FFF — VF0..VF15 first, then PF. Base points to
+ * VF0 (the block q-sys CA73 listens on; see mailbox_data[IDX_MAILBOX_
+ * PCIE_VF0] in external/ssw-bundle/.../drivers/mailbox/mailbox.c for
+ * __TARGET_CP==0). PF is where the host KMD's BAR4 PCIe TLPs physically
+ * land on silicon, and where q-sys's bootdone_notify_to_host(PCIE_PF)
+ * writes FW_BOOT_DONE into ISSR[4].
+ *
+ * Both blocks need an r100-mailbox QEMU device so FW→host ISSR egress
+ * (PF) and host→NPU INTGR ingress (VF0, via r100-doorbell) both land on
+ * a real peripheral — see src/machine/r100_soc.c for the topology.
+ */
+#define R100_PCIE_MAILBOX_BASE      0x1FF8160000ULL  /* cluster base = VF0 */
+#define R100_PCIE_MAILBOX_SFR_STRIDE 0x1000ULL       /* per-function SFR */
+#define R100_PCIE_MAILBOX_PF_BASE   (R100_PCIE_MAILBOX_BASE + \
+                                     16 * R100_PCIE_MAILBOX_SFR_STRIDE)
 
 /* --- PERI0 block --- */
 #define R100_PERI0_CMU_BASE         0x1FF9000000ULL

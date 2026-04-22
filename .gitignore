@@ -2,8 +2,11 @@ build/
 install/
 output/
 images/*.bin
+images/x86_guest/
 tests/*.bin
 tests/*.o
+guest/*.ko
+guest/output/
 *.egg-info/
 __pycache__/
 *.pyc
