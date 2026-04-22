@@ -480,7 +480,8 @@ def _make_run_dir(name, output_root):
 
 def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
                    npu_monitor_sock=None, doorbell_sock=None,
-                   doorbell_log=None, msix_sock=None, msix_log=None):
+                   doorbell_log=None, msix_sock=None, msix_log=None,
+                   issr_sock=None, issr_log=None):
     """Assemble the aarch64 QEMU cmdline for the R100 NPU side.
     Matches the previous in-line flow exactly; extracted so that
     --host can extend it (Phase 2) without duplicating boot-image
@@ -511,7 +512,19 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
     r100-imsix device emits an 8-byte (offset, db_data) frame on this
     chardev; the host's r100-npu-pci consumes it and fires
     msix_notify(). An optional `msix_log` file chardev echoes every
-    emitted frame as an ASCII line for humans and tests."""
+    emitted frame as an ASCII line for humans and tests.
+
+    issr_sock / issr_log: M8 plumbing — NPU→host ISSR shadow-egress.
+    When `issr_sock` is a path, the NPU attaches a client socket
+    chardev (same host-as-server pattern as M6/M7) and wires it into
+    the r100-soc machine's `issr` option, which the chiplet-0
+    r100-mailbox picks up. Every MMIO-path write to one of its
+    ISSR0..63 scratch registers emits an 8-byte (BAR4-offset, value)
+    frame; the host-side r100-npu-pci write-throughs `value` into
+    bar4_mmio_regs[BAR4-offset/4] so a later KMD readl() on the
+    matching BAR4 offset observes the FW-written magic (FW_BOOT_DONE
+    on ISSR[4], reset counters on ISSR[7], and so on). Optional
+    `issr_log` file chardev echoes one ASCII line per egress."""
     uart0_log = run_dir / "uart0.log"
     hils_log = run_dir / "hils.log"
 
@@ -526,6 +539,10 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
         machine_opt += ",msix=msix"
         if msix_log is not None:
             machine_opt += ",msix-debug=msix_dbg"
+    if issr_sock is not None:
+        machine_opt += ",issr=issr"
+        if issr_log is not None:
+            machine_opt += ",issr-debug=issr_dbg"
 
     cmd = [
         str(QEMU_BIN),
@@ -566,6 +583,20 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
             cmd += [
                 "-chardev",
                 "file,id=msix_dbg,path=%s,mux=off" % msix_log,
+            ]
+    if issr_sock is not None:
+        # M8: same host-as-server client pattern as M6/M7. Host owns
+        # the listener (its realize installs the issr_chr receive
+        # handler first); NPU connects as client and every FW-side
+        # ISSR write egresses over this socket.
+        cmd += [
+            "-chardev",
+            "socket,id=issr,path=%s,reconnect=1" % issr_sock,
+        ]
+        if issr_log is not None:
+            cmd += [
+                "-chardev",
+                "file,id=issr_dbg,path=%s,mux=off" % issr_log,
             ]
     click.echo("  Chiplet 0 UART -> stdio (log: %s)" % uart0_log)
 
@@ -632,7 +663,8 @@ def _setup_shm(run_name, size):
 
 
 def _build_host_cmd(host_dir, shm_file, shm_size, monitor_sock, mem,
-                    doorbell_sock=None, msix_sock=None, msix_log=None):
+                    doorbell_sock=None, msix_sock=None, msix_log=None,
+                    issr_sock=None, issr_log=None):
     """Assemble the x86_64 QEMU cmdline for the Phase-2 host side.
 
     M3 upgraded the placeholder ivshmem-plain to our own `r100-npu-pci`
@@ -654,6 +686,15 @@ def _build_host_cmd(host_dir, shm_file, shm_size, monitor_sock, mem,
     REBELH_PCIE_MSIX_ADDR) and fires msix_notify() for the encoded
     vector. `msix_log`, when set, is a file chardev wired to the
     device's `msix-debug` option so every frame leaves an ASCII trail.
+
+    M8 adds the `issr` chardev: the same 8-byte (offset, value) frame
+    format but carrying NPU-side ISSR writes from the chiplet-0
+    r100-mailbox into the host's BAR4 MMIO register file. `issr_log`,
+    when set, is a file chardev wired to the device's `issr-debug`
+    option so every ingressed frame leaves an ASCII trail. Host-side
+    BAR4 MAILBOX_BASE writes flow OUT over the existing `doorbell`
+    chardev (offset disambiguation is done by the NPU r100-doorbell),
+    so M8 only needs one new chardev, not two.
 
     SeaBIOS IS allowed to run (no `-S`) so the BAR addresses get
     programmed — the automated verify queries `info mtree`, which
@@ -690,6 +731,18 @@ def _build_host_cmd(host_dir, shm_file, shm_size, monitor_sock, mem,
                 "file,id=msix_dbg,path=%s,mux=off" % msix_log,
             ]
             device_arg += ",msix-debug=msix_dbg"
+    if issr_sock is not None:
+        chardevs += [
+            "-chardev",
+            "socket,id=issr,path=%s,server=on,wait=off" % issr_sock,
+        ]
+        device_arg += ",issr=issr"
+        if issr_log is not None:
+            chardevs += [
+                "-chardev",
+                "file,id=issr_dbg,path=%s,mux=off" % issr_log,
+            ]
+            device_arg += ",issr-debug=issr_dbg"
 
     cmd = [
         str(QEMU_BIN_X86),
@@ -1008,6 +1061,77 @@ def _verify_msix_wired(host_monitor_sock, npu_monitor_sock,
     return npu_snippet + "\n" + host_snippet
 
 
+def _verify_issr_wired(host_monitor_sock, npu_monitor_sock,
+                       host_qtree_log, npu_qtree_log,
+                       poll_timeout=10.0):
+    """Prove the M8 ISSR shadow-egress plumbing is alive on both sides.
+
+    Unlike M6/M7, M8 doesn't introduce a new MemoryRegion — the ISSR
+    egress is a property on the existing chiplet-0 r100-mailbox, and
+    the ingress is a CharBackend on the existing host r100-npu-pci.
+    So we inspect `info qtree` on both sides and look for:
+
+    NPU side:  r100-mailbox with a non-null `issr-chardev` property.
+               Realization only succeeds when the chardev is found in
+               qemu_chr_find(), so presence of a *value* here proves
+               both the CLI wiring and the late-binding path.
+
+    Host side: r100-npu-pci with a non-null `issr` property (a
+               CharBackend prints as the chardev id, e.g. `issr`).
+
+    Raises RuntimeError with an actionable message on failure.
+    """
+    qtree_npu = ""
+    deadline = time.time() + poll_timeout
+    while time.time() < deadline:
+        qtree_npu = _hmp_query(npu_monitor_sock, "info qtree", timeout=10.0)
+        if "issr-chardev" in qtree_npu and 'issr-chardev ""' not in qtree_npu:
+            break
+        time.sleep(0.3)
+    npu_qtree_log.write_text(qtree_npu + "\n")
+
+    npu_lines = [ln.rstrip() for ln in qtree_npu.splitlines()
+                 if "issr-chardev" in ln]
+    # Any non-empty chardev value (the chardev id string) proves the
+    # CLI-to-machine-to-device wiring took. qdev prints unset
+    # CharBackend properties as `prop "" ""` in info qtree.
+    if not any('""' not in ln for ln in npu_lines):
+        raise RuntimeError(
+            "NPU-side r100-mailbox 'issr-chardev' property is unset; "
+            "the -machine r100-soc,issr=<id> option didn't latch. "
+            "See %s" % npu_qtree_log)
+    npu_snippet = "\n".join(npu_lines) or "(no issr-chardev lines)"
+
+    qtree_host = ""
+    deadline = time.time() + poll_timeout
+    while time.time() < deadline:
+        qtree_host = _hmp_query(host_monitor_sock, "info qtree", timeout=10.0)
+        # Host property is literally `issr` (not `issr-chardev`); the
+        # CharBackend prints on its own line as `  issr = "issr"`.
+        for ln in qtree_host.splitlines():
+            stripped = ln.strip()
+            if stripped.startswith("issr ") and '""' not in stripped:
+                break
+        else:
+            time.sleep(0.3)
+            continue
+        break
+    host_qtree_log.write_text(qtree_host + "\n")
+
+    host_lines = [ln.rstrip() for ln in qtree_host.splitlines()
+                  if ln.strip().startswith("issr ")
+                  or ln.strip().startswith("issr-debug ")]
+    if not any('""' not in ln for ln in host_lines
+               if ln.strip().startswith("issr ")):
+        raise RuntimeError(
+            "host-side r100-npu-pci 'issr' property is unset; "
+            "the -device r100-npu-pci,issr=<id> option didn't latch. "
+            "See %s" % host_qtree_log)
+    host_snippet = "\n".join(host_lines) or "(no issr lines)"
+
+    return npu_snippet + "\n" + host_snippet
+
+
 def _verify_npu_shared_mapping(npu_monitor_sock, mtree_log):
     """Prove the shared memory-backend-file is spliced over chiplet 0
     DRAM on the NPU side (M5).
@@ -1093,8 +1217,10 @@ def run(name, output_root, gdb, trace, chiplets, memory,
       host/info-mtree-bar5.log `info mtree` snippet showing BAR5 msix-table (M7)
       host/doorbell.sock M6 NPU→host-visible doorbell socket
       host/msix.sock     M7 NPU→host MSI-X reverse-direction socket
+      host/issr.sock     M8 NPU→host ISSR shadow-egress socket
       doorbell.log       ASCII tail of doorbell frames received by NPU (M6)
       msix.log           ASCII tail of MSI-X frames emitted by NPU (M7)
+      issr.log           ASCII tail of ISSR frames emitted by NPU (M8)
 
     `<output-root>/latest` is updated to point at the most recent run.
     """
@@ -1112,21 +1238,25 @@ def run(name, output_root, gdb, trace, chiplets, memory,
     doorbell_log = None
     msix_sock = None
     msix_log = None
+    issr_sock = None
+    issr_log = None
     if with_host:
         npu_dir = run_dir / "npu"
         npu_dir.mkdir(exist_ok=True)
         npu_monitor_sock = npu_dir / "monitor.sock"
-        # M6 doorbell and M7 iMSIX use the same host-as-server +
-        # NPU-as-client pattern; sockets live under host/ so they
-        # survive alongside the other host-owned artifacts. ASCII
-        # debug tails sit at run root so users can tail them without
-        # guessing which side "owns" them. Stale sock paths would
-        # make the host bind EADDRINUSE; clean both before launch.
+        # M6 doorbell and M7 iMSIX and M8 ISSR shadow all use the
+        # same host-as-server + NPU-as-client pattern; sockets live
+        # under host/ so they survive alongside the other host-owned
+        # artifacts. ASCII debug tails sit at run root so users can
+        # tail them without guessing which side "owns" them. Stale
+        # sock paths would make the host bind EADDRINUSE; clean
+        # them all before launch.
         host_dir_early = run_dir / "host"
         host_dir_early.mkdir(exist_ok=True)
         doorbell_sock = host_dir_early / "doorbell.sock"
         msix_sock = host_dir_early / "msix.sock"
-        for p in (doorbell_sock, msix_sock):
+        issr_sock = host_dir_early / "issr.sock"
+        for p in (doorbell_sock, msix_sock, issr_sock):
             if p.exists():
                 try:
                     p.unlink()
@@ -1134,6 +1264,7 @@ def run(name, output_root, gdb, trace, chiplets, memory,
                     pass
         doorbell_log = run_dir / "doorbell.log"
         msix_log = run_dir / "msix.log"
+        issr_log = run_dir / "issr.log"
 
     npu_cmd, found = _build_npu_cmd(run_dir, gdb, trace,
                                     with_host=with_host,
@@ -1141,7 +1272,9 @@ def run(name, output_root, gdb, trace, chiplets, memory,
                                     doorbell_sock=doorbell_sock,
                                     doorbell_log=doorbell_log,
                                     msix_sock=msix_sock,
-                                    msix_log=msix_log)
+                                    msix_log=msix_log,
+                                    issr_sock=issr_sock,
+                                    issr_log=issr_log)
 
     if found == 0:
         click.secho("Warning: no firmware images in %s/" % IMAGES_DIR,
@@ -1180,7 +1313,9 @@ def run(name, output_root, gdb, trace, chiplets, memory,
             host_dir, shm_file, shm_size, monitor_sock, host_mem,
             doorbell_sock=doorbell_sock,
             msix_sock=msix_sock,
-            msix_log=msix_log)
+            msix_log=msix_log,
+            issr_sock=issr_sock,
+            issr_log=issr_log)
         (host_dir / "cmdline.txt").write_text(
             " \\\n  ".join(host_cmd) + "\n")
         click.echo("  Host QEMU   -> SeaBIOS idle (monitor: %s)" % monitor_sock)
@@ -1188,6 +1323,8 @@ def run(name, output_root, gdb, trace, chiplets, memory,
                    % (doorbell_sock, doorbell_log))
         click.echo("  MSI-X       -> %s (debug tail: %s)"
                    % (msix_sock, msix_log))
+        click.echo("  ISSR        -> %s (debug tail: %s)"
+                   % (issr_sock, issr_log))
 
     (run_dir / "cmdline.txt").write_text(" \\\n  ".join(npu_cmd) + "\n")
 
@@ -1252,6 +1389,11 @@ def run(name, output_root, gdb, trace, chiplets, memory,
         if msix_sock and msix_sock.exists():
             try:
                 msix_sock.unlink()
+            except OSError:
+                pass
+        if issr_sock and issr_sock.exists():
+            try:
+                issr_sock.unlink()
             except OSError:
                 pass
 
@@ -1376,6 +1518,25 @@ def run(name, output_root, gdb, trace, chiplets, memory,
                 "  msix chardev wired: r100-imsix on NPU + "
                 "msix-table overlay on host BAR5", fg="green")
             for ln in msix_snip.splitlines():
+                click.echo("    " + ln)
+            click.echo()
+        except Exception as e:
+            click.secho("  %s" % e, fg="red")
+
+        # M8: Verify the ISSR shadow-egress plumbing is wired on both
+        # sides. Failure is non-fatal — the NPU still boots and the
+        # other bridges keep working — but surfacing it early saves a
+        # debugging round-trip when the chardev id gets mangled.
+        try:
+            issr_snip = _verify_issr_wired(
+                host_dir / "monitor.sock", npu_monitor_sock,
+                host_dir / "info-qtree-issr.log",
+                npu_dir / "info-qtree-issr.log",
+            )
+            click.secho(
+                "  issr chardev wired: r100-mailbox egress on NPU + "
+                "r100-npu-pci ingress on host", fg="green")
+            for ln in issr_snip.splitlines():
                 click.echo("    " + ln)
             click.echo()
         except Exception as e:

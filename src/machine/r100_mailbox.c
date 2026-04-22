@@ -1,5 +1,5 @@
 /*
- * R100 Samsung IPM mailbox peripheral (Phase 2, M7 prep).
+ * R100 Samsung IPM mailbox peripheral (Phase 2, M6 + M8a).
  *
  * Models one instance of the Samsung mailbox SFR block that sits on the
  * config-space path between two CPUs. The real silicon has 20+ copies
@@ -33,29 +33,53 @@
  * pending bit unmasked. A pending bit is cleared either by an INTCR
  * write (the normal ISR path) or a MCUCTRL mswrst.
  *
- * For Phase 2/M7 only chiplet 0's PCIE mailbox is actually wired to a
+ * For Phase 2 only chiplet 0's PCIE mailbox is actually wired to a
  * GIC (see r100_soc.c). The device is otherwise untargeted from
  * MMIO — FW accesses it through its cfg-space alias via the sysmem
  * mapping installed by the machine.
  *
- * The M6 doorbell path (host BAR4 MAILBOX_INTGR writes forwarded over
- * a chardev) used to pulse a placeholder SPI directly; with this
- * device in place, src/machine/r100_doorbell.c calls
- * r100_mailbox_raise_intgr() instead and the SPI is asserted as the
+ * M6 (host → NPU IRQ). The doorbell path (host BAR4 MAILBOX_INTGR
+ * writes forwarded over a chardev) used to pulse a placeholder SPI
+ * directly; with this device in place, src/machine/r100_doorbell.c
+ * calls r100_mailbox_raise_intgr() and the SPI is asserted as the
  * natural consequence of the mailbox's INTMSR going non-zero. That
  * matches silicon: on the real chip, a host PCIe write to
  * MAILBOX_PCIE_PRIVATE + INTGR1 sets pending bits in the same SFR
  * the ISR then reads from.
  *
+ * M8a (bidirectional ISSR shadow for BAR4 + MAILBOX_BASE):
+ *   - NPU → host: every MMIO write into ISSRn (any origin — firmware
+ *     ISR, test poke, future stub) re-emits the `(bar4_offset, value)`
+ *     pair on an optional `issr-chardev`. The host-side r100-npu-pci
+ *     mirrors it into its BAR4 MMIO register file so the x86 kmd sees
+ *     a live shadow at BAR4 + MAILBOX_BASE + idx*4. This is the only
+ *     direction where the mailbox talks to the chardev bridge — there
+ *     is no ingress path, because host-to-NPU traffic arrives via the
+ *     doorbell chardev + r100-doorbell + r100_mailbox_set_issr().
+ *   - Host → NPU: r100_mailbox_set_issr(idx, val) is the API the
+ *     doorbell calls on receipt of a MAILBOX_BASE frame. It updates
+ *     the same ISSR storage but *intentionally does not* emit on the
+ *     issr chardev (the host is already the source of the value;
+ *     re-emitting would alias the write back to itself and wedge the
+ *     shadow in an infinite loop). It also does not touch INTSR /
+ *     INTGR — ISSR writes are plain scratch-register traffic.
+ *
+ * The issr-debug chardev is advisory; the CLI directs it to
+ * output/<run>/issr.log so tests can check who wrote what in which
+ * order.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
 #include "qemu/osdep.h"
+#include "qemu/bswap.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "hw/sysbus.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
+#include "hw/qdev-properties-system.h"
+#include "chardev/char-fe.h"
 #include "migration/vmstate.h"
 #include "r100_soc.h"
 
@@ -97,6 +121,77 @@ void r100_mailbox_raise_intgr(R100MailboxState *s, int group, uint32_t val)
     s->pending[group] |= val;
     s->intgr_writes[group]++;
     r100_mailbox_update_irq(s, group);
+}
+
+/*
+ * M8 NPU→host ISSR egress.
+ *
+ * Emit an 8-byte (bar4_off, val) frame on the egress chardev when
+ * `issr_chr` is connected. The `bar4_off` field is the BAR4 offset
+ * the host KMD uses to reach the mirrored ISSR register (= MAILBOX_BASE
+ * + idx*4), not the NPU-side SFR offset (ISSR0 + idx*4). This keeps
+ * the host side parser trivial — it just indexes into bar4_mmio_regs
+ * with `off >> 2`. Best-effort non-blocking write: silicon doesn't
+ * back-pressure the CPU on mailbox stores either, so on short writes
+ * we count and drop and rely on the next ISSR write to resync state.
+ */
+static void r100_mailbox_issr_emit_debug(R100MailboxState *s, uint32_t idx,
+                                         uint32_t val)
+{
+    char line[96];
+    int n;
+
+    if (!qemu_chr_fe_backend_connected(&s->issr_debug_chr)) {
+        return;
+    }
+    n = snprintf(line, sizeof(line),
+                 "issr[%s] idx=%u val=0x%x egress=%" PRIu64 "\n",
+                 s->name ? s->name : "?", idx, val, s->issr_egress_frames);
+    if (n > 0) {
+        qemu_chr_fe_write(&s->issr_debug_chr, (const uint8_t *)line, n);
+    }
+}
+
+static void r100_mailbox_issr_emit(R100MailboxState *s, uint32_t idx,
+                                   uint32_t val)
+{
+    uint8_t frame[8];
+    uint32_t bar4_off;
+    int rc;
+
+    if (!qemu_chr_fe_backend_connected(&s->issr_chr)) {
+        return;
+    }
+
+    bar4_off = R100_BAR4_MAILBOX_BASE + idx * 4U;
+    stl_le_p(&frame[0], bar4_off);
+    stl_le_p(&frame[4], val);
+
+    rc = qemu_chr_fe_write(&s->issr_chr, frame, sizeof(frame));
+    if (rc != sizeof(frame)) {
+        qemu_log_mask(LOG_UNIMP,
+                      "r100-mailbox[%s]: issr egress idx=%u val=0x%x "
+                      "dropped (rc=%d)\n",
+                      s->name ? s->name : "?", idx, val, rc);
+        s->issr_egress_dropped++;
+        return;
+    }
+    s->issr_egress_frames++;
+    r100_mailbox_issr_emit_debug(s, idx, val);
+}
+
+void r100_mailbox_set_issr(R100MailboxState *s, uint32_t idx, uint32_t val)
+{
+    if (!s || idx >= R100_MBX_ISSR_COUNT) {
+        return;
+    }
+    /* Ingress from host-side BAR4 payload writes: update backing
+     * store, count for observability, but DO NOT re-emit on the
+     * egress chardev — the host already has its own view of this
+     * value and echoing would produce an infinite loop across
+     * the two QEMU processes. */
+    s->issr[idx] = val;
+    s->issr_ingress_writes++;
 }
 
 static uint64_t r100_mailbox_read(void *opaque, hwaddr addr, unsigned size)
@@ -201,7 +296,15 @@ static void r100_mailbox_write(void *opaque, hwaddr addr, uint64_t val,
     default:
         if (addr >= R100_MBX_ISSR0 &&
             addr < R100_MBX_ISSR0 + R100_MBX_ISSR_COUNT * 4) {
-            s->issr[(addr - R100_MBX_ISSR0) >> 2] = v;
+            uint32_t idx = (addr - R100_MBX_ISSR0) >> 2;
+            s->issr[idx] = v;
+            /* MMIO-path writes (FW CPU / PCIE_CM7 stores) are the
+             * NPU→host egress trigger: every such write emits an
+             * (bar4_off, val) frame on issr_chr if the chardev is
+             * connected. Writes driven by r100_mailbox_set_issr()
+             * (host→NPU ingress) bypass this function entirely, so
+             * there is no echo risk. */
+            r100_mailbox_issr_emit(s, idx, v);
             return;
         }
         qemu_log_mask(LOG_UNIMP,
@@ -234,6 +337,19 @@ static void r100_mailbox_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq[0]);
     sysbus_init_irq(sbd, &s->irq[1]);
+
+    /* ISSR egress is write-only: we never consume bytes from the
+     * chardev, only emit. Installing no receive handler is OK —
+     * qemu_chr_fe_write() is driven by our MMIO path. The chardev
+     * is optional (single-QEMU runs leave it disconnected). */
+}
+
+static void r100_mailbox_unrealize(DeviceState *dev)
+{
+    R100MailboxState *s = R100_MAILBOX(dev);
+
+    qemu_chr_fe_deinit(&s->issr_chr, false);
+    qemu_chr_fe_deinit(&s->issr_debug_chr, false);
 }
 
 static void r100_mailbox_reset(DeviceState *dev)
@@ -254,7 +370,7 @@ static void r100_mailbox_reset(DeviceState *dev)
 
 static const VMStateDescription r100_mailbox_vmstate = {
     .name = "r100-mailbox",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (VMStateField[]) {
         VMSTATE_UINT32(mcuctrl, R100MailboxState),
@@ -264,12 +380,17 @@ static const VMStateDescription r100_mailbox_vmstate = {
         VMSTATE_UINT32(is_version, R100MailboxState),
         VMSTATE_UINT32_ARRAY(issr, R100MailboxState, R100_MBX_ISSR_COUNT),
         VMSTATE_UINT64_ARRAY(intgr_writes, R100MailboxState, 2),
+        VMSTATE_UINT64_V(issr_egress_frames, R100MailboxState, 2),
+        VMSTATE_UINT64_V(issr_egress_dropped, R100MailboxState, 2),
+        VMSTATE_UINT64_V(issr_ingress_writes, R100MailboxState, 2),
         VMSTATE_END_OF_LIST()
     },
 };
 
 static Property r100_mailbox_properties[] = {
     DEFINE_PROP_STRING("name", R100MailboxState, name),
+    DEFINE_PROP_CHR("issr-chardev", R100MailboxState, issr_chr),
+    DEFINE_PROP_CHR("issr-debug-chardev", R100MailboxState, issr_debug_chr),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -279,6 +400,7 @@ static void r100_mailbox_class_init(ObjectClass *klass, void *data)
 
     dc->desc = "R100 Samsung IPM mailbox SFR block";
     dc->realize = r100_mailbox_realize;
+    dc->unrealize = r100_mailbox_unrealize;
     dc->vmsd = &r100_mailbox_vmstate;
     device_class_set_legacy_reset(dc, r100_mailbox_reset);
     device_class_set_props(dc, r100_mailbox_properties);

@@ -1,32 +1,52 @@
 /*
- * R100 NPU-side PCIe doorbell ingress (Phase 2, M6 + M7 mailbox refactor).
+ * R100 NPU-side PCIe doorbell ingress (Phase 2, M6 mailbox-route +
+ * M8a ISSR payload-route).
  *
  * This sysbus device terminates the cross-process doorbell channel that
  * originates in the x86 host guest's r100-npu-pci BAR4. On the host side
- * (src/host/r100_npu_pci.c), writes to MAILBOX_INTGR0 / MAILBOX_INTGR1
- * within BAR4 emit an 8-byte little-endian frame over a shared chardev:
+ * (src/host/r100_npu_pci.c), BAR4 writes into the 4 KB MMIO overlay
+ * emit an 8-byte little-endian frame over a shared chardev:
  *
- *   [0..3]  u32 BAR4 offset (0x8 = MAILBOX_INTGR0, 0x1c = MAILBOX_INTGR1)
- *   [4..7]  u32 value written (bitmask of db_idx triggered within the
- *           INTGR group; see rebel_doorbell_write() in
- *           external/ssw-bundle/.../kmd/rebellions/rebel/rebel.c:108)
+ *   [0..3]  u32 BAR4 offset
+ *   [4..7]  u32 value written
  *
- * On receipt of a complete frame we inject the written value into the
- * linked `r100-mailbox` instance's INTGR register (group 0 for offset
- * 0x08, group 1 for offset 0x1c). The mailbox's standard group→SPI
- * assertion then fires the chiplet-0 GIC SPI that FW listens on,
- * exactly as it would if the FW had issued a cfg-space store to
- * MAILBOX_PCIE_PRIVATE + INTGR{0,1} from inside the NPU. Before this
- * refactor the doorbell pulsed a placeholder SPI directly and
- * bypassed the mailbox entirely — useful as an M6 bring-up hack but
- * it hid the real FW register surface from the emulator and meant
- * any MSI-X reply path (M7) would need a second ad-hoc mechanism.
+ * The offset disambiguates two distinct flows that both cross the
+ * same wire:
+ *
+ *   M6 (INTGR trigger, host → NPU IRQ)
+ *   ---------------------------------------------------------------
+ *     off = 0x08 (MAILBOX_INTGR0) or 0x1c (MAILBOX_INTGR1)
+ *     val = bitmask of db_idx triggered within the INTGR group
+ *           (see rebel_doorbell_write() in
+ *            external/ssw-bundle/.../kmd/rebellions/rebel/rebel.c:108)
+ *     Action: call r100_mailbox_raise_intgr() on the linked mailbox,
+ *             which sets INTSR bits and lets INTMSR = INTSR & ~INTMR
+ *             drive the chiplet-0 GIC SPI.
+ *
+ *   M8a (ISSR payload, host → NPU scratch-register write)
+ *   ---------------------------------------------------------------
+ *     off = 0x80..0x180  (MAILBOX_BASE .. MAILBOX_END, the 64-word
+ *                          ISSR0..63 window — R100_BAR4_MAILBOX_*)
+ *     val = full 32-bit value to store in ISSRn
+ *     Action: call r100_mailbox_set_issr(idx, val) which updates the
+ *             NPU-side scratch register *without* asserting any SPI
+ *             and *without* looping the value back out on the issr
+ *             chardev (the host already has the value — no shadow
+ *             write-through needed, and looping would alias the
+ *             write onto itself).
+ *
+ *   Anything else is a protocol violation — silicon would NAK a PCIe
+ *   write that fell off the mapped window; we log GUEST_ERROR and
+ *   drop the frame so bogus traffic shows up in -D logs.
  *
  * Optional debug tail chardev: if the `debug-chardev` property is set,
- * every received frame is echoed as an ASCII line ("doorbell off=0x%x
- * val=0x%x count=%llu\n") to that chardev. The CLI wires it to
- * output/<run>/doorbell.log so tests and humans can confirm the NPU
- * observed a particular ring without parsing GIC state.
+ * every successfully-delivered frame (INTGR or ISSR, not the
+ * bad-offset ones — those go only to the qemu.log GUEST_ERROR path)
+ * is echoed as an ASCII line
+ * ("doorbell off=0x%x val=0x%x count=%llu\n") to that chardev. The
+ * CLI wires it to output/<run>/doorbell.log so tests and humans can
+ * confirm the NPU observed a particular ring or ISSR write without
+ * parsing GIC state.
  *
  * The device is instantiated by r100_soc_init when
  * `-machine r100-soc,doorbell=<chardev-id>` is set (see r100_soc.c).
@@ -103,32 +123,45 @@ static void r100_doorbell_emit_debug(R100DoorbellState *s,
 static void r100_doorbell_deliver(R100DoorbellState *s,
                                   uint32_t off, uint32_t val)
 {
-    int group;
-
     s->frames_received++;
     s->last_offset = off;
     s->last_value = val;
 
-    switch (off) {
-    case R100_BAR4_MAILBOX_INTGR0:
-        group = 0;
-        break;
-    case R100_BAR4_MAILBOX_INTGR1:
-        group = 1;
-        break;
-    default:
+    /*
+     * BAR4 frames fall into three classes distinguished by offset:
+     *
+     *  0x08 / 0x1c  INTGR0 / INTGR1 trigger  → raise mailbox INTGR
+     *               and let the per-group SPI fire via INTMSR.
+     *               This is the M6 doorbell path.
+     *
+     *  0x80..0x180  MAILBOX_BASE payload     → write through to
+     *               the linked mailbox's ISSR0..63 scratch store.
+     *               No interrupt asserted; the KMD / FW reads these
+     *               back after they've already taken the matching
+     *               INTGR SPI (see ipm_samsung_{read,write} +
+     *               mb_read/mb_write in q-sys). This is the M8
+     *               host→NPU ISSR ingress path.
+     *
+     *  anything else                         → protocol violation;
+     *               log and drop. Silicon would just NAK a PCIe
+     *               write that fell off the mapped window — we
+     *               treat it as a GUEST_ERROR so bogus frames are
+     *               traceable in the -D log.
+     */
+    if (off == R100_BAR4_MAILBOX_INTGR0) {
+        r100_mailbox_raise_intgr(s->mailbox, 0, val);
+    } else if (off == R100_BAR4_MAILBOX_INTGR1) {
+        r100_mailbox_raise_intgr(s->mailbox, 1, val);
+    } else if (off >= R100_BAR4_MAILBOX_BASE &&
+               off < R100_BAR4_MAILBOX_END) {
+        uint32_t idx = (off - R100_BAR4_MAILBOX_BASE) >> 2;
+        r100_mailbox_set_issr(s->mailbox, idx, val);
+    } else {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "r100-doorbell: unexpected frame off=0x%x val=0x%x\n",
                       off, val);
         return;
     }
-
-    /* The mailbox is the single ground-truth for host→FW signalling:
-     * it latches pending bits in INTGR/INTSR, masks via INTMR, and
-     * asserts its per-group SPI (wired by r100_soc_init). A later
-     * INTCR write by the ISR clears the pending bit and deasserts
-     * the line — no need for the ad-hoc pulse we used in pre-M7 M6. */
-    r100_mailbox_raise_intgr(s->mailbox, group, val);
 
     r100_doorbell_emit_debug(s, off, val);
 }

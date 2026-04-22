@@ -12,6 +12,7 @@
 #include "hw/arm/boot.h"
 #include "hw/boards.h"
 #include "qom/object.h"
+#include "chardev/char-fe.h"
 #include "remu_addrmap.h"
 
 /* Forward declaration — full def in sysemu/hostmem.h (included only by
@@ -65,6 +66,27 @@ struct R100SoCMachineState {
     /* Optional debug tail for r100-imsix (one ASCII line per frame
      * emitted). Mirror of doorbell_debug_chardev_id. */
     char *msix_debug_chardev_id;
+
+    /* `-machine r100-soc,issr=<chardev-id>` : M8 ISSR shadow-egress.
+     * When set, every NPU-side write to one of the chiplet-0 PCIE
+     * r100-mailbox ISSR0..63 scratch registers (4 KB MMIO block at
+     * R100_PCIE_MAILBOX_BASE + 0x80..0x180) emits an 8-byte
+     * (offset, value) frame on this chardev. The offset field
+     * carries the matching BAR4 offset the host sees (i.e. 0x80 +
+     * idx*4, matching the KMD MAILBOX_BASE layout), so host-side
+     * r100-npu-pci can write-through bar4_mmio_regs[offset >> 2]
+     * without knowing which mailbox instance the frame came from.
+     * This is the NPU→host half of the FW_BOOT_DONE handshake;
+     * the reverse host→NPU half flows over the existing `doorbell`
+     * chardev, since M8 extends r100-doorbell to recognise
+     * MAILBOX_BASE-range offsets and write them through to the
+     * mailbox's ISSR register file (no interrupt). Resolved to a
+     * Chardev at machine-init time (same late-binding reason as
+     * memdev / doorbell / msix). */
+    char *issr_chardev_id;
+    /* Optional debug tail for the ISSR egress (one ASCII line per
+     * frame emitted). Mirror of doorbell_debug_chardev_id. */
+    char *issr_debug_chardev_id;
 };
 
 typedef struct R100SoCMachineState R100SoCMachineState;
@@ -309,6 +331,16 @@ struct R100MailboxState {
     qemu_irq irq[2];            /* [0] = INTMSR0, [1] = INTMSR1 */
     char *name;                 /* e.g. "pcie.chiplet0" for debug */
 
+    /* M8 NPU→host ISSR shadow-egress. When `issr_chr` is connected,
+     * every FW-initiated ISSR write (MMIO path) is also emitted as
+     * an 8-byte (BAR4-offset, value) frame on this chardev so the
+     * host-side r100-npu-pci can mirror the write into its BAR4
+     * MMIO register file. Writes driven by r100_mailbox_set_issr()
+     * (the host→NPU ingress path via r100-doorbell) deliberately
+     * skip the emit to avoid echoing frames back at the host. */
+    CharBackend issr_chr;
+    CharBackend issr_debug_chr;
+
     uint32_t mcuctrl;
     /* Combined INTGR/INTSR storage: INTGR is W1S into `pending`, INTSR
      * and INTGR reads both return it. */
@@ -320,6 +352,9 @@ struct R100MailboxState {
 
     /* Observability counters (survive reset, inspectable via HMP). */
     uint64_t intgr_writes[2];
+    uint64_t issr_egress_frames;    /* emitted to host (MMIO writes) */
+    uint64_t issr_egress_dropped;   /* short write / backend gone */
+    uint64_t issr_ingress_writes;   /* set via r100_mailbox_set_issr */
 };
 
 typedef struct R100MailboxState R100MailboxState;
@@ -335,6 +370,16 @@ DECLARE_INSTANCE_CHECKER(R100MailboxState, R100_MAILBOX, TYPE_R100_MAILBOX)
  * matching qemu_irq when INTMSR goes non-zero.
  */
 void r100_mailbox_raise_intgr(R100MailboxState *s, int group, uint32_t val);
+
+/*
+ * Inject an ISSR register write from outside the MMIO path. Used by
+ * the M8 extension to r100-doorbell: frames arriving from the x86
+ * host-side BAR4 writes into the MAILBOX_BASE payload range update
+ * the backing scratch register but must NOT re-emit on the ISSR
+ * egress chardev (that would loop the host's own write back at
+ * itself). Out-of-range `idx` is a no-op.
+ */
+void r100_mailbox_set_issr(R100MailboxState *s, uint32_t idx, uint32_t val);
 
 /* ========================================================================
  * Integrated MSI-X trigger (iMSIX-DB) — FW→host reverse-direction.

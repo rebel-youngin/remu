@@ -58,7 +58,12 @@ NPU_MON = RUN_DIR / "monitor.sock"
 # src/include/remu_addrmap.h).
 INTGR0 = 0x00000008
 INTGR1 = 0x0000001C
-BOGUS  = 0x00000100  # not a real INTGR register → must be rejected
+# BOGUS must be outside BOTH the INTGR trigger offsets (0x08 / 0x1c)
+# AND the M8-extended MAILBOX_BASE payload range (0x80..0x180, 64 u32
+# ISSR scratch slots). 0x200 lands in the 4 KB BAR4 MMIO window but
+# matches no real register on either silicon or our device model, so
+# r100_doorbell_deliver must drop it with a GUEST_ERROR entry.
+BOGUS  = 0x00000200
 
 
 def hmp(sock_path, cmd, timeout=5.0):

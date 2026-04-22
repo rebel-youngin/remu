@@ -57,12 +57,18 @@ the single pinned QEMU tree (`./remucli build` → `qemu-system-aarch64`
 │  r100-npu-pci (QEMU device model)                │
 │    └─ BAR0 backed by /dev/shm/remu-* (M4) ✓      │
 │    └─ BAR2/5 lazy RAM + MSI-X table (M3) ✓       │
-│    └─ BAR4 MMIO head → chardev frame (M6) ✓      │
-│    └─ msix chardev → msix_notify()  (M7) ✓       │
-└────────────┬──────────┬──────────┬───────────────┘
-             │ shm      │ doorbell │ msix
-             │          │ chardev  │ chardev
-┌────────────┴──────────────────┴──────────────────┐
+│    └─ BAR4 MMIO head:                            │
+│        · INTGR writes → doorbell frame (M6) ✓   │
+│        · MAILBOX_BASE writes → doorbell         │
+│          frame (ISSR payload, M8a) ✓             │
+│        · MAILBOX_BASE reads ← issr-chardev       │
+│          shadow (M8a) ✓                          │
+│    └─ msix chardev → msix_notify() (M7) ✓        │
+│    └─ issr chardev → BAR4 shadow (M8a) ✓         │
+└────────┬─────────┬─────────┬──────────┬──────────┘
+         │ shm     │ doorbell│ msix     │ issr
+         │         │ chardev │ chardev  │ chardev
+┌────────┴─────────┴─────────┴──────────┴──────────┐
 │  FW QEMU (aarch64, bare-metal)                   │
 │  32x CA73 vCPUs (cortex-a72 w/ MIDR=A73 r1p1)    │
 │  TF-A BL1 → BL2 → BL31 → FreeRTOS              │
@@ -79,12 +85,15 @@ the single pinned QEMU tree (`./remucli build` → `qemu-system-aarch64`
 │  │  PVT — idle/valid-bit stub (pvt_init)      │  │
 │  │  HILS ring tail — drains FreeRTOS .logbuf  │  │
 │  │  Mailbox RAM — inter-chiplet handshake     │  │
-│  │  r100-doorbell — chardev ingress (M6) ✓    │  │
-│  │    └─ calls r100_mailbox_raise_intgr()     │  │
+│  │  r100-doorbell — chardev ingress           │  │
+│  │     INTGR offsets → raise_intgr() (M6) ✓   │  │
+│  │     MAILBOX_BASE offsets →                 │  │
+│  │       mailbox_set_issr() (M8a) ✓           │  │
 │  │  r100-mailbox — Samsung ipm SFR (M6) ✓     │  │
 │  │     @ R100_PCIE_MAILBOX_BASE               │  │
 │  │     INTMSR0 → GIC SPI 184 (chiplet 0)      │  │
 │  │     INTMSR1 → GIC SPI 185 (chiplet 0)      │  │
+│  │     ISSR writes → issr chardev (M8a) ✓     │  │
 │  │  r100-imsix — PCIe MSI-X address-match     │  │
 │  │    trap @ R100_PCIE_IMSIX_BASE (M7) ✓      │  │
 │  │    └─ 4-byte write @ off 0xFFC emits       │  │
@@ -217,11 +226,11 @@ All device models follow the QEMU QOM (QEMU Object Model) pattern:
 | `r100_pvt.c` | PVT monitor | 5 per chiplet (ROT + 4 DCL) | `PVT_CON_STATUS=0x3` (idle), per-sensor `_valid=1`, rest RAM — unblocks FreeRTOS `pvt_init()` `PVT_ENABLE_{PROC,VOLT,TEMP}_CONTROLLER` polls |
 | `r100_dma.c` | PL330 DMA | 1 per chiplet | Fake completion on csr/dbgstatus/dbgcmd polls |
 | `r100_logbuf.c` | HILS ring tail | 1 (chiplet 0 only) | Polls DRAM `.logbuf` ring at 0x10000000 on a 50 ms timer, drains `RLOG_*`/`FLOG_*` entries to own chardev |
-| `r100_doorbell.c` | PCIe doorbell ingress | 1 (chiplet 0 only; M6) | Reassembles 8-byte `(BAR4 offset, value)` frames on a `CharBackend`, validates the offset is `MAILBOX_INTGR0` (0x8) or `MAILBOX_INTGR1` (0x1c), and calls `r100_mailbox_raise_intgr(group, val)` on the linked `r100-mailbox` (via `DEFINE_PROP_LINK`). No longer owns a `qemu_irq` — the mailbox owns the GIC line |
-| `r100_mailbox.c` | Samsung `ipm_samsung` SFR | 1 (chiplet 0 only; M6) | Full register model: `MCUCTRL`, `INTGR{0,1}` (write-1-to-set), `INTCR{0,1}` (write-1-to-clear), `INTMR{0,1}` (mask), `INTSR{0,1}` (raw pending), `INTMSR{0,1}` (`INTSR & ~INTMR`), `MIF_INIT`, `IS_VERSION`, `ISSR0..63`. Two `qemu_irq` outputs (`irq[0]` / `irq[1]`) track the non-zero state of INTMSR0 / INTMSR1. Exposes `r100_mailbox_raise_intgr(group, val)` helper so upstream devices (like `r100-doorbell`) can inject pending bits without round-tripping through MMIO |
+| `r100_doorbell.c` | PCIe doorbell ingress | 1 (chiplet 0 only; M6+M8a) | Reassembles 8-byte `(BAR4 offset, value)` frames on a `CharBackend` and routes by offset: `MAILBOX_INTGR0` (0x8) / `MAILBOX_INTGR1` (0x1c) call `r100_mailbox_raise_intgr(group, val)` for the M6 interrupt-trigger path; `MAILBOX_BASE..MAILBOX_END` (0x80..0x180) call `r100_mailbox_set_issr(idx, val)` for the M8a host → NPU scratch-write path (no IRQ side-effect, and mailbox skips the return-path chardev emit so host writes don't loop back); everything else logs `GUEST_ERROR`. Links to the `r100-mailbox` via `DEFINE_PROP_LINK`. Optional debug chardev echoes every accepted frame (INTGR or ISSR) as `doorbell off=0x... val=0x... count=N` |
+| `r100_mailbox.c` | Samsung `ipm_samsung` SFR | 1 (chiplet 0 only; M6+M8a) | Full register model: `MCUCTRL`, `INTGR{0,1}` (write-1-to-set), `INTCR{0,1}` (write-1-to-clear), `INTMR{0,1}` (mask), `INTSR{0,1}` (raw pending), `INTMSR{0,1}` (`INTSR & ~INTMR`), `MIF_INIT`, `IS_VERSION`, `ISSR0..63`. Two `qemu_irq` outputs (`irq[0]` / `irq[1]`) track the non-zero state of INTMSR0 / INTMSR1. Exposes `r100_mailbox_raise_intgr(group, val)` so the doorbell can inject pending bits without round-tripping through MMIO, and `r100_mailbox_set_issr(idx, val)` for the M8a host-write path (updates the ISSR state *without* re-emitting on the `issr` chardev, so host writes don't loop back). Every MMIO-path ISSR write emits an 8-byte `(bar4_offset, value)` frame on the optional `issr` chardev (M8a) so the host's BAR4 shadow stays live; an `issr-debug` chardev echoes every frame with `status={ok,bad-offset}` |
 | `r100_imsix.c` | PCIe MSI-X address-match trap | 1 (chiplet 0 only; M7) | 4 KB MMIO window at `R100_PCIE_IMSIX_BASE` (`0x1B_FFFF_F000`). Traps 4-byte FW writes to offset `0xFFC` (`R100_PCIE_IMSIX_DB_OFFSET` = `REBELH_PCIE_MSIX_ADDR & 0xFFF`) — the same 32-bit store that DW PCIe `MSIX_ADDRESS_MATCH_*` logic snoops on silicon — and emits 8-byte `(offset, db_data)` frames on the `msix` chardev. Non-doorbell offsets fall through to a local 1 KB register file so FW side-probes don't spam QEMU's unimplemented-device log. Optional `msix-debug` chardev echoes every frame for observability |
-| `r100_npu_pci.c` (x86 side) | PCIe endpoint `0x1eff:0x2030` | 1 | Four BARs: BAR0 splices shared memdev at offset 0 (M4); BAR2 lazy RAM; BAR4 is a container with a 4 KB MMIO head overlay that intercepts `MAILBOX_INTGR0/1` writes and emits 8-byte frames on the `doorbell` chardev (M6), plus an 8 MB lazy-RAM fallback; BAR5 is MSI-X table + PBA + RAM fill (M3); on the reverse direction (M7), the `msix` chardev consumes 8-byte `(offset, db_data)` frames emitted by `r100-imsix`, decodes `vector = db_data & 0x7FF`, and calls `msix_notify()` |
-| `remu_addrmap.h` | — | — | All address constants (from `g_sys_addrmap.h`), plus M6 doorbell offsets (`R100_PCIE_MAILBOX_BASE`, `R100_PCIE_MBX_GROUP{0,1}_SPI`) and M7 iMSIX-DB offsets (`R100_PCIE_IMSIX_BASE`, `R100_PCIE_IMSIX_DB_OFFSET`, `R100_PCIE_IMSIX_VECTOR_MASK`) |
+| `r100_npu_pci.c` (x86 side) | PCIe endpoint `0x1eff:0x2030` | 1 | Four BARs: BAR0 splices shared memdev at offset 0 (M4); BAR2 lazy RAM; BAR4 is a container with a 4 KB MMIO head overlay that intercepts both `MAILBOX_INTGR0/1` (M6 interrupt triggers) and the `MAILBOX_BASE` payload range (M8a ISSR scratch writes) and emits 8-byte frames on the `doorbell` chardev, plus an 8 MB lazy-RAM fallback for the rest of BAR4; BAR5 is MSI-X table + PBA + RAM fill (M3). Reverse-direction paths: `msix` chardev consumes `(offset, db_data)` frames from `r100-imsix` and calls `msix_notify(vector & 0x7FF)` (M7); `issr` chardev consumes `(bar4_offset, value)` frames from `r100-mailbox` and mirrors them into `bar4_mmio_regs[]` so guest reads at `BAR4 + MAILBOX_BASE + idx*4` see a live shadow (M8a). The 4 KB MMIO overlay is installed when *either* `doorbell` or `issr` is connected |
+| `remu_addrmap.h` | — | — | All address constants (from `g_sys_addrmap.h`), plus M6 doorbell offsets (`R100_PCIE_MAILBOX_BASE`, `R100_BAR4_MAILBOX_INTGR{0,1}`, `R100_PCIE_MBX_GROUP{0,1}_SPI`), M7 iMSIX-DB offsets (`R100_PCIE_IMSIX_BASE`, `R100_PCIE_IMSIX_DB_OFFSET`, `R100_PCIE_IMSIX_VECTOR_MASK`), and M8a ISSR-payload offsets (`R100_BAR4_MAILBOX_BASE = 0x80`, `R100_BAR4_MAILBOX_COUNT = 64`, `R100_BAR4_MAILBOX_END = 0x180`, `R100_BAR4_MMIO_SIZE = 0x1000`) |
 
 ## FW Source References
 

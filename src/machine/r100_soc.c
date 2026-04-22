@@ -1261,6 +1261,40 @@ static void r100_soc_init(MachineState *machine)
 
         mbx_dev = qdev_new(TYPE_R100_MAILBOX);
         qdev_prop_set_string(mbx_dev, "name", "pcie.chiplet0");
+        /*
+         * M8: optional NPU→host ISSR shadow-egress. The mailbox
+         * accepts both a primary chardev (binary 8-byte frames) and
+         * a debug chardev (ASCII per-write trace). Both must be set
+         * BEFORE realize() so the backing CharBackends latch in.
+         * Single-QEMU runs leave these unset and the egress is a
+         * no-op (the qemu_chr_fe_backend_connected check in
+         * r100_mailbox_issr_emit short-circuits).
+         */
+        if (r100m->issr_chardev_id != NULL &&
+            *r100m->issr_chardev_id != '\0') {
+            Chardev *chr = qemu_chr_find(r100m->issr_chardev_id);
+            Chardev *dbg = NULL;
+
+            if (chr == NULL) {
+                error_report("r100-soc: issr chardev '%s' not found",
+                             r100m->issr_chardev_id);
+                exit(1);
+            }
+            if (r100m->issr_debug_chardev_id != NULL &&
+                *r100m->issr_debug_chardev_id != '\0') {
+                dbg = qemu_chr_find(r100m->issr_debug_chardev_id);
+                if (dbg == NULL) {
+                    error_report("r100-soc: issr debug chardev "
+                                 "'%s' not found",
+                                 r100m->issr_debug_chardev_id);
+                    exit(1);
+                }
+            }
+            qdev_prop_set_chr(mbx_dev, "issr-chardev", chr);
+            if (dbg) {
+                qdev_prop_set_chr(mbx_dev, "issr-debug-chardev", dbg);
+            }
+        }
         sysbus_realize_and_unref(SYS_BUS_DEVICE(mbx_dev), &error_fatal);
         /* Priority 10 to outrank chiplet-0's cfg_mr container (pri 0)
          * which covers this address as part of its catch-all. */
@@ -1491,6 +1525,33 @@ static void r100_soc_set_msix_debug(Object *obj, const char *value,
     r100m->msix_debug_chardev_id = g_strdup(value);
 }
 
+static char *r100_soc_get_issr(Object *obj, Error **errp)
+{
+    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
+    return g_strdup(r100m->issr_chardev_id);
+}
+
+static void r100_soc_set_issr(Object *obj, const char *value, Error **errp)
+{
+    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
+    g_free(r100m->issr_chardev_id);
+    r100m->issr_chardev_id = g_strdup(value);
+}
+
+static char *r100_soc_get_issr_debug(Object *obj, Error **errp)
+{
+    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
+    return g_strdup(r100m->issr_debug_chardev_id);
+}
+
+static void r100_soc_set_issr_debug(Object *obj, const char *value,
+                                    Error **errp)
+{
+    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
+    g_free(r100m->issr_debug_chardev_id);
+    r100m->issr_debug_chardev_id = g_strdup(value);
+}
+
 static void r100_soc_machine_instance_init(Object *obj)
 {
     object_property_add_str(obj, "memdev",
@@ -1532,6 +1593,24 @@ static void r100_soc_machine_instance_init(Object *obj)
         "Optional chardev id that receives an ASCII trace of every "
         "iMSIX doorbell write observed on the NPU (one line per "
         "frame emitted).");
+
+    object_property_add_str(obj, "issr",
+                            r100_soc_get_issr, r100_soc_set_issr);
+    object_property_set_description(obj, "issr",
+        "Optional chardev id the chiplet-0 r100-mailbox device emits "
+        "8-byte (BAR4-offset, value) frames on whenever FW writes an "
+        "ISSR0..63 scratch register. The Phase-2 x86 host QEMU's "
+        "r100-npu-pci consumes these frames and write-throughs the "
+        "value into its BAR4 MMIO register file so a subsequent KMD "
+        "read (e.g. the FW_BOOT_DONE poll on BAR4+0x90) observes "
+        "the FW-written magic — NPU → host ISSR shadow.");
+
+    object_property_add_str(obj, "issr-debug",
+                            r100_soc_get_issr_debug,
+                            r100_soc_set_issr_debug);
+    object_property_set_description(obj, "issr-debug",
+        "Optional chardev id that receives an ASCII trace of every "
+        "ISSR write observed on the NPU (one line per frame emitted).");
 }
 
 static void r100_soc_machine_instance_finalize(Object *obj)
@@ -1542,6 +1621,8 @@ static void r100_soc_machine_instance_finalize(Object *obj)
     g_free(r100m->doorbell_debug_chardev_id);
     g_free(r100m->msix_chardev_id);
     g_free(r100m->msix_debug_chardev_id);
+    g_free(r100m->issr_chardev_id);
+    g_free(r100m->issr_debug_chardev_id);
 }
 
 /*

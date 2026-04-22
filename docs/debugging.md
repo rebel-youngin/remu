@@ -93,25 +93,30 @@ output/
     uart{0..3}.log    # NPU UARTs (as in Phase 1)
     hils.log          # NPU HILS ring tail
     shm -> /dev/shm/remu-my-test/
-    doorbell.log      # NPU-side ASCII trace of every guest→NPU (offset, value) frame (M6)
+    doorbell.log      # NPU-side ASCII trace of every guest→NPU (offset, value) frame
+                      # (both M6 INTGR triggers and M8a ISSR payload writes)
     msix.log          # host-side ASCII trace of every NPU→host (offset, db_data) frame (M7)
+    issr.log          # host-side ASCII trace of every NPU→host ISSR (offset, value) frame (M8a)
     npu/
       monitor.sock    # NPU HMP monitor (unix socket)
       info-mtree.log  # captured info mtree — chiplet0.dram splice
       info-mtree-imsix.log  # captured info mtree — r100-imsix MMIO @ 0x1BFFFFF000 (M7)
       info-qtree.log  # captured info qtree — confirms r100-doorbell + r100-mailbox
+      info-qtree-issr.log   # captured info qtree — confirms r100-mailbox has issr-chardev wired (M8a)
     host/
       cmdline.txt     # x86 QEMU invocation
       qemu.stdout.log
       qemu.stderr.log
       serial.log      # x86 guest serial (SeaBIOS + "No bootable device" idle)
       monitor.sock    # host HMP monitor (unix socket)
-      doorbell.sock   # unix-socket chardev listener (host = server, NPU = client; M6)
+      doorbell.sock   # unix-socket chardev listener (host = server, NPU = client; M6+M8a)
       msix.sock       # unix-socket chardev listener (host = server, NPU = client; M7)
+      issr.sock       # unix-socket chardev listener (host = server, NPU = client; M8a)
       info-pci.log    # captured info pci — lists 1eff:2030 endpoint
       info-mtree.log  # captured info mtree — BAR0 shm splice
-      info-mtree-bar4.log  # captured info mtree — BAR4 MMIO overlay (M6)
+      info-mtree-bar4.log  # captured info mtree — BAR4 MMIO overlay (M6+M8a)
       info-mtree-bar5.log  # captured info mtree — BAR5 msix-table + msix-pba overlays (M7)
+      info-qtree-issr.log  # captured info qtree — confirms r100-npu-pci has issr chardev wired (M8a)
 ```
 
 Everything under `/dev/shm/remu-<name>/` is cleaned up on exit. If
@@ -314,10 +319,14 @@ python3 tests/m6_doorbell_test.py
 ```
 
 `output/<name>/doorbell.log` is the ASCII trace of every
-frame the NPU actually received (one line per frame, format
-`doorbell off=0x... val=0x... count=N`). If it's empty after the host
-has written INTGR, the chardev bridge is down — check that both
-QEMUs are still up and that `output/<name>/host/doorbell.sock` exists.
+frame the NPU actually accepted — both M6 INTGR triggers and M8a
+ISSR payload writes (one line per frame, format `doorbell off=0x...
+val=0x... count=N`; the offset identifies which class). Frames
+rejected for bad offsets do not appear here — they only surface as
+`GUEST_ERROR` entries in `qemu.log`. If `doorbell.log` is empty after
+the host has written INTGR / MAILBOX_BASE, the chardev bridge is
+down — check that both QEMUs are still up and that
+`output/<name>/host/doorbell.sock` exists.
 
 ### MSI-X path (M7, FW → guest)
 
@@ -360,6 +369,80 @@ chardev bridge is down — check that both QEMUs are up and that
 `output/<name>/host/msix.sock` exists. `./remucli run --host`
 auto-verifies both mtree checks on startup and prints pass/fail to
 stdout.
+
+### ISSR bridge (M8a, both directions)
+
+M8a is pure register-shadow transport over the shared-mailbox window
+(`MAILBOX_BASE..MAILBOX_END` = `0x80..0x180` in both BAR4 and the NPU
+Samsung-IPM SFR). No silicon peripheral moves: the NPU's `r100-mailbox`
+still owns the authoritative ISSR0..63 state, and the host's BAR4
+still looks like an ordinary register window to the guest. What M8a
+adds is a pair of one-way forwarders that keep the two copies in sync.
+
+**NPU → host** (firmware writes ISSR, host BAR4 reflects it). Every
+MMIO write to an ISSR register inside `r100-mailbox` emits an 8-byte
+`(bar4_offset, value)` frame on a third unix socket (`issr.sock`,
+same wire format as M6/M7). Host-side `r100-npu-pci` receives it and
+mirrors the value into `bar4_mmio_regs[]` — so the very next guest
+`readl` at `BAR4 + MAILBOX_BASE + idx*4` returns the firmware's
+latest write, without going back through the wire. The `r100-mailbox`
+instance is told about the chardev through a pair of machine-level
+string properties (`issr=<id>`, `issr-debug=<id>`) forwarded onto the
+device as `issr-chardev` / `issr-debug-chardev`.
+
+**Host → NPU** (guest writes BAR4, firmware's ISSR updates). Rather
+than open a fourth socket, M8a reuses the M6 doorbell chardev.
+Writes into `MAILBOX_BASE..MAILBOX_END` on the host side are emitted
+as the same `(offset, value)` frames — except the offset puts them in
+the payload range instead of on `INTGR{0,1}`. The NPU-side
+`r100-doorbell` disambiguates by offset: `0x8` / `0x1c` → call
+`r100_mailbox_raise_intgr()` (M6 behaviour, asserts SPI); `0x80..0x180`
+→ call `r100_mailbox_set_issr()` (M8a, updates the scratch word but
+asserts nothing and does *not* re-emit on the `issr` chardev, so the
+host's write doesn't loop back to itself). Offsets outside both
+ranges log `GUEST_ERROR`.
+
+Concretely, that makes the `FW_BOOT_DONE` handshake (firmware writes
+`0xFB0D` to ISSR[4]) and the reset-counter ping (ISSR[7]) into plain
+MMIO exchanges with no protocol-specific code on either side — the
+logical step M8b will bolt the real HIL protocol on top of.
+
+Quick sanity poking from the monitor:
+
+```
+# NPU side: r100-mailbox must advertise an issr-chardev wiring
+printf 'info qtree\nquit\n' \
+  | socat - UNIX-CONNECT:output/<name>/npu/monitor.sock \
+  | rg -A 1 'r100-mailbox'
+#   → "issr-chardev = \"issr\""
+
+# Host side: r100-npu-pci must advertise an issr chardev
+printf 'info qtree\nquit\n' \
+  | socat - UNIX-CONNECT:output/<name>/host/monitor.sock \
+  | rg -A 8 'r100-npu-pci' | rg 'issr'
+#   → "issr = \"issr\"" and "issr-debug = \"issr_dbg\""
+
+# Read the live ISSR shadow from the host side at BAR4 + MAILBOX_BASE
+#   BAR4 base comes from info-pci.log (currently 0xfe000000 with SeaBIOS)
+printf 'xp /4wx 0xfe000090\nquit\n' \
+  | socat - UNIX-CONNECT:output/<name>/host/monitor.sock
+# Read the same word on the NPU side straight off the mailbox SFR
+printf 'xp /1wx 0x1ff8160090\nquit\n' \
+  | socat - UNIX-CONNECT:output/<name>/npu/monitor.sock
+# The two must agree at steady state.
+
+# Drive a synthetic bidirectional exchange without the kmd or FW
+python3 tests/m8_issr_test.py
+```
+
+`output/<name>/issr.log` is the ASCII trace of every ISSR frame the
+host actually accepted or rejected (one line per frame, format
+`issr off=0x... val=0x... status={ok|bad-offset} count=N`). If it's
+empty after the FW has written an ISSR, the chardev is down — check
+that both QEMUs are up and that `output/<name>/host/issr.sock` exists.
+`./remucli run --host` auto-verifies both qtree checks on startup and
+prints pass/fail to stdout (non-fatal — the NPU still boots for
+post-mortem poking if the wiring is missing).
 
 ## Interpreting a boot log
 

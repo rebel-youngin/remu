@@ -402,6 +402,26 @@
  * (offset, value) frame over the M6 chardev. */
 #define R100_BAR4_MAILBOX_INTGR0    0x00000008u  /* db_idx >= 32 */
 #define R100_BAR4_MAILBOX_INTGR1    0x0000001cu  /* db_idx <  32 */
+/*
+ * BAR4 MAILBOX payload window — the host-visible shadow of the NPU
+ * Samsung-IPM mailbox's ISSR0..ISSR63 scratch registers (the 256 B
+ * body at offsets 0x80..0x180 in both BAR4 and the NPU SFR, matching
+ * rebel_regs.h:MAILBOX_BASE / MAILBOX_SIZE and struct ipm_samsung's
+ * issr0..63 layout at +0x80).
+ *
+ * M8 extends the M6 chardev bridge so host BAR4 writes into this
+ * window egress NPU-ward as `(offset, value)` frames on the same
+ * `doorbell` chardev (offset distinguishes INTGR trigger vs. ISSR
+ * payload on the NPU side), and the NPU-side r100-mailbox re-emits
+ * every local ISSR write on a new `issr` chardev back to the host so
+ * BAR4 readers see a live mirror. That makes FW_BOOT_DONE (ISSR[4])
+ * and reset-counter (ISSR[7]) traffic a plain MMIO exchange for the
+ * kmd, with no protocol-specific code anywhere in the device model.
+ */
+#define R100_BAR4_MAILBOX_BASE      0x00000080u  /* MAILBOX_BASE in KMD */
+#define R100_BAR4_MAILBOX_COUNT     64u          /* 0x80..0x180, 64 u32 */
+#define R100_BAR4_MAILBOX_END       \
+    (R100_BAR4_MAILBOX_BASE + R100_BAR4_MAILBOX_COUNT * 4u)
 /* The first MMIO-trapped window of BAR4 that the host-side device
  * treats as register-backed (i.e. not lazy RAM). Covers both INTGR
  * registers at 0x8/0x1c and the MAILBOX_BASE body at 0x80..0x180. */

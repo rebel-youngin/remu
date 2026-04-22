@@ -40,7 +40,7 @@ match the driver's size checks in `rebel_check_pci_bars_size`:
 |-----|------|------|
 | 0   | 64 GB (>= 36 GB `RBLN_DRAM_SIZE`) | DDR — first 128 MB = `/dev/shm` shared file, tail = lazy RAM |
 | 2   | 64 MB (= `RBLN_SRAM_SIZE`)        | ACP / SRAM / logbuf (lazy RAM) |
-| 4   | 8 MB  (= `RBLN_PERI_SIZE`)        | Doorbells — 4 KB MMIO head intercepts `MAILBOX_INTGR{0,1}` writes and forwards them to the NPU as 8-byte chardev frames (M6); rest is lazy RAM |
+| 4   | 8 MB  (= `RBLN_PERI_SIZE`)        | Doorbells — 4 KB MMIO head intercepts `MAILBOX_INTGR{0,1}` writes (M6) and `MAILBOX_BASE` payload writes (M8a, host → NPU ISSR) and forwards them to the NPU as 8-byte chardev frames on the same `doorbell` socket; the `MAILBOX_BASE` range also acts as a read-through shadow of the NPU's ISSR state, fed by frames arriving on the `issr` chardev (M8a, NPU → host ISSR); rest is lazy RAM |
 | 5   | 1 MB  (= `RBLN_PCIE_SIZE`)        | MSI-X table (32 vectors) + PBA — `msix_notify()` target for frames coming back from the NPU `r100-imsix` device (M7) |
 
 Both QEMUs open the same 128 MB memory-backed file at
@@ -84,7 +84,11 @@ interactive HMP).
   - **M7**: `info mtree` on the NPU must list the `r100-imsix`
     MemoryRegion at `0x1BFFFFF000`, and `info mtree` on host must show
     `msix-table` + `msix-pba` overlaying `r100.bar5.msix` (logged to
-    `npu/info-mtree-imsix.log` + `host/info-mtree-bar5.log`).
+    `npu/info-mtree-imsix.log` + `host/info-mtree-bar5.log`);
+  - **M8a**: `info qtree` on the NPU must show the chiplet-0
+    `r100-mailbox` with `issr-chardev = "issr"`, and `info qtree` on
+    host must show `r100-npu-pci` with `issr = "issr"` (logged to
+    `npu/info-qtree-issr.log` + `host/info-qtree-issr.log`).
 
 Any check failing prints to the terminal — the NPU still boots for
 post-mortem poking. End-to-end sanity scripts, one per milestone
@@ -99,6 +103,12 @@ bridge:
     impersonating client to `host/msix.sock` (test IS the NPU in this
     scenario), emits 5 frames (3 `ok` + 1 `oor` + 1 `bad-offset`),
     and checks `msix.log` plus `GUEST_ERROR` entries.
+  - `tests/m8_issr_test.py` runs two phases against two minimal QEMUs:
+    phase 1 acts as the NPU writing ISSRs (server on `issr.sock`) and
+    verifies the host's BAR4 shadow mirrors them via `xp` over HMP;
+    phase 2 acts as the host writing BAR4 (server on `doorbell.sock`)
+    and verifies the NPU's mailbox ISSR registers update without any
+    spurious GIC SPI assertion.
 
 All `./remucli run` invocations write into `output/<name>/` (or
 `output/run-<timestamp>/` if `--name` is omitted). Never pass paths

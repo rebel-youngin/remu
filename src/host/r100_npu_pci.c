@@ -20,14 +20,26 @@
  *
  * BAR2 is plain lazily-allocated host RAM (no side effects on
  * writes); BAR4 is normally lazy RAM too, but when the `doorbell`
- * chardev property is wired (M6+) a 4 KB MMIO head overlay
- * intercepts MAILBOX_INTGR0/INTGR1 writes and forwards them as
- * 8-byte (offset, value) frames to the NPU-side r100-doorbell
- * device, which injects a GIC SPI. MAILBOX_BASE (0x80..0x180) and
- * the rest of BAR4 remain RAM-like so the driver's mailbox payload
- * writes don't fault. BAR5 holds the MSI-X table + PBA in its first
- * few KB with plain RAM filling the rest so the driver's size
- * check passes. Lazy allocation keeps the 64 GB BAR0 from actually
+ * or `issr` chardev property is wired (M6+M8a) a 4 KB MMIO head
+ * overlay intercepts two distinct write classes in a single trap:
+ *   (a) MAILBOX_INTGR0/1 (0x8 / 0x1c) — forwarded as 8-byte
+ *       (offset, value) frames on the `doorbell` chardev; the
+ *       NPU-side r100-doorbell injects them as a GIC SPI via
+ *       r100-mailbox (M6).
+ *   (b) MAILBOX_BASE range (0x80..0x180) — forwarded as the same
+ *       frame format on the *same* `doorbell` chardev; the NPU
+ *       side disambiguates by offset and updates its mailbox's
+ *       ISSRn scratch register without raising any IRQ (M8a
+ *       host → NPU).
+ * Reads from MAILBOX_BASE return values previously written into
+ * `bar4_mmio_regs[]` by frames arriving on the `issr` chardev
+ * (M8a NPU → host) — that's how the KMD's FW_BOOT_DONE poll on
+ * BAR4 + MAILBOX_BASE + 0x10 eventually sees the firmware-written
+ * magic. The remaining BAR4 space past the MMIO overlay is lazy
+ * RAM so driver stores that fall outside the mailbox window don't
+ * fault. BAR5 holds the MSI-X table + PBA in its first few KB
+ * with plain RAM filling the rest so the driver's size check
+ * passes. Lazy allocation keeps the 64 GB BAR0 from actually
  * costing 64 GB of host RSS unless the guest touches every page.
  *
  * BAR0 has two shapes:
@@ -56,6 +68,16 @@
  *        REBELH_PCIE_MSIX_ADDR = 0x1B_FFFF_FFFC) and calls
  *        msix_notify() for the encoded vector. Mirrors the M6
  *        doorbell wire format but flowing in the opposite direction.
+ *   M8 — BAR4 MAILBOX_BASE payload (0x80..0x180) is now a live
+ *        shadow of the NPU mailbox's ISSR0..63 scratch registers.
+ *        Host writes in that range are forwarded over the existing
+ *        `doorbell` chardev (offset disambiguates vs. INTGR) so
+ *        the NPU r100-mailbox re-absorbs them via
+ *        r100_mailbox_set_issr(). NPU-side ISSR writes from FW come
+ *        back on a new `issr` chardev (same 8-byte wire format)
+ *        and update bar4_mmio_regs in place, so the KMD's
+ *        FW_BOOT_DONE poll on BAR4 + MAILBOX_BASE + 4*4 observes
+ *        the FW-written magic.
  */
 
 #include "qemu/osdep.h"
@@ -128,6 +150,31 @@ struct R100NpuPciState {
     uint64_t msix_frames_dropped;   /* bad offset / vector out of range */
     uint32_t msix_last_db_data;
     uint32_t msix_last_vector;
+
+    /* M8 ISSR ingress — when set (via -device r100-npu-pci,issr=<chardev-id>),
+     * receives 8-byte (bar4_off, val) frames from the NPU-side
+     * r100-mailbox. Each complete frame writes `val` into the
+     * mirrored bar4_mmio_regs[bar4_off >> 2] slot so a subsequent
+     * guest read on BAR4 (the KMD's rebel_mailbox_read(), the
+     * FW_BOOT_DONE poll) observes the FW-written value. Bad offsets
+     * outside the MAILBOX_BASE range are dropped with a
+     * GUEST_ERROR entry. When unset the chardev is simply not
+     * polled and BAR4 payload offsets remain stuck at whatever the
+     * guest last wrote (matches pre-M8 behaviour). */
+    CharBackend issr_chr;
+    CharBackend issr_debug_chr;
+    uint8_t issr_rx_buf[8];
+    uint32_t issr_rx_len;
+    uint64_t issr_frames_received;
+    uint64_t issr_frames_dropped;   /* bad offset */
+    uint32_t issr_last_offset;
+    uint32_t issr_last_value;
+    /* M8 ISSR egress — frames sent to the NPU on bar4_mmio_writes
+     * that land in the MAILBOX_BASE payload range. Routed over the
+     * existing `doorbell` chardev (offset field disambiguates
+     * INTGR trigger vs. ISSR payload on the NPU side via
+     * r100_doorbell_deliver). */
+    uint64_t issr_payload_frames_sent;
 
     MemoryRegion bar0_ddr;
     MemoryRegion bar0_tail;
@@ -207,13 +254,31 @@ static void r100_bar4_mmio_write(void *opaque, hwaddr addr, uint64_t val,
         s->bar4_mmio_regs[idx] = v32;
     }
 
-    /* Triggers: only the MAILBOX_INTGR* registers forward to the NPU.
-     * Everything else in the MMIO window (MAILBOX_BASE payload at
-     * 0x80..0x180, etc.) is stash-only — the NPU reads it out of DRAM
-     * once it takes the SPI. */
+    /*
+     * Forwards:
+     *
+     *  INTGR0 / INTGR1  (M6)   — the real doorbell. Emits a frame so
+     *      the NPU r100-doorbell raises the matching INTGR pending
+     *      bit on its r100-mailbox (and the per-group SPI fires).
+     *
+     *  MAILBOX_BASE..MAILBOX_END (M8) — KMD payload writes: reset
+     *      counters, ISSR-encoded commands the FW polls for, etc.
+     *      See rebel_mailbox_write() in the KMD. We emit the same
+     *      8-byte (offset, value) frame on the doorbell chardev;
+     *      r100_doorbell_deliver disambiguates by offset range and
+     *      calls r100_mailbox_set_issr() on the NPU mailbox (no
+     *      SPI — just updates the scratch register).
+     *
+     * Everything else in the 4 KB BAR4 MMIO head is stash-only —
+     * reads come back from bar4_mmio_regs[], writes stay local.
+     */
     if (addr == R100_BAR4_MAILBOX_INTGR0 ||
         addr == R100_BAR4_MAILBOX_INTGR1) {
         r100_doorbell_emit(s, (uint32_t)addr, v32);
+    } else if (addr >= R100_BAR4_MAILBOX_BASE &&
+               addr < R100_BAR4_MAILBOX_END) {
+        r100_doorbell_emit(s, (uint32_t)addr, v32);
+        s->issr_payload_frames_sent++;
     }
 }
 
@@ -330,6 +395,87 @@ static void r100_msix_receive(void *opaque, const uint8_t *buf, int size)
     }
 }
 
+/* ========================================================================
+ * M8: ISSR reverse-direction chardev — consumes frames emitted by
+ * the NPU-side r100-mailbox every time FW writes an ISSR scratch
+ * register. Each frame writes through to the host's BAR4 MMIO
+ * register file at (bar4_off / 4) so a subsequent guest read (e.g.
+ * the KMD's FW_BOOT_DONE polling on BAR4 + MAILBOX_BASE + 4*4)
+ * observes the FW-provided value. Frame layout matches M6 / M7:
+ *   [0..3]  u32 offset   (KMD-side BAR4 offset: MAILBOX_BASE + idx*4)
+ *   [4..7]  u32 value    (raw u32 the FW stored in ISSR[idx])
+ * ======================================================================== */
+
+static int r100_issr_can_receive(void *opaque)
+{
+    R100NpuPciState *s = opaque;
+    return sizeof(s->issr_rx_buf) - s->issr_rx_len;
+}
+
+static void r100_issr_emit_debug(R100NpuPciState *s, uint32_t off,
+                                 uint32_t val, const char *status)
+{
+    char line[128];
+    int n;
+
+    if (!qemu_chr_fe_backend_connected(&s->issr_debug_chr)) {
+        return;
+    }
+    n = snprintf(line, sizeof(line),
+                 "issr off=0x%x val=0x%x status=%s count=%" PRIu64 "\n",
+                 off, val, status, s->issr_frames_received);
+    if (n > 0) {
+        qemu_chr_fe_write(&s->issr_debug_chr, (const uint8_t *)line, n);
+    }
+}
+
+static void r100_issr_deliver(R100NpuPciState *s, uint32_t off, uint32_t val)
+{
+    s->issr_last_offset = off;
+    s->issr_last_value = val;
+
+    if (off < R100_BAR4_MAILBOX_BASE || off >= R100_BAR4_MAILBOX_END ||
+        (off & 0x3u) != 0) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "r100-npu-pci: issr frame off=0x%x out of "
+                      "MAILBOX_BASE range / unaligned\n", off);
+        s->issr_frames_dropped++;
+        r100_issr_emit_debug(s, off, val, "bad-offset");
+        return;
+    }
+
+    /* Mirror into the BAR4 MMIO register file so the guest driver's
+     * next readl() on the matching BAR4 offset observes `val`. The
+     * write-through happens unconditionally; no doorbell is fired
+     * (the NPU would separately set INTGR to signal the KMD to
+     * actually consume the ISSR word). */
+    s->bar4_mmio_regs[off >> 2] = val;
+    s->issr_frames_received++;
+    r100_issr_emit_debug(s, off, val, "ok");
+}
+
+static void r100_issr_receive(void *opaque, const uint8_t *buf, int size)
+{
+    R100NpuPciState *s = opaque;
+
+    while (size > 0) {
+        uint32_t want = sizeof(s->issr_rx_buf) - s->issr_rx_len;
+        uint32_t take = size < (int)want ? (uint32_t)size : want;
+
+        memcpy(s->issr_rx_buf + s->issr_rx_len, buf, take);
+        s->issr_rx_len += take;
+        buf += take;
+        size -= take;
+
+        if (s->issr_rx_len == sizeof(s->issr_rx_buf)) {
+            uint32_t off = ldl_le_p(s->issr_rx_buf);
+            uint32_t val = ldl_le_p(s->issr_rx_buf + 4);
+            s->issr_rx_len = 0;
+            r100_issr_deliver(s, off, val);
+        }
+    }
+}
+
 static void r100_npu_pci_realize(PCIDevice *pdev, Error **errp)
 {
     R100NpuPciState *s = R100_NPU_PCI(pdev);
@@ -428,7 +574,26 @@ static void r100_npu_pci_realize(PCIDevice *pdev, Error **errp)
     }
     memory_region_add_subregion_overlap(&s->bar4_container, 0,
                                         &s->bar4_ram, 0);
-    if (qemu_chr_fe_backend_connected(&s->doorbell_chr)) {
+    /*
+     * Install the 4 KB MMIO overlay when ANY of the three bridges
+     * is wired:
+     *   - doorbell (M6): host → NPU INTGR writes intercepted by
+     *                    r100_bar4_mmio_write.
+     *   - msix     (M7): not touched by BAR4 — doesn't need the
+     *                    overlay, but listed for completeness.
+     *   - issr     (M8): NPU → host ISSR values arrive on the
+     *                    chardev and are mirrored into
+     *                    bar4_mmio_regs[]; subsequent guest
+     *                    readls at BAR4 + MAILBOX_BASE + idx*4
+     *                    flow through r100_bar4_mmio_read, not
+     *                    the plain RAM region.
+     *
+     * When neither doorbell nor issr is connected the whole BAR is
+     * plain RAM — the M3/M5 behaviour that pre-M6 single-QEMU runs
+     * still rely on for lazy BAR mmaps.
+     */
+    if (qemu_chr_fe_backend_connected(&s->doorbell_chr) ||
+        qemu_chr_fe_backend_connected(&s->issr_chr)) {
         memory_region_init_io(&s->bar4_mmio, OBJECT(s),
                               &r100_bar4_mmio_ops, s,
                               "r100.bar4.mmio", R100_BAR4_MMIO_SIZE);
@@ -483,6 +648,20 @@ static void r100_npu_pci_realize(PCIDevice *pdev, Error **errp)
                                  NULL,   /* context */
                                  true);  /* set_open */
     }
+
+    /* M8: If an issr chardev is wired, install the receive handler.
+     * Same shape as the M7 ingress but writes through to the BAR4
+     * MMIO register file instead of msix_notify(). */
+    if (qemu_chr_fe_backend_connected(&s->issr_chr)) {
+        qemu_chr_fe_set_handlers(&s->issr_chr,
+                                 r100_issr_can_receive,
+                                 r100_issr_receive,
+                                 NULL,   /* event */
+                                 NULL,   /* be_change */
+                                 s,
+                                 NULL,   /* context */
+                                 true);  /* set_open */
+    }
 }
 
 static void r100_npu_pci_exit(PCIDevice *pdev)
@@ -500,6 +679,8 @@ static void r100_npu_pci_exit(PCIDevice *pdev)
     qemu_chr_fe_deinit(&s->doorbell_chr, false);
     qemu_chr_fe_deinit(&s->msix_chr, false);
     qemu_chr_fe_deinit(&s->msix_debug_chr, false);
+    qemu_chr_fe_deinit(&s->issr_chr, false);
+    qemu_chr_fe_deinit(&s->issr_debug_chr, false);
 }
 
 static Property r100_npu_pci_properties[] = {
@@ -508,6 +689,8 @@ static Property r100_npu_pci_properties[] = {
     DEFINE_PROP_CHR("doorbell", R100NpuPciState, doorbell_chr),
     DEFINE_PROP_CHR("msix", R100NpuPciState, msix_chr),
     DEFINE_PROP_CHR("msix-debug", R100NpuPciState, msix_debug_chr),
+    DEFINE_PROP_CHR("issr", R100NpuPciState, issr_chr),
+    DEFINE_PROP_CHR("issr-debug", R100NpuPciState, issr_debug_chr),
     DEFINE_PROP_END_OF_LIST(),
 };
 
