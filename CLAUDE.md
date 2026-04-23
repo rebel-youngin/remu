@@ -52,7 +52,7 @@ binds with no changes). BAR sizes match `rebel_check_pci_bars_size`:
 | BAR | Size  | Role |
 |-----|-------|------|
 | 0   | 64 GB | DDR — first 128 MB = shm file, tail = lazy RAM |
-| 2   | 64 MB | ACP / SRAM / logbuf (lazy RAM) |
+| 2   | 64 MB | ACP / SRAM / logbuf; 4 KB prio-10 trap @ `FW_LOGBUF_SIZE` (M8b 3b cfg-head) forwards writes on `cfg` chardev, rest lazy RAM |
 | 4   | 8 MB  | 4 KB MMIO head (INTGR M6 + MAILBOX_BASE M8a bidir + CM7-stub Stage 3a); rest lazy RAM |
 | 5   | 1 MB  | MSI-X table (32 vectors) + PBA (`msix_notify()` target for M7) |
 
@@ -61,7 +61,23 @@ serialised as 8-byte chardev frames on the `doorbell` socket; reads in
 `MAILBOX_BASE` range return the live shadow fed by `issr` chardev
 frames (NPU → host). `INTGR0` bit 0 (`SOFT_RESET`) triggers the
 QEMU-side CM7-stub that synthesises `FW_BOOT_DONE` into PF.ISSR[4] —
-see commit `a01d2b5` for the full shortcut design.
+see commit `a01d2b5` for the full shortcut design. `INTGR1` bit 7
+(`QUEUE_INIT`) triggers the Stage 3b QINIT stub (see below).
+
+BAR2 details (M8b 3b): kmd writes `DDH_BASE_{LO,HI}` (at `FW_LOGBUF_SIZE
++ 0xC0/0xC4`) to publish the host-RAM `rbln_device_desc` to firmware.
+Stage 3b widens this into a reusable **host → NPU configuration
+mirror**: the host-side `r100-npu-pci` traps the 4 KB window and emits
+8-byte `(cfg_off, val)` frames on the `cfg` chardev; the NPU-side
+`r100-doorbell` consumes them into a 1024-entry `cfg_shadow[]`. The
+paired **NPU → host DMA executor** is the `hdma` chardev with a 24 B
+header + payload protocol (`src/bridge/remu_hdma_proto.h`). On `INTGR1`
+bit 7 the NPU CM7 stub (`r100_doorbell_qinit_stub`) reads `DDH_BASE`
+from `cfg_shadow[]`, then emits two `HDMA_OP_WRITE` frames — one
+for `fw_version = "3.remu-stub"`, one for `init_done = 1`. The host
+decodes and runs `pci_dma_write` against the x86 guest DMA space. Same
+`cfg + hdma` plumbing will back M9 BD-completion writes and any future
+NPU-initiated host RAM update.
 
 Both QEMUs `mmap` the same 128 MB `/dev/shm/remu-<name>/remu-shm` with
 `share=on`. Splice points (same backend, two places):
@@ -102,6 +118,9 @@ Every `--host` run captures and checks:
   `msix-{table,pba}` overlaying `r100.bar5.msix`.
 - **M8a**: NPU `r100-mailbox` has `issr-chardev = "issr"`; host
   `r100-npu-pci` has `issr = "issr"`.
+- **M8b 3b**: NPU `r100-doorbell` has `cfg-chardev = "cfg"` +
+  `hdma-chardev = "hdma"`; host `r100-npu-pci` has `cfg = "cfg"` +
+  `hdma = "hdma"` (logged to `{host,npu}/info-qtree-cfg-hdma.log`).
 
 All results go to `host/info-*.log` + `npu/info-*.log`. Failures print
 to stdout (non-fatal — NPU still boots for post-mortem poking).
@@ -177,8 +196,9 @@ src/host/             Host-side (x86 guest) PCI device models (symlinked into ex
 src/include/          Added to -I during QEMU configure
                         r100/remu_addrmap.h — `#include "r100/remu_addrmap.h"`
 src/bridge/           Added to -I during QEMU configure — cross-side shared headers
-                        remu_frame.h         8-byte frame codec (RX accumulator + emit)
-                        remu_doorbell_proto.h BAR4 offset classifier
+                        remu_frame.h          8-byte frame codec (RX accumulator + emit)
+                        remu_doorbell_proto.h BAR4 offset classifier + BAR2 cfg-head layout
+                        remu_hdma_proto.h     NPU → host DMA protocol (24 B header + payload)
                       Header-only `static inline`, so both host-side (system_ss)
                       and NPU-side (arm_ss) TUs pick up the same definitions
                       without introducing a shared object.

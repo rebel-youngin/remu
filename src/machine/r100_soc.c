@@ -1011,11 +1011,43 @@ static void r100_soc_init(MachineState *machine)
                 Chardev *dbg = r100_soc_resolve_chr(
                                    r100m->doorbell_debug_chardev_id,
                                    "doorbell debug");
+                /* M8b 3b: cfg (host→NPU) + hdma (NPU→host). Both are
+                 * optional — missing either demotes the QINIT CM7 stub
+                 * to a no-op but doesn't break the M6/M8a paths. */
+                Chardev *cfg_chr = r100_soc_resolve_chr(
+                                       r100m->cfg_chardev_id, "cfg");
+                Chardev *cfg_dbg = NULL;
+                Chardev *hdma_chr = r100_soc_resolve_chr(
+                                       r100m->hdma_chardev_id, "hdma");
+                Chardev *hdma_dbg = NULL;
                 DeviceState *db = qdev_new(TYPE_R100_DOORBELL);
+
+                if (cfg_chr) {
+                    cfg_dbg = r100_soc_resolve_chr(
+                                  r100m->cfg_debug_chardev_id,
+                                  "cfg debug");
+                }
+                if (hdma_chr) {
+                    hdma_dbg = r100_soc_resolve_chr(
+                                  r100m->hdma_debug_chardev_id,
+                                  "hdma debug");
+                }
 
                 qdev_prop_set_chr(db, "chardev", chr);
                 if (dbg) {
                     qdev_prop_set_chr(db, "debug-chardev", dbg);
+                }
+                if (cfg_chr) {
+                    qdev_prop_set_chr(db, "cfg-chardev", cfg_chr);
+                }
+                if (cfg_dbg) {
+                    qdev_prop_set_chr(db, "cfg-debug-chardev", cfg_dbg);
+                }
+                if (hdma_chr) {
+                    qdev_prop_set_chr(db, "hdma-chardev", hdma_chr);
+                }
+                if (hdma_dbg) {
+                    qdev_prop_set_chr(db, "hdma-debug-chardev", hdma_dbg);
                 }
                 /* mailbox=VF0 (shortcut PCIE_CM7 relay — INTGR bits raise
                  * SPI 185 q-sys services). pf-mailbox=PF so SOFT_RESET can
@@ -1148,6 +1180,10 @@ R100_SOC_DEF_STRPROP(msix,           msix_chardev_id)
 R100_SOC_DEF_STRPROP(msix_debug,     msix_debug_chardev_id)
 R100_SOC_DEF_STRPROP(issr,           issr_chardev_id)
 R100_SOC_DEF_STRPROP(issr_debug,     issr_debug_chardev_id)
+R100_SOC_DEF_STRPROP(cfg,            cfg_chardev_id)
+R100_SOC_DEF_STRPROP(cfg_debug,      cfg_debug_chardev_id)
+R100_SOC_DEF_STRPROP(hdma,           hdma_chardev_id)
+R100_SOC_DEF_STRPROP(hdma_debug,     hdma_debug_chardev_id)
 
 #undef R100_SOC_DEF_STRPROP
 
@@ -1186,6 +1222,16 @@ static const R100SoCStrProp r100_soc_str_props[] = {
         "(M8a)."),
     R100_SOC_STR_PROP("issr-debug", issr_debug, issr_debug_chardev_id,
         "chardev id for an ASCII trace of every ISSR frame emitted."),
+    R100_SOC_STR_PROP("cfg", cfg, cfg_chardev_id,
+        "chardev id: host→NPU 8-byte (BAR2 cfg-head off, val) frames "
+        "that populate cfg_shadow[] for the CM7 QINIT stub (M8b 3b)."),
+    R100_SOC_STR_PROP("cfg-debug", cfg_debug, cfg_debug_chardev_id,
+        "chardev id for an ASCII trace of every cfg frame received."),
+    R100_SOC_STR_PROP("hdma", hdma, hdma_chardev_id,
+        "chardev id: NPU→host variable-length HDMA_OP_WRITE frames "
+        "that the host executes as pci_dma_write (M8b 3b, M9 BD-done)."),
+    R100_SOC_STR_PROP("hdma-debug", hdma_debug, hdma_debug_chardev_id,
+        "chardev id for an ASCII trace of every hdma frame emitted."),
 };
 
 #undef R100_SOC_STR_PROP

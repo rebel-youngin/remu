@@ -56,25 +56,27 @@ output/my-test/
   qemu.log        # only if --trace
 ```
 
-Phase 2 (`./remucli run --host` — both QEMUs + 3 chardev bridges):
+Phase 2 (`./remucli run --host` — both QEMUs + 5 chardev bridges):
 
 ```
 output/my-test/
   cmdline.txt + uart{0..3}.log + hils.log   # NPU side (as above)
-  doorbell.log  # M6+M8a — host → NPU frames (INTGR + MAILBOX_BASE)
-  msix.log      # M7     — NPU → host MSI-X frames
-  issr.log      # M8a    — NPU → host ISSR frames
+  doorbell.log  # M6+M8a    — host → NPU frames (INTGR + MAILBOX_BASE)
+  msix.log      # M7        — NPU → host MSI-X frames
+  issr.log      # M8a       — NPU → host ISSR frames
+  cfg.log       # M8b 3b    — host → NPU BAR2 cfg-head writes (DDH_BASE_{LO,HI}, …)
+  hdma.log      # M8b 3b    — NPU → host DMA writes (HDMA_OP_WRITE frames)
   shm -> /dev/shm/remu-my-test/
   npu/
     monitor.sock       # HMP over unix socket
     qemu.stderr.log    # device-model breadcrumbs (only way to see internal state)
-    info-{mtree,qtree,mtree-imsix,qtree-issr}.log  # startup bridge checks
+    info-{mtree,qtree,mtree-imsix,qtree-issr,qtree-cfg-hdma}.log  # startup bridge checks
   host/
     cmdline.txt + qemu.{stdout,stderr}.log
     serial.log         # SeaBIOS idle, or Linux + kmd dmesg when M8b Stage 2 staged
     monitor.sock       # HMP
-    {doorbell,msix,issr}.sock  # chardev listeners (host = server, NPU = client)
-    info-{pci,mtree,mtree-bar4,mtree-bar5,qtree-issr}.log
+    {doorbell,msix,issr,cfg,hdma}.sock  # chardev listeners (host = server, NPU = client)
+    info-{pci,mtree,mtree-bar4,mtree-bar5,qtree-issr,qtree-cfg-hdma}.log
 ```
 
 Cleanup is automatic on clean exit. For orphaned runs:
@@ -231,13 +233,19 @@ printf 'info mtree\nquit\n' | socat - UNIX-CONNECT:output/<name>/host/monitor.so
 #   BAR4 base is in host/info-pci.log (currently 0xfe000000 under SeaBIOS)
 printf 'xp /1wx 0xfe000090\nquit\n'    | socat - UNIX-CONNECT:output/<name>/host/monitor.sock
 printf 'xp /1wx 0x1ff8160090\nquit\n'  | socat - UNIX-CONNECT:output/<name>/npu/monitor.sock
+
+# M8b 3b: both ends of cfg + hdma must be bound in qtree
+printf 'info qtree\nquit\n' | socat - UNIX-CONNECT:output/<name>/host/monitor.sock | rg '(cfg|hdma) *='
+printf 'info qtree\nquit\n' | socat - UNIX-CONNECT:output/<name>/npu/monitor.sock  | rg '(cfg|hdma)-chardev'
 ```
 
-`{doorbell,msix,issr}.log` are per-bridge ASCII traces (format `<bus>
-off=0x... val=0x... [status=...] count=N`). Empty-after-traffic means
-the chardev is down — check both QEMUs are up and the `*.sock` files
-exist. Rejected frames (bad offset / vector ≥ 32) only surface as
-`GUEST_ERROR` lines in `qemu.log`, not the per-bridge log.
+`{doorbell,msix,issr,cfg,hdma}.log` are per-bridge ASCII traces
+(format `<bus> off=0x... val=0x... [status=...] count=N`, or for
+hdma: `hdma op=1 dst=0x... len=... status=... count=N`).
+Empty-after-traffic means the chardev is down — check both QEMUs are
+up and the `*.sock` files exist. Rejected frames (bad offset / vector
+≥ 32 / bad HDMA magic) only surface as `GUEST_ERROR` lines in
+`qemu.log`, not the per-bridge log.
 
 `./remucli run --host` auto-verifies all of the above on startup and
 prints pass/fail; failures are non-fatal (NPU still boots for
@@ -327,19 +335,65 @@ rebellions rbln0: [rbln-rbl] FW_BOOT_DONE
 
 No `FW_BOOT_DONE` → see CM7-stub shadow-check recipe above.
 
-### Stage 3b (in progress)
+### Stage 3b — QINIT CM7 stub (cfg + hdma chardevs)
 
-After `FW_BOOT_DONE`, kmd's `rebel_hw_init` soft-lockups at t+25 s:
+After `FW_BOOT_DONE`, kmd's `rebel_hw_init` used to soft-lockup at
+t+25 s polling `desc->init_done` in host RAM. Silicon's PCIE_CM7
+would have ISR'd on `INTGR1 bit 7` (`REBEL_DOORBELL_QUEUE_INIT`),
+read `desc` via HDMA, written back `fw_version` + `init_done = 1`.
+REMU models neither CM7 nor HDMA, so Stage 3b splits the CM7 role
+cleanly across both QEMUs via two new chardevs:
+
+| chardev | dir | frame | role |
+|---------|-----|-------|------|
+| `cfg` | host→NPU | 8-byte `(cfg_off, val)` | BAR2 cfg-head mirror. Host-side `r100-npu-pci` traps the 4 KB MMIO window at BAR2 offset `FW_LOGBUF_SIZE` and forwards every write (notably `DDH_BASE_{LO,HI}` at +0xC0/+0xC4) to the NPU's `r100-doorbell`, which maintains `cfg_shadow[1024]`. |
+| `hdma` | NPU→host | 24 B header + payload | Write executor. NPU-side `r100-doorbell` emits `HDMA_OP_WRITE` frames (`remu_hdma_proto.h`); host-side `r100-npu-pci` decodes them and runs `pci_dma_write` against the x86 guest's DMA address space. |
+
+On `INTGR1 bit 7`, the NPU-side CM7 stub in `src/machine/r100_doorbell.c`
+(function `r100_doorbell_qinit_stub`) reads `DDH_BASE_{LO,HI}` from
+`cfg_shadow`, recovers `desc_dma = (hi:lo) - HOST_PHYS_BASE`, and
+emits two HDMA writes:
 
 ```
-watchdog: BUG: soft lockup - CPU#0 stuck for 26s! [kworker/…:rbln_probe]
-  rebel_hw_init+0x439/0xa60 [rebellions]
-  rbln_device_init_async+0x46/0x470 [rebellions]
+HDMA_OP_WRITE  dst = desc_dma + 0x5C  len = 52  payload = "3.remu-stub\0…"
+HDMA_OP_WRITE  dst = desc_dma + 0x58  len = 4   payload = 0x00000001
 ```
 
-Next unmodelled FW wait-state — likely another ISSR poll or the
-`TEST_IB` shared-DRAM ring handshake. Decode, then wire up FW-side or
-synthesise in QEMU analogous to the CM7-stub.
+Watch the split in action:
+
+```
+$ tail output/<name>/cfg.log
+cfg off=0xc0 val=0x2b80000 status=ok count=4     # DDH_BASE_LO = desc_dma
+cfg off=0xc4 val=0x80       status=ok count=5     # DDH_BASE_HI (HOST_PHYS_BASE>>32)
+
+$ tail output/<name>/doorbell.log
+doorbell off=0x1c val=0x80 count=…                # INTGR1 bit 7 = QUEUE_INIT
+
+$ tail output/<name>/hdma.log
+hdma op=1 dst=0x2b8005c len=52 status=ok count=1  # fw_version
+hdma op=1 dst=0x2b80058 len=4  status=ok count=2  # init_done=1
+```
+
+The major-version prefix compared by `rbln_device_version_check` is
+`"3"` against `"3.remu-stub"` — passes cleanly. When the kmd bumps
+past major 3, update `REMU_FW_VERSION_STR` in `r100_doorbell.c` (or
+add `HDMA_OP_READ` + async response and do a proper driver→fw
+mirror).
+
+After Stage 3b the kmd boots past `hw_init` into `rbln_queue_test`,
+which currently fails waiting for an MSI-X interrupt — that's the
+next unmodelled FW path (BD completion), tracked under M9.
+
+#### Sanity-checking the stub
+
+The host-side `info qtree` must show both `cfg` and `hdma`
+CharBackends bound on `r100-npu-pci`, and the NPU-side must show
+the matching `cfg-chardev` / `hdma-chardev` on `r100-doorbell`.
+`./remucli run --host` auto-verifies both ends and logs the
+snippets to `host/info-qtree-cfg-hdma.log` and
+`npu/info-qtree-cfg-hdma.log`. A missing property means the
+`-machine r100-soc,cfg=/hdma=…` or `-device r100-npu-pci,cfg=/hdma=…`
+option didn't latch — check `cli/remu_cli.py` chardev id literals.
 
 ## Interpreting a boot log
 

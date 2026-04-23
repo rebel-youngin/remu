@@ -49,7 +49,7 @@ device, handshakes with FW, umd opens the device.
 | M6 | BAR4 INTGR → `doorbell` chardev → `r100-doorbell` → `r100-mailbox` → chiplet-0 GIC SPI 184/185 | done | `85b76bb`, `500856b` |
 | M7 | `r100-imsix` MMIO trap at `0x1BFFFFF000 + 0xFFC` → `msix` chardev → `msix_notify()` | done | `db3d1df` |
 | M8a | ISSR bridge both dirs (NPU→host on new `issr` chardev, host→NPU on same `doorbell` wire, offset-disambiguated) | done | `cd24aa9` |
-| M8b | `FW_BOOT_DONE` + `TEST_IB` ring on top of M8a | in progress (3a done, 3b active) | see sub-table |
+| M8b | `FW_BOOT_DONE` + QINIT handshake on top of M8a | in progress (3a + 3b done, 3c active) | see sub-table |
 | M9  | DNC stub + trivial umd job | pending | — |
 
 Each milestone boots end-to-end and the run-harness (`./remucli run --host`)
@@ -65,7 +65,8 @@ auto-verifies its bridge via `info pci/mtree/qtree` — see the checklist in
 | 2b | `--host` auto-wires `-kernel/-initrd/-fsdev virtio-9p`, `-cpu max` for BMI2 in kmd | done | `1ef7208` |
 | 2c | GIC CPU-interface `bpr > 0` assertion fix (QEMU patch `0002-arm-gicv3-reset-cpuif-after-init.patch`) | done | `985fd58` |
 | 3a | KMD soft-reset handshake: `r100-doorbell` CM7-stub synthesises `FW_BOOT_DONE` → PF.ISSR[4] in QEMU, bypassing unmodelled PCIE_CM7 | done | `a01d2b5` |
-| 3b | `rebel_hw_init` soft-lockup at t+25 s — decode the next unmodelled FW wait-state (likely `TEST_IB` ring or another ISSR poll) and either wire it on FW side or synthesise in QEMU | in progress | — |
+| 3b | `rebel_hw_init` QINIT handshake: new `cfg` chardev (host → NPU BAR2 cfg-head mirror, incl. `DDH_BASE_{LO,HI}`) + `hdma` chardev (NPU → host DMA writes, 24 B header + payload) — NPU-side CM7 stub handles `INTGR1 bit 7 = QUEUE_INIT` by emitting HDMA writes for `fw_version = "3.remu-stub"` and `init_done = 1` | done | — |
+| 3c | `rbln_queue_test` MSI-X completion — FW BD-done path writes completion MSI-X; reuses same `cfg + hdma` plumbing | pending | — |
 
 ### Components (current state)
 
@@ -73,36 +74,49 @@ Device models + chardev bridges — see `docs/architecture.md`
 "Source File Map" for per-file behaviour, and `docs/debugging.md`
 for the HMP sanity recipes.
 
-- `src/host/r100_npu_pci.c` — x86-side endpoint. BAR0 splice, BAR2 lazy RAM,
-  BAR4 container with 4 KB MMIO head (INTGR + MAILBOX_BASE shadow),
-  BAR5 MSI-X + RAM fill.
+- `src/host/r100_npu_pci.c` — x86-side endpoint. BAR0 splice, BAR2 lazy RAM
+  with a 4 KB cfg-head trap at `FW_LOGBUF_SIZE` (M8b 3b, forwards writes on
+  `cfg` chardev), BAR4 container with 4 KB MMIO head (INTGR + MAILBOX_BASE
+  shadow), BAR5 MSI-X + RAM fill, `hdma` chardev receiver that decodes
+  `HDMA_OP_WRITE` frames into `pci_dma_write` against x86 guest RAM.
 - `src/machine/r100_soc.c` — machine. Splices memdev into chiplet-0 DRAM,
   instantiates two PF/VF0 `r100-mailbox` blocks, optional `r100-doorbell`
-  / `r100-imsix` gated on chardev machine-props.
+  / `r100-imsix` gated on chardev machine-props. Wires `cfg` + `hdma`
+  chardevs onto `r100-doorbell`.
 - `src/machine/r100_mailbox.c` — Samsung IPM SFR (`INTGR/INTCR/INTMR/INTSR/INTMSR/ISSR0..63`),
   two `qemu_irq` outs tracking INTMSR. API: `r100_mailbox_raise_intgr`,
   `r100_mailbox_set_issr`, `r100_mailbox_cm7_stub_write_issr`.
 - `src/machine/r100_doorbell.c` — reassembles 8-byte `(offset, value)` frames,
-  routes by offset into mailbox INTGR / ISSR / CM7-stub.
+  routes by offset into mailbox INTGR / ISSR / CM7-stub. Also hosts the
+  M8b-3b `cfg_shadow[1024]` mirror of host BAR2 cfg-head and the QINIT
+  CM7 stub that emits HDMA writes on `INTGR1 bit 7`.
 - `src/machine/r100_imsix.c` — 4 KB MMIO trap at `R100_PCIE_IMSIX_BASE`,
   emits `(offset, db_data)` frames on write to `0xFFC`.
-- Three Unix-socket chardevs under `output/<name>/host/`: `doorbell.sock`
+- Five Unix-socket chardevs under `output/<name>/host/`: `doorbell.sock`
   (M6+M8a, host → NPU), `msix.sock` (M7, NPU → host), `issr.sock`
-  (M8a, NPU → host).
+  (M8a, NPU → host), `cfg.sock` (M8b 3b, host → NPU BAR2 cfg-head),
+  `hdma.sock` (M8b 3b, NPU → host DMA writes).
+- `src/bridge/remu_hdma_proto.h` — 24 B `RemuHdmaHeader` + payload
+  wire format for NPU → host writes; reused for any future NPU-initiated
+  host-RAM update (M9 BD-done included).
 - `./remucli run --host` orchestrates both QEMUs + auto-verifies bridges;
   M8b Stage 2 adds optional `-kernel/-initrd/-fsdev virtio-9p` wiring when
   `images/x86_guest/{bzImage,initramfs.cpio.gz}` are staged.
 
 ### Pending components
 
+- BD-completion CM7 stub — reuse `cfg + hdma` plumbing, add `HDMA_OP_READ`
+  if FW reads need async responses (M8b 3c)
 - DNC stub (accept task, generate completion MSI-X) — M9
-- HDMA stub (actual memcpy between DRAM regions) — M9
+- HDMA scatter-gather (actual memcpy between DRAM regions, beyond the
+  Stage-3b "write-one-descriptor" primitive) — M9
 
 ### Success criteria
 
 - `insmod rebellions.ko` succeeds, device probes, BAR sizes match
 - MSI-X vectors allocated, `FW_BOOT_DONE` handshake completes (M8b 3a ✓)
-- `TEST_IB` ring passes (M8b 3b)
+- `rebel_hw_init` / `rebel_queue_init` pass (M8b 3b ✓)
+- `rbln_queue_test` completes (M8b 3c — BD-done MSI-X)
 - umd opens device, creates context, submits simple job (M9)
 
 ## Phase 3: Full Inference

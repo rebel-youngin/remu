@@ -537,7 +537,9 @@ def _make_run_dir(name, output_root):
 def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
                    npu_monitor_sock=None, doorbell_sock=None,
                    doorbell_log=None, msix_sock=None, msix_log=None,
-                   issr_sock=None, issr_log=None):
+                   issr_sock=None, issr_log=None,
+                   cfg_sock=None, cfg_log=None,
+                   hdma_sock=None, hdma_log=None):
     """Assemble the aarch64 QEMU cmdline for the R100 NPU side.
     Matches the previous in-line flow exactly; extracted so that
     --host can extend it (Phase 2) without duplicating boot-image
@@ -580,7 +582,27 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
     bar4_mmio_regs[BAR4-offset/4] so a later KMD readl() on the
     matching BAR4 offset observes the FW-written magic (FW_BOOT_DONE
     on ISSR[4], reset counters on ISSR[7], and so on). Optional
-    `issr_log` file chardev echoes one ASCII line per egress."""
+    `issr_log` file chardev echoes one ASCII line per egress.
+
+    cfg_sock / cfg_log: M8b Stage 3b plumbing — host→NPU BAR2 cfg-head
+    mirror. The host side traps a 4 KB MMIO window at BAR2 offset
+    FW_LOGBUF_SIZE (where the kmd programs DDH_BASE_{LO,HI}) and
+    forwards every write as an 8-byte (cfg-head-offset, value) frame;
+    the NPU-side r100-doorbell consumes them into cfg_shadow[] so the
+    CM7 QINIT stub can read DDH_BASE without round-tripping to host
+    RAM. Optional `cfg_log` file chardev echoes one ASCII line per
+    received frame.
+
+    hdma_sock / hdma_log: M8b Stage 3b plumbing — NPU→host HDMA
+    executor. The NPU-side r100-doorbell emits variable-length
+    HDMA_OP_WRITE frames (24-byte header + payload, remu_hdma_proto.h)
+    on this chardev whenever the CM7 stub decides to touch host RAM;
+    the host-side r100-npu-pci decodes each frame and performs the
+    underlying pci_dma_write on the x86 guest's memory. Today only
+    the QINIT stub uses it (fw_version + init_done = 1 into the
+    rbln_device_desc); M9 BD-done completions reuse the same wire.
+    Optional `hdma_log` file chardev echoes one ASCII line per
+    emitted frame."""
     uart0_log = run_dir / "uart0.log"
     hils_log = run_dir / "hils.log"
 
@@ -599,6 +621,14 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
         machine_opt += ",issr=issr"
         if issr_log is not None:
             machine_opt += ",issr-debug=issr_dbg"
+    if cfg_sock is not None:
+        machine_opt += ",cfg=cfg"
+        if cfg_log is not None:
+            machine_opt += ",cfg-debug=cfg_dbg"
+    if hdma_sock is not None:
+        machine_opt += ",hdma=hdma"
+        if hdma_log is not None:
+            machine_opt += ",hdma-debug=hdma_dbg"
 
     cmd = [
         str(QEMU_BIN),
@@ -653,6 +683,32 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
             cmd += [
                 "-chardev",
                 "file,id=issr_dbg,path=%s,mux=off" % issr_log,
+            ]
+    if cfg_sock is not None:
+        # M8b 3b: host→NPU cfg-head mirror. Same host-as-server pattern
+        # — host-side r100-npu-pci listens and egresses frames, NPU
+        # r100-doorbell connects as client and populates cfg_shadow.
+        cmd += [
+            "-chardev",
+            "socket,id=cfg,path=%s,reconnect=1" % cfg_sock,
+        ]
+        if cfg_log is not None:
+            cmd += [
+                "-chardev",
+                "file,id=cfg_dbg,path=%s,mux=off" % cfg_log,
+            ]
+    if hdma_sock is not None:
+        # M8b 3b: NPU→host HDMA executor. Host listens; NPU connects
+        # and emits HDMA_OP_WRITE frames (variable-length) on the
+        # CM7-stub dispatch.
+        cmd += [
+            "-chardev",
+            "socket,id=hdma,path=%s,reconnect=1" % hdma_sock,
+        ]
+        if hdma_log is not None:
+            cmd += [
+                "-chardev",
+                "file,id=hdma_dbg,path=%s,mux=off" % hdma_log,
             ]
     click.echo("  Chiplet 0 UART -> stdio (log: %s)" % uart0_log)
 
@@ -843,6 +899,8 @@ def _cleanup_run_trash(run_name, output_root=None, verbose=True):
 def _build_host_cmd(host_dir, shm_file, shm_size, monitor_sock, mem,
                     doorbell_sock=None, msix_sock=None, msix_log=None,
                     issr_sock=None, issr_log=None,
+                    cfg_sock=None, cfg_log=None,
+                    hdma_sock=None, hdma_log=None,
                     kernel=None, initrd=None, share_dir=None,
                     cmdline_extra=None):
     """Assemble the x86_64 QEMU cmdline for the Phase-2 host side.
@@ -923,6 +981,37 @@ def _build_host_cmd(host_dir, shm_file, shm_size, monitor_sock, mem,
                 "file,id=issr_dbg,path=%s,mux=off" % issr_log,
             ]
             device_arg += ",issr-debug=issr_dbg"
+    if cfg_sock is not None:
+        # M8b 3b cfg: host owns the listener, egresses (cfg_off, val)
+        # frames on kmd BAR2 cfg-head writes. NPU r100-doorbell joins
+        # as client and updates cfg_shadow[].
+        chardevs += [
+            "-chardev",
+            "socket,id=cfg,path=%s,server=on,wait=off" % cfg_sock,
+        ]
+        device_arg += ",cfg=cfg"
+        if cfg_log is not None:
+            chardevs += [
+                "-chardev",
+                "file,id=cfg_dbg,path=%s,mux=off" % cfg_log,
+            ]
+            device_arg += ",cfg-debug=cfg_dbg"
+    if hdma_sock is not None:
+        # M8b 3b hdma: host owns the listener, receives
+        # HDMA_OP_WRITE frames from the NPU-side CM7 stub and
+        # executes them as pci_dma_write into the guest's DMA
+        # address space.
+        chardevs += [
+            "-chardev",
+            "socket,id=hdma,path=%s,server=on,wait=off" % hdma_sock,
+        ]
+        device_arg += ",hdma=hdma"
+        if hdma_log is not None:
+            chardevs += [
+                "-chardev",
+                "file,id=hdma_dbg,path=%s,mux=off" % hdma_log,
+            ]
+            device_arg += ",hdma-debug=hdma_dbg"
 
     # `qemu64` is a minimal CPU model missing BMI2/AVX2/etc. Our kmd
     # (rebellions.ko) is built on the host with `-march=native` and
@@ -1347,6 +1436,93 @@ def _verify_issr_wired(host_monitor_sock, npu_monitor_sock,
     return npu_snippet + "\n" + host_snippet
 
 
+def _verify_cfg_hdma_wired(host_monitor_sock, npu_monitor_sock,
+                           host_qtree_log, npu_qtree_log,
+                           poll_timeout=10.0):
+    """Prove the M8b 3b cfg + hdma chardev plumbing is alive on both sides.
+
+    Same pattern as `_verify_issr_wired` — both new chardevs are
+    CharBackend properties on existing devices (no new MemoryRegion
+    overlay to look for), so we inspect `info qtree` on both sides:
+
+    NPU side (r100-doorbell):
+      `cfg-chardev`  = "cfg"   (non-empty CharBackend value)
+      `hdma-chardev` = "hdma"  (non-empty CharBackend value)
+
+    Host side (r100-npu-pci):
+      `cfg`  = "cfg"
+      `hdma` = "hdma"
+
+    Raises RuntimeError on failure with actionable detail. The caller
+    in `run()` downgrades that to a red-text warning so the NPU still
+    boots (same policy as the other post-launch verifiers).
+    """
+    def _has_nonempty(lines, key):
+        for ln in lines:
+            stripped = ln.strip()
+            if not stripped.startswith(key + " "):
+                continue
+            if '""' in stripped:
+                continue
+            return True
+        return False
+
+    qtree_npu = ""
+    deadline = time.time() + poll_timeout
+    while time.time() < deadline:
+        qtree_npu = _hmp_query(npu_monitor_sock, "info qtree", timeout=10.0)
+        if ("cfg-chardev" in qtree_npu and
+                'cfg-chardev ""' not in qtree_npu and
+                "hdma-chardev" in qtree_npu and
+                'hdma-chardev ""' not in qtree_npu):
+            break
+        time.sleep(0.3)
+    npu_qtree_log.write_text(qtree_npu + "\n")
+
+    npu_lines = [ln.rstrip() for ln in qtree_npu.splitlines()
+                 if "cfg-chardev" in ln or "hdma-chardev" in ln]
+    if not _has_nonempty(npu_lines, "cfg-chardev"):
+        raise RuntimeError(
+            "NPU-side r100-doorbell 'cfg-chardev' property is unset; "
+            "the -machine r100-soc,cfg=<id> option didn't latch. "
+            "See %s" % npu_qtree_log)
+    if not _has_nonempty(npu_lines, "hdma-chardev"):
+        raise RuntimeError(
+            "NPU-side r100-doorbell 'hdma-chardev' property is unset; "
+            "the -machine r100-soc,hdma=<id> option didn't latch. "
+            "See %s" % npu_qtree_log)
+    npu_snippet = "\n".join(npu_lines) or "(no cfg/hdma-chardev lines)"
+
+    qtree_host = ""
+    deadline = time.time() + poll_timeout
+    while time.time() < deadline:
+        qtree_host = _hmp_query(host_monitor_sock, "info qtree", timeout=10.0)
+        lines = qtree_host.splitlines()
+        if (_has_nonempty(lines, "cfg") and _has_nonempty(lines, "hdma")):
+            break
+        time.sleep(0.3)
+    host_qtree_log.write_text(qtree_host + "\n")
+
+    host_lines = [ln.rstrip() for ln in qtree_host.splitlines()
+                  if ln.strip().startswith("cfg ")
+                  or ln.strip().startswith("cfg-debug ")
+                  or ln.strip().startswith("hdma ")
+                  or ln.strip().startswith("hdma-debug ")]
+    if not _has_nonempty(host_lines, "cfg"):
+        raise RuntimeError(
+            "host-side r100-npu-pci 'cfg' property is unset; "
+            "the -device r100-npu-pci,cfg=<id> option didn't latch. "
+            "See %s" % host_qtree_log)
+    if not _has_nonempty(host_lines, "hdma"):
+        raise RuntimeError(
+            "host-side r100-npu-pci 'hdma' property is unset; "
+            "the -device r100-npu-pci,hdma=<id> option didn't latch. "
+            "See %s" % host_qtree_log)
+    host_snippet = "\n".join(host_lines) or "(no cfg/hdma lines)"
+
+    return npu_snippet + "\n" + host_snippet
+
+
 def _verify_npu_shared_mapping(npu_monitor_sock, mtree_log):
     """Prove the shared memory-backend-file is spliced over chiplet 0
     DRAM on the NPU side (M5).
@@ -1450,9 +1626,13 @@ def run(name, output_root, gdb, trace, chiplets, memory,
       host/doorbell.sock M6 NPU→host-visible doorbell socket
       host/msix.sock     M7 NPU→host MSI-X reverse-direction socket
       host/issr.sock     M8 NPU→host ISSR shadow-egress socket
+      host/cfg.sock      M8b 3b host→NPU BAR2 cfg-head mirror socket
+      host/hdma.sock     M8b 3b NPU→host HDMA write executor socket
       doorbell.log       ASCII tail of doorbell frames received by NPU (M6)
       msix.log           ASCII tail of MSI-X frames emitted by NPU (M7)
       issr.log           ASCII tail of ISSR frames emitted by NPU (M8)
+      cfg.log            ASCII tail of cfg frames received by NPU (M8b 3b)
+      hdma.log           ASCII tail of hdma frames emitted by NPU (M8b 3b)
 
     `<output-root>/latest` is updated to point at the most recent run.
     """
@@ -1482,23 +1662,29 @@ def run(name, output_root, gdb, trace, chiplets, memory,
     msix_log = None
     issr_sock = None
     issr_log = None
+    cfg_sock = None
+    cfg_log = None
+    hdma_sock = None
+    hdma_log = None
     if with_host:
         npu_dir = run_dir / "npu"
         npu_dir.mkdir(exist_ok=True)
         npu_monitor_sock = npu_dir / "monitor.sock"
-        # M6 doorbell and M7 iMSIX and M8 ISSR shadow all use the
-        # same host-as-server + NPU-as-client pattern; sockets live
-        # under host/ so they survive alongside the other host-owned
-        # artifacts. ASCII debug tails sit at run root so users can
-        # tail them without guessing which side "owns" them. Stale
-        # sock paths would make the host bind EADDRINUSE; clean
+        # M6 doorbell, M7 iMSIX, M8 ISSR shadow, and M8b 3b cfg + hdma
+        # all use the same host-as-server + NPU-as-client pattern;
+        # sockets live under host/ so they survive alongside the other
+        # host-owned artifacts. ASCII debug tails sit at run root so
+        # users can tail them without guessing which side "owns" them.
+        # Stale sock paths would make the host bind EADDRINUSE; clean
         # them all before launch.
         host_dir_early = run_dir / "host"
         host_dir_early.mkdir(exist_ok=True)
         doorbell_sock = host_dir_early / "doorbell.sock"
         msix_sock = host_dir_early / "msix.sock"
         issr_sock = host_dir_early / "issr.sock"
-        for p in (doorbell_sock, msix_sock, issr_sock):
+        cfg_sock = host_dir_early / "cfg.sock"
+        hdma_sock = host_dir_early / "hdma.sock"
+        for p in (doorbell_sock, msix_sock, issr_sock, cfg_sock, hdma_sock):
             if p.exists():
                 try:
                     p.unlink()
@@ -1507,6 +1693,8 @@ def run(name, output_root, gdb, trace, chiplets, memory,
         doorbell_log = run_dir / "doorbell.log"
         msix_log = run_dir / "msix.log"
         issr_log = run_dir / "issr.log"
+        cfg_log = run_dir / "cfg.log"
+        hdma_log = run_dir / "hdma.log"
 
     npu_cmd, found = _build_npu_cmd(run_dir, gdb, trace,
                                     with_host=with_host,
@@ -1516,7 +1704,11 @@ def run(name, output_root, gdb, trace, chiplets, memory,
                                     msix_sock=msix_sock,
                                     msix_log=msix_log,
                                     issr_sock=issr_sock,
-                                    issr_log=issr_log)
+                                    issr_log=issr_log,
+                                    cfg_sock=cfg_sock,
+                                    cfg_log=cfg_log,
+                                    hdma_sock=hdma_sock,
+                                    hdma_log=hdma_log)
 
     if found == 0:
         click.secho("Warning: no firmware images in %s/" % IMAGES_DIR,
@@ -1583,6 +1775,10 @@ def run(name, output_root, gdb, trace, chiplets, memory,
             msix_log=msix_log,
             issr_sock=issr_sock,
             issr_log=issr_log,
+            cfg_sock=cfg_sock,
+            cfg_log=cfg_log,
+            hdma_sock=hdma_sock,
+            hdma_log=hdma_log,
             kernel=kernel_path,
             initrd=initrd_path,
             share_dir=share_path,
@@ -1604,6 +1800,10 @@ def run(name, output_root, gdb, trace, chiplets, memory,
                    % (msix_sock, msix_log))
         click.echo("  ISSR        -> %s (debug tail: %s)"
                    % (issr_sock, issr_log))
+        click.echo("  CFG         -> %s (debug tail: %s)"
+                   % (cfg_sock, cfg_log))
+        click.echo("  HDMA        -> %s (debug tail: %s)"
+                   % (hdma_sock, hdma_log))
 
     (run_dir / "cmdline.txt").write_text(" \\\n  ".join(npu_cmd) + "\n")
 
@@ -1673,6 +1873,16 @@ def run(name, output_root, gdb, trace, chiplets, memory,
         if issr_sock and issr_sock.exists():
             try:
                 issr_sock.unlink()
+            except OSError:
+                pass
+        if cfg_sock and cfg_sock.exists():
+            try:
+                cfg_sock.unlink()
+            except OSError:
+                pass
+        if hdma_sock and hdma_sock.exists():
+            try:
+                hdma_sock.unlink()
             except OSError:
                 pass
 
@@ -1818,6 +2028,24 @@ def run(name, output_root, gdb, trace, chiplets, memory,
                 "  issr chardev wired: r100-mailbox egress on NPU + "
                 "r100-npu-pci ingress on host", fg="green")
             for ln in issr_snip.splitlines():
+                click.echo("    " + ln)
+            click.echo()
+        except Exception as e:
+            click.secho("  %s" % e, fg="red")
+
+        # M8b 3b: Verify the cfg (host→NPU) + hdma (NPU→host) pair so
+        # CM7 QINIT stub has the two wires it needs. Same non-fatal
+        # policy as issr.
+        try:
+            ch_snip = _verify_cfg_hdma_wired(
+                host_dir / "monitor.sock", npu_monitor_sock,
+                host_dir / "info-qtree-cfg-hdma.log",
+                npu_dir / "info-qtree-cfg-hdma.log",
+            )
+            click.secho(
+                "  cfg+hdma chardevs wired: r100-doorbell cfg/hdma on NPU + "
+                "r100-npu-pci cfg/hdma on host", fg="green")
+            for ln in ch_snip.splitlines():
                 click.echo("    " + ln)
             click.echo()
         except Exception as e:

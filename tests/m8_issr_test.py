@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """M8 ISSR shadow-bridge end-to-end test.
 
-Exercises the bidirectional ISSR payload bridge the kmd / q-cp will
-ride on top of for FW_BOOT_DONE and the TEST_IB ring:
+Exercises the bidirectional ISSR payload bridge the kmd / q-cp rides
+on top of — used by FW_BOOT_DONE (M8b Stage 3a CM7-stub) and
+downstream q-cp message-ring paths:
 
     NPU → host:  FW writes one of the chiplet-0 PCIE r100-mailbox
                  ISSR0..63 scratch registers
