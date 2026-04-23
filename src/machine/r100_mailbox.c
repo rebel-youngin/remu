@@ -1,72 +1,23 @@
 /*
- * R100 Samsung IPM mailbox peripheral (Phase 2, M6 + M8a).
+ * R100 Samsung IPM mailbox SFR (Phase 2, M6 + M8a).
  *
- * Models one instance of the Samsung mailbox SFR block that sits on the
- * config-space path between two CPUs. The real silicon has 20+ copies
- * of this same register layout scattered around the SoC (ROT_M0..M2,
- * CP{0,1}_M3/M4, PERI0/1_M5..M14, PCIE_PF/VF0..15). All of them share
- * the exact register layout documented in
- * external/ssw-bundle/.../drivers/mailbox/ipm_samsung.h:
+ * Register layout per drivers/mailbox/ipm_samsung.h:
+ *   0x00 MCUCTRL (bit 0 = mswrst)
+ *   0x08/0x1C INTGR{0,1}  W1S pending
+ *   0x0C/0x20 INTCR{0,1}  W1C pending
+ *   0x10/0x24 INTMR{0,1}  mask
+ *   0x14/0x28 INTSR{0,1}  = pending                  (R)
+ *   0x18/0x2C INTMSR{0,1} = pending & ~INTMR         (R)
+ *   0x6C MIF_INIT / 0x70 IS_VERSION / 0x80.. ISSR0..63
  *
- *   0x00   MCUCTRL                (bit 0 = mswrst)
- *   0x08   INTGR0                 W1S pending.0 (generate to CPU0-side)
- *   0x0C   INTCR0                 W1C pending.0
- *   0x10   INTMR0                 mask for group 0
- *   0x14   INTSR0                 raw pending.0                (R)
- *   0x18   INTMSR0                pending.0 & ~INTMR0          (R)
- *   0x1C   INTGR1                 W1S pending.1 (generate to CPU1-side)
- *   0x20   INTCR1                 W1C pending.1
- *   0x24   INTMR1                 mask for group 1
- *   0x28   INTSR1                 raw pending.1                (R)
- *   0x2C   INTMSR1                pending.1 & ~INTMR1          (R)
- *   0x6C   MIF_INIT               bit 2 = mif_init (unused here; RW)
- *   0x70   IS_VERSION             RW scratch
- *   0x80   ISSR0..ISSR63          64 x u32 payload scratch regs
+ * Two qemu_irq outs (`irq[0]`, `irq[1]`) level-high whenever INTMSR is
+ * non-zero. Clear via INTCR or MCUCTRL mswrst.
  *
- * ipm_samsung_send() writes BIT(channel) into INTGR{0,1}. ipm_samsung_isr()
- * finds the MSB set in INTMSR{0,1} and then clears it via INTCR. Our model
- * keeps a single 32-bit `pending[2]` shadow for both INTSR and INTGR reads
- * (they are the same storage on silicon) and derives INTMSR lazily.
- *
- * Two qemu_irq outputs (`irq[0]`, `irq[1]`) follow INTMSR0/INTMSR1
- * respectively: level-high whenever the corresponding INTMSR has any
- * pending bit unmasked. A pending bit is cleared either by an INTCR
- * write (the normal ISR path) or a MCUCTRL mswrst.
- *
- * For Phase 2 only chiplet 0's PCIE mailbox is actually wired to a
- * GIC (see r100_soc.c). The device is otherwise untargeted from
- * MMIO — FW accesses it through its cfg-space alias via the sysmem
- * mapping installed by the machine.
- *
- * M6 (host → NPU IRQ). The doorbell path (host BAR4 MAILBOX_INTGR
- * writes forwarded over a chardev) used to pulse a placeholder SPI
- * directly; with this device in place, src/machine/r100_doorbell.c
- * calls r100_mailbox_raise_intgr() and the SPI is asserted as the
- * natural consequence of the mailbox's INTMSR going non-zero. That
- * matches silicon: on the real chip, a host PCIe write to
- * MAILBOX_PCIE_PRIVATE + INTGR1 sets pending bits in the same SFR
- * the ISR then reads from.
- *
- * M8a (bidirectional ISSR shadow for BAR4 + MAILBOX_BASE):
- *   - NPU → host: every MMIO write into ISSRn (any origin — firmware
- *     ISR, test poke, future stub) re-emits the `(bar4_offset, value)`
- *     pair on an optional `issr-chardev`. The host-side r100-npu-pci
- *     mirrors it into its BAR4 MMIO register file so the x86 kmd sees
- *     a live shadow at BAR4 + MAILBOX_BASE + idx*4. This is the only
- *     direction where the mailbox talks to the chardev bridge — there
- *     is no ingress path, because host-to-NPU traffic arrives via the
- *     doorbell chardev + r100-doorbell + r100_mailbox_set_issr().
- *   - Host → NPU: r100_mailbox_set_issr(idx, val) is the API the
- *     doorbell calls on receipt of a MAILBOX_BASE frame. It updates
- *     the same ISSR storage but *intentionally does not* emit on the
- *     issr chardev (the host is already the source of the value;
- *     re-emitting would alias the write back to itself and wedge the
- *     shadow in an infinite loop). It also does not touch INTSR /
- *     INTGR — ISSR writes are plain scratch-register traffic.
- *
- * The issr-debug chardev is advisory; the CLI directs it to
- * output/<run>/issr.log so tests can check who wrote what in which
- * order.
+ * M6 (commit 500856b): doorbell → r100_mailbox_raise_intgr() → INTMSR
+ * nonzero → SPI asserted. M8a (commit cd24aa9): every MMIO ISSR write
+ * re-emits an 8-byte (bar4_off, val) frame on the `issr` chardev so the
+ * host BAR4 shadow stays in sync. Host→NPU ISSR (via
+ * r100_mailbox_set_issr) does NOT re-emit — would loop the write back.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -124,16 +75,9 @@ void r100_mailbox_raise_intgr(R100MailboxState *s, int group, uint32_t val)
 }
 
 /*
- * M8 NPU→host ISSR egress.
- *
- * Emit an 8-byte (bar4_off, val) frame on the egress chardev when
- * `issr_chr` is connected. The `bar4_off` field is the BAR4 offset
- * the host KMD uses to reach the mirrored ISSR register (= MAILBOX_BASE
- * + idx*4), not the NPU-side SFR offset (ISSR0 + idx*4). This keeps
- * the host side parser trivial — it just indexes into bar4_mmio_regs
- * with `off >> 2`. Best-effort non-blocking write: silicon doesn't
- * back-pressure the CPU on mailbox stores either, so on short writes
- * we count and drop and rely on the next ISSR write to resync state.
+ * M8a NPU→host ISSR egress. Frame's bar4_off = MAILBOX_BASE + idx*4
+ * (host-side offset, not NPU SFR offset — keeps host parser trivial).
+ * Non-blocking; silicon doesn't back-pressure either.
  */
 static void r100_mailbox_issr_emit_debug(R100MailboxState *s, uint32_t idx,
                                          uint32_t val)
@@ -221,9 +165,7 @@ static uint64_t r100_mailbox_read(void *opaque, hwaddr addr, unsigned size)
     switch (addr) {
     case R100_MBX_MCUCTRL:
         return s->mcuctrl;
-    /* INTGR reads return the current pending state on silicon (same
-     * storage as INTSR). Not used by the FW driver but exposed for
-     * test introspection. */
+    /* INTGR reads = pending (same storage as INTSR on silicon). */
     case R100_MBX_INTGR0:
     case R100_MBX_INTSR0:
         return s->pending[0];
@@ -267,8 +209,7 @@ static void r100_mailbox_write(void *opaque, hwaddr addr, uint64_t val,
     case R100_MBX_MCUCTRL:
         s->mcuctrl = v & R100_MBX_MCUCTRL_MSWRST;
         if (v & R100_MBX_MCUCTRL_MSWRST) {
-            /* MSWRST: reset all pending and unmask everything. Docs
-             * describe this as a soft-reset of the SFR block. */
+            /* Soft-reset: clear pending + mask. */
             s->pending[0] = s->pending[1] = 0;
             s->intmr[0] = s->intmr[1] = 0;
             r100_mailbox_update_irq(s, 0);
@@ -305,7 +246,7 @@ static void r100_mailbox_write(void *opaque, hwaddr addr, uint64_t val,
     case R100_MBX_INTSR1:
     case R100_MBX_INTMSR0:
     case R100_MBX_INTMSR1:
-        /* Read-only status mirrors; writes are ignored on silicon. */
+        /* RO status mirrors; writes ignored on silicon. */
         break;
     case R100_MBX_MIF_INIT:
         s->mif_init = v;
@@ -318,12 +259,8 @@ static void r100_mailbox_write(void *opaque, hwaddr addr, uint64_t val,
             addr < R100_MBX_ISSR0 + R100_MBX_ISSR_COUNT * 4) {
             uint32_t idx = (addr - R100_MBX_ISSR0) >> 2;
             s->issr[idx] = v;
-            /* MMIO-path writes (FW CPU / PCIE_CM7 stores) are the
-             * NPU→host egress trigger: every such write emits an
-             * (bar4_off, val) frame on issr_chr if the chardev is
-             * connected. Writes driven by r100_mailbox_set_issr()
-             * (host→NPU ingress) bypass this function entirely, so
-             * there is no echo risk. */
+            /* MMIO path = NPU→host egress. Host→NPU bypasses this
+             * via r100_mailbox_set_issr, so no echo. */
             r100_mailbox_issr_emit(s, idx, v);
             return;
         }
@@ -357,11 +294,7 @@ static void r100_mailbox_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq[0]);
     sysbus_init_irq(sbd, &s->irq[1]);
-
-    /* ISSR egress is write-only: we never consume bytes from the
-     * chardev, only emit. Installing no receive handler is OK —
-     * qemu_chr_fe_write() is driven by our MMIO path. The chardev
-     * is optional (single-QEMU runs leave it disconnected). */
+    /* ISSR chardev is write-only egress; no receive handler. Optional. */
 }
 
 static void r100_mailbox_unrealize(DeviceState *dev)
@@ -382,8 +315,7 @@ static void r100_mailbox_reset(DeviceState *dev)
     s->mif_init = 0;
     s->is_version = 0;
     memset(s->issr, 0, sizeof(s->issr));
-    /* intgr_writes is observability only; keep it across reset so
-     * tests can inspect cumulative activity. */
+    /* intgr_writes / issr counters kept across reset for test inspection. */
     r100_mailbox_update_irq(s, 0);
     r100_mailbox_update_irq(s, 1);
 }
@@ -425,7 +357,7 @@ static void r100_mailbox_class_init(ObjectClass *klass, void *data)
     device_class_set_legacy_reset(dc, r100_mailbox_reset);
     device_class_set_props(dc, r100_mailbox_properties);
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
-    /* Instantiation is the machine's job — SPI wiring is topology. */
+    /* Machine-instantiated (SPI wiring is topology). */
     dc->user_creatable = false;
 }
 

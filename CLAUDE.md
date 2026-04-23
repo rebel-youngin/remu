@@ -2,7 +2,9 @@
 
 ## Project
 
-REMU — R100 NPU System Emulator. QEMU-based functional emulator for the R100 (CR03 quad, 4-chiplet) NPU SoC. Runs unmodified firmware (q-sys, q-cp) and drivers (kmd, umd) on emulated hardware.
+REMU — R100 NPU System Emulator. QEMU-based functional emulator for the
+R100 (CR03 quad, 4-chiplet) NPU SoC. Runs unmodified firmware (q-sys,
+q-cp) and drivers (kmd, umd) on emulated hardware.
 
 ## Documentation
 
@@ -12,243 +14,203 @@ REMU — R100 NPU System Emulator. QEMU-based functional emulator for the R100 (
 
 ## Build
 
-All commands go through `./remucli` at the repo root — a thin bash
-wrapper around `cli/remu_cli.py`. **No install step** — just make sure
-`click` is available (`pip install --user click`).
+All commands go through `./remucli` at the repo root (bash wrapper
+around `cli/remu_cli.py`). Only runtime dep: `pip install --user click`.
 
 ```
-./remucli build                     # builds QEMU (aarch64 + x86_64) with R100 device models
-./remucli fw-build                  # builds q-sys FW (tf-a + cp0 + cp1) → images/ (silicon, implicit)
-./remucli status                    # sanity-check environment
-./remucli run --name my-test        # Phase 1: boot NPU only; logs land in output/my-test/ (auto-cleans first)
-./remucli run --name dbg --gdb      # Phase 1: boot paused, wait for GDB on :1234
-./remucli run --host --name pair    # Phase 2: launch NPU + x86 host QEMUs with r100-npu-pci bridge
-./remucli test                      # run M5+M6+M7+M8 bridge tests (or `./remucli test m5 m7` for a subset)
-./remucli clean --name pair         # wipe orphan procs / shm / sockets left by a SIGKILL'd prior run
-./remucli clean --all               # nuke every /dev/shm/remu-* dir + associated QEMU processes
+./remucli build                     # QEMU (aarch64 + x86_64) with R100 device models
+./remucli fw-build                  # q-sys FW (tf-a + cp{0,1}) → images/ (silicon only)
+./remucli status                    # environment sanity-check
+./remucli run --name my-test        # Phase 1: NPU only → output/my-test/
+./remucli run --name dbg --gdb      # Phase 1: paused, GDB on :1234
+./remucli run --host --name pair    # Phase 2: NPU + x86 host QEMUs + r100-npu-pci bridge
+./remucli test                      # M5/M6/M7/M8 bridge tests (`test m5 m7` for subset)
+./remucli clean --name pair         # wipe orphan procs/shm/sockets from a SIGKILL'd run
+./remucli clean --all               # nuke every REMU-shaped process + /dev/shm/remu-*
 ./guest/build-guest-image.sh        # M8b Stage 2: stage images/x86_guest/{bzImage,initramfs.cpio.gz}
-./guest/build-kmd.sh                # M8b Stage 2: rebuild rebellions.ko + rblnfs.ko against host kernel
+./guest/build-kmd.sh                # M8b Stage 2: rebuild rebellions.ko + rblnfs.ko
 ```
 
-`./remucli fw-build` defaults to `silicon` — the only FW profile REMU
-exercises end-to-end. The `zebu` / `zebu_ci` / `zebu_vdk` profiles are
-still accepted by `-p <name>` but emit a deprecation warning and are
-not part of any regression loop.
+`silicon` is the only FW profile exercised end-to-end. `zebu*` builds
+but emits a deprecation warning and is not in regression.
 
-`./remucli run` auto-invokes `./remucli clean --name <name>` at the
-very start of every invocation, so a SIGKILL-killed prior run with the
-same name (orphan QEMU processes still mmap'd over
-`/dev/shm/remu-<name>/`, stale `*.sock` files that would
-`EADDRINUSE`-block a fresh bind) gets wiped before anything new is
-launched. Concurrent runs with a *different* `--name` value are left
-strictly alone — the sweep only matches cmdlines referencing the
-current run's paths. `./remucli test` runs each M5..M8 end-to-end test
-with the same pre-cleanup and prints a concise PASS/FAIL summary (full
-per-test stdout spools to `output/test-<id>.log`).
+`./remucli run` auto-runs `clean --name <name>` first, so SIGKILL'd
+prior runs don't leave stale shm / sockets / QEMU mmaps. Concurrent
+runs with different `--name` are untouched. `./remucli test` wraps the
+same cleanup per-test.
 
-`./remucli build` produces two QEMU binaries from one pinned source
-tree: `build/qemu/qemu-system-aarch64` (NPU side, Phase 1 FW boot) and
-`build/qemu/qemu-system-x86_64` (host side, Phase 2 kmd/umd guest). On
-an existing aarch64-only build tree the configure step is re-run
-automatically to pick up the x86_64 target — no `--clean` needed.
+`./remucli build` produces `build/qemu/qemu-system-{aarch64,x86_64}`
+from one pinned source tree. Adding x86_64 on top of an aarch64-only
+build tree re-runs configure automatically (no `--clean` needed).
 
-With `--host`, the x86 guest has our custom `r100-npu-pci` endpoint
-attached (vendor/device `0x1eff:0x2030` matching the real CR03 silicon,
-so the stock `rebellions.ko` binds with no changes). Its four BARs
-match the driver's size checks in `rebel_check_pci_bars_size`:
+### `--host` mode (Phase 2)
 
-| BAR | Size | Role |
-|-----|------|------|
-| 0   | 64 GB (>= 36 GB `RBLN_DRAM_SIZE`) | DDR — first 128 MB = `/dev/shm` shared file, tail = lazy RAM |
-| 2   | 64 MB (= `RBLN_SRAM_SIZE`)        | ACP / SRAM / logbuf (lazy RAM) |
-| 4   | 8 MB  (= `RBLN_PERI_SIZE`)        | Doorbells — 4 KB MMIO head intercepts `MAILBOX_INTGR{0,1}` writes (M6) and `MAILBOX_BASE` payload writes (M8a, host → NPU ISSR) and forwards them to the NPU as 8-byte chardev frames on the same `doorbell` socket; the `MAILBOX_BASE` range also acts as a read-through shadow of the NPU's ISSR state, fed by frames arriving on the `issr` chardev (M8a, NPU → host ISSR); on the NPU side, `INTGR0` bit 0 (`SOFT_RESET`) triggers the QEMU-side CM7-stub shortcut (M8b Stage 3a), which synthesises `FW_BOOT_DONE` back into PF.ISSR[4] without involving the unmodelled PCIE_CM7 subcontroller; rest is lazy RAM |
-| 5   | 1 MB  (= `RBLN_PCIE_SIZE`)        | MSI-X table (32 vectors) + PBA — `msix_notify()` target for frames coming back from the NPU `r100-imsix` device (M7) |
+The x86 guest sees our `r100-npu-pci` endpoint (vendor/device
+`0x1eff:0x2030`, matching real CR03 silicon — stock `rebellions.ko`
+binds with no changes). BAR sizes match `rebel_check_pci_bars_size`:
 
-Both QEMUs open the same 128 MB memory-backed file at
-`/dev/shm/remu-<name>/remu-shm` with `share=on`. The **same** backend is
-spliced into **two** places — one per QEMU process — via containers
-that layer the shared file at offset 0 and lazy RAM over the tail:
+| BAR | Size  | Role |
+|-----|-------|------|
+| 0   | 64 GB | DDR — first 128 MB = shm file, tail = lazy RAM |
+| 2   | 64 MB | ACP / SRAM / logbuf (lazy RAM) |
+| 4   | 8 MB  | 4 KB MMIO head (INTGR M6 + MAILBOX_BASE M8a bidir + CM7-stub Stage 3a); rest lazy RAM |
+| 5   | 1 MB  | MSI-X table (32 vectors) + PBA (`msix_notify()` target for M7) |
 
-- **x86 host QEMU** (M4) — aliased through the `r100-npu-pci` device's
-  `memdev` link over **BAR0 offset 0**, so stores into
-  BAR0[0..128MB) land in tmpfs pages.
-- **NPU QEMU** (M5) — aliased through the `r100-soc` machine's
-  `memdev` string property (resolved at machine-init time because
-  `-object memory-backend-*` is processed after `-machine` options)
-  over **chiplet 0 DRAM offset 0**, so CA73 loads/stores into
-  chiplet-0 physical 0x0..0x07FFFFFF hit the same file. The tail
-  (0x08000000..0x40000000) stays plain lazy RAM, so BL31_CP1 / FreeRTOS_CP1
-  loaded at 0x14100000 / 0x14200000 remain private to the NPU.
+BAR4 details: `MAILBOX_INTGR{0,1}` / `MAILBOX_BASE` writes are
+serialised as 8-byte chardev frames on the `doorbell` socket; reads in
+`MAILBOX_BASE` range return the live shadow fed by `issr` chardev
+frames (NPU → host). `INTGR0` bit 0 (`SOFT_RESET`) triggers the
+QEMU-side CM7-stub that synthesises `FW_BOOT_DONE` into PF.ISSR[4] —
+see commit `a01d2b5` for the full shortcut design.
 
-The NPU QEMU's HMP monitor is exposed on a second unix socket at
-`output/<name>/npu/monitor.sock` (on top of the existing stdio-muxed
-readline monitor on uart0). SeaBIOS is allowed to run so the x86 BAR
-addresses get programmed; by default the guest then idles at "No
-bootable device" with serial redirected to `host/serial.log`. The
-host-side HMP monitor lives at `output/<name>/host/monitor.sock` (use
-`socat - UNIX-CONNECT:...` for interactive HMP).
+Both QEMUs `mmap` the same 128 MB `/dev/shm/remu-<name>/remu-shm` with
+`share=on`. Splice points (same backend, two places):
 
-**M8b Stage 2 (x86 Linux guest):** when the artifacts
-`images/x86_guest/bzImage` and `images/x86_guest/initramfs.cpio.gz`
-exist (staged by `./guest/build-guest-image.sh`), the same
-`--host` invocation auto-adds `-kernel / -initrd` + a virtio-9p
-`-fsdev local,path=guest/,mount_tag=remu` share and flips the x86
-CPU to `-cpu max`. The guest then boots a real Ubuntu HWE kernel
-with a busybox initramfs that mounts `guest/` at `/mnt/remu` and
-runs `setup.sh` (which insmod's `rebellions.ko` and waits for the
-kmd to print `FW_BOOT_DONE` in dmesg). Overrides:
-`--guest-kernel`, `--guest-initrd`, `--guest-share`,
-`--no-guest-boot`, `--guest-cmdline-extra`. `-cpu max` is required
-because the stock kmd is built with `-march=native` and emits BMI2
-instructions that trap `#UD` on the minimal `qemu64` CPU.
+- **x86 host** (M4) — `r100-npu-pci` `memdev` link over BAR0 offset 0.
+- **NPU** (M5) — `r100-soc` machine's `memdev` string property (resolved
+  at machine-init time, after `-object memory-backend-*`) over chiplet-0
+  DRAM offset 0. Tail `0x08000000..0x40000000` stays private lazy RAM
+  so BL31_CP1 / FreeRTOS_CP1 loaded at `0x14100000` / `0x14200000` don't
+  leak to host.
 
-`./remucli run --host` auto-verifies every bridge end-to-end:
-  - **M4**: `info pci` on host must list `1eff:2030` (logged to
-    `host/info-pci.log`);
-  - **M4**: `info mtree` on host must place the `remushm` subregion at
-    offset 0 of `r100.bar0.ddr` (logged to `host/info-mtree.log`);
-  - **M5**: `info mtree` on the NPU must place the same `remushm`
-    subregion at offset 0 of `r100.chiplet0.dram` (logged to
-    `npu/info-mtree.log`);
-  - **M4/M5**: both QEMU PIDs must have the shm file in
-    `/proc/<pid>/maps`;
-  - **M6**: `info mtree` on host must show the `r100.bar4.mmio`
-    priority-10 overlay, and `info qtree` on the NPU must list both
-    `r100-doorbell` and `r100-mailbox` (logged to
-    `host/info-mtree-bar4.log` + `npu/info-qtree.log`);
-  - **M7**: `info mtree` on the NPU must list the `r100-imsix`
-    MemoryRegion at `0x1BFFFFF000`, and `info mtree` on host must show
-    `msix-table` + `msix-pba` overlaying `r100.bar5.msix` (logged to
-    `npu/info-mtree-imsix.log` + `host/info-mtree-bar5.log`);
-  - **M8a**: `info qtree` on the NPU must show the chiplet-0
-    `r100-mailbox` with `issr-chardev = "issr"`, and `info qtree` on
-    host must show `r100-npu-pci` with `issr = "issr"` (logged to
-    `npu/info-qtree-issr.log` + `host/info-qtree-issr.log`).
+HMP monitors: NPU on `output/<name>/npu/monitor.sock` (plus the
+stdio-muxed readline monitor on uart0), host on
+`output/<name>/host/monitor.sock`. By default SeaBIOS runs and the x86
+guest idles at "No bootable device", serial to `host/serial.log`.
 
-Any check failing prints to the terminal — the NPU still boots for
-post-mortem poking. End-to-end sanity scripts, one per milestone
-bridge, driven together by `./remucli test` (pass `m5 m6 m7 m8` for a
-subset; `--stop-on-fail` aborts on first failure; pre-run cleanup is
-implicit per test so a SIGKILL'd prior attempt never poisons the next):
-  - `tests/m5_dataflow_test.py` writes a magic pattern to
-    `/dev/shm/.../remu-shm` at offset 0x07F00000 and asserts `xp /4wx`
-    on both monitors returns the same bytes.
-  - `tests/m6_doorbell_test.py` drives 8-byte `(offset, value)`
-    frames on `host/doorbell.sock` and checks `doorbell.log` plus
-    `GUEST_ERROR` entries for rejected frames.
-  - `tests/m7_msix_test.py` does the reverse: connects as an NPU-
-    impersonating client to `host/msix.sock` (test IS the NPU in this
-    scenario), emits 5 frames (3 `ok` + 1 `oor` + 1 `bad-offset`),
-    and checks `msix.log` plus `GUEST_ERROR` entries.
-  - `tests/m8_issr_test.py` runs two phases against two minimal QEMUs:
-    phase 1 acts as the NPU writing ISSRs (server on `issr.sock`) and
-    verifies the host's BAR4 shadow mirrors them via `xp` over HMP;
-    phase 2 acts as the host writing BAR4 (server on `doorbell.sock`)
-    and verifies the NPU's mailbox ISSR registers update without any
-    spurious GIC SPI assertion.
+**M8b Stage 2 (x86 Linux guest):** with
+`images/x86_guest/{bzImage,initramfs.cpio.gz}` staged (via
+`./guest/build-guest-image.sh`), `--host` auto-adds `-kernel/-initrd`
++ virtio-9p share of `guest/` at `/mnt/remu` + `-cpu max` (stock kmd is
+`-march=native` with BMI2 → `#UD` on minimal `qemu64`). The guest
+boots Ubuntu HWE + busybox initramfs, runs `setup.sh` (insmods
+`rebellions.ko` and watches for `FW_BOOT_DONE`). Overrides:
+`--guest-kernel`, `--guest-initrd`, `--guest-share`, `--no-guest-boot`,
+`--guest-cmdline-extra`. See commits `1ef7208` / `985fd58` for
+artifact pipeline and GIC-bpr QEMU patch detail.
+
+### Auto-verification on startup
+
+Every `--host` run captures and checks:
+
+- **M4/M5**: shm file in both `/proc/<pid>/maps`; `remushm` subregion
+  at offset 0 of both `r100.bar0.ddr` (host) and `r100.chiplet0.dram`
+  (NPU); host `info pci` lists `1eff:2030`.
+- **M6**: host shows `r100.bar4.mmio` prio-10 overlay; NPU `info qtree`
+  lists `r100-doorbell` + `r100-mailbox`.
+- **M7**: NPU lists `r100-imsix` @ `0x1BFFFFF000`; host shows
+  `msix-{table,pba}` overlaying `r100.bar5.msix`.
+- **M8a**: NPU `r100-mailbox` has `issr-chardev = "issr"`; host
+  `r100-npu-pci` has `issr = "issr"`.
+
+All results go to `host/info-*.log` + `npu/info-*.log`. Failures print
+to stdout (non-fatal — NPU still boots for post-mortem poking).
+
+### End-to-end bridge tests
+
+Driven by `./remucli test` (or individually). Each has pre-run
+cleanup so SIGKILL'd prior state never poisons the next:
+
+- `tests/m5_dataflow_test.py` — write magic to shm @ `0x07F00000`,
+  `xp /4wx` on both monitors must agree.
+- `tests/m6_doorbell_test.py` — drive 8-byte frames on
+  `host/doorbell.sock`, check `doorbell.log` + `GUEST_ERROR`.
+- `tests/m7_msix_test.py` — reverse: test impersonates NPU on
+  `host/msix.sock`, emits 5 frames (3 ok + 1 oor + 1 bad-offset),
+  checks `msix.log` + `GUEST_ERROR`.
+- `tests/m8_issr_test.py` — two phases against two minimal QEMUs: NPU
+  writes ISSR → host BAR4 shadow mirror via `xp`; host writes BAR4 →
+  NPU mailbox ISSR update without spurious GIC SPI.
 
 All `./remucli run` invocations write into `output/<name>/` (or
-`output/run-<timestamp>/` if `--name` is omitted). Never pass paths
-under `/tmp/` — stick with the per-run output directory so multiple
-runs don't clobber each other. See `docs/debugging.md` for the full
-agent loop, log interpretation, and GDB workflow.
+`output/run-<timestamp>/` if `--name` omitted). Never pass `/tmp/`
+paths — stick to per-run directory. See `docs/debugging.md` for the
+full agent loop.
 
-Shell tab-completion (optional, but handy):
+### Shell completion (optional)
 
 ```
 eval "$(./remucli completion bash)"   # or: completion zsh / completion fish
 ```
 
-For persistent completion, add the eval to `~/.bashrc` with the
-absolute path to `remucli`, and either put the repo root on PATH or
-`alias remucli=/abs/path/to/remucli` so bare `remucli` tab-completes too.
+Persistent: add to `~/.bashrc` with an absolute path; alias or `PATH`
+so bare `remucli` tab-completes.
 
-Manual ninja rebuild (skips the CLI's symlink / meson patch / `cli/qemu-patches/*.patch`
-apply step — use only when `external/qemu` is already set up by a prior
-`./remucli build`):
+### Manual ninja rebuild
+
+Skips the CLI's symlink / meson-patch / `cli/qemu-patches/*.patch`
+apply step — use only when `external/qemu` is already set up by a
+prior `./remucli build`:
+
 ```
 cd build/qemu && ninja -j$(nproc)
 ```
 
-`./remucli fw-build` wraps `external/ssw-bundle/.../q/sys/build.sh`. Components
-are repeatable (`-c tf-a -c cp0 -c cp1`, default covers the CA73 boot set);
-platform defaults to `silicon` (the only supported profile — explicit
-`-p zebu` / `-p zebu_ci` / `-p zebu_vdk` still build via `build.sh` but
-emit a deprecation warning and are not part of any REMU regression);
-`--install` (default on) copies the 6 CA73 binaries into `images/`.
-Toolchains are taken from `COMPILER_PATH_ARM64` / `COMPILER_PATH_ARM32`
-env vars, with defaults under `/mnt/data/tools/...`.
+### `fw-build` internals
 
-Before invoking `build.sh`, `fw-build` idempotently applies every
-`cli/fw-patches/*.patch` to the q-sys submodule — same
-forward/reverse check dance as `cli/qemu-patches/`. **Project policy:
-`cli/fw-patches/` is kept empty.** The q-sys submodule stays
-byte-identical to upstream; any unmodelled hardware block that would
-hang or `-EBUSY` the boot is modelled on the QEMU side (a `src/machine/`
-or `src/host/` stub, however minimal), never skipped with an `#ifdef`
-in firmware. The plumbing stays in place so a developer can drop a
-**local, uncommitted** debug patch into the directory while bisecting
-a wedge and have `./remucli fw-build` pick it up — see
-`cli/fw-patches/README.md`.
+Wraps `external/ssw-bundle/.../q/sys/build.sh`. Components repeatable
+(`-c tf-a -c cp0 -c cp1`, default = CA73 boot set); `--install` (on by
+default) copies 6 CA73 binaries into `images/`. Toolchains from
+`COMPILER_PATH_{ARM64,ARM32}` env vars (defaults under
+`/mnt/data/tools/...`).
 
-The runtime-side example of this policy is the CM7-stub in
-`src/machine/r100_doorbell.c` (M8b Stage 3a), which synthesises the
-terminal side-effect of the unmodelled PCIE_CM7 `SOFT_RESET` handler
-entirely in QEMU — see the BAR4 row above and `docs/debugging.md` for
-the handshake recipe.
+Before `build.sh`, `fw-build` idempotently applies every
+`cli/fw-patches/*.patch` (forward/reverse-check dance, same as
+`cli/qemu-patches/`). **Policy: `cli/fw-patches/` is empty.** The q-sys
+submodule stays byte-identical to upstream; any unmodelled hardware
+that would hang or `-EBUSY` boot gets a `src/machine/` or `src/host/`
+QEMU stub (however minimal), never an `#ifdef` in firmware. The
+plumbing stays so developers can drop a **local, uncommitted** debug
+patch while bisecting — see `cli/fw-patches/README.md`. Runtime-side
+example of this policy: the CM7-stub in `src/machine/r100_doorbell.c`
+(commit `a01d2b5`) — see BAR4 row above.
 
 ## Project layout
 
 ```
-remucli               Bash wrapper — the one entry point (`./remucli <cmd>`)
+remucli               Bash wrapper — the one entry point
 src/machine/          NPU-side QEMU device models (symlinked into external/qemu/hw/arm/r100/)
 src/host/             Host-side (x86 guest) PCI device models (symlinked into external/qemu/hw/misc/r100-host/)
 src/include/          Shared headers (remu_addrmap.h)
-cli/remu_cli.py       Click-based CLI implementation (invoked by ./remucli)
+cli/remu_cli.py       Click-based CLI implementation
 tests/                Test binaries and test scripts
-docs/                 Architecture, roadmap, debugging docs
+docs/                 Architecture, roadmap, debugging
 external/             Read-only: ssw-bundle (q-sys, q-cp, kmd, umd, ...), qemu
-guest/                M8b Stage 2: virtio-9p share mounted by the x86 Linux guest
-                      (build-guest-image.sh, build-kmd.sh, setup.sh; rebellions.ko + rblnfs.ko are gitignored)
+guest/                M8b Stage 2 virtio-9p share (rebellions.ko / rblnfs.ko gitignored)
 images/               FW binaries (bl1.bin, bl31_cp0.bin, freertos_cp0.bin, ...)
-images/x86_guest/     M8b Stage 2: staged x86 guest kernel + initramfs (gitignored)
+images/x86_guest/     M8b Stage 2 staged x86 guest kernel + initramfs (gitignored)
 build/qemu/           QEMU build output (gitignored)
 output/               Per-run log directories (gitignored; see docs/debugging.md)
 ```
 
 ## Code style
 
-- Device models follow QEMU coding conventions: 4-space indent, snake_case, QOM type system
-- Use `device_class_set_legacy_reset()` (not `dc->reset`) for QEMU 9.2.0+
-- Use `qdev_prop_set_array()` with `QList` for array properties (e.g., GIC `redist-region-count`)
-- Machine type names must end with `-machine` suffix (QEMU assertion requirement)
-- All remu source uses `r100_` prefix; external repos keep their own naming (`rebel_h_*` in q-sys)
+- QEMU conventions: 4-space indent, snake_case, QOM type system
+- `device_class_set_legacy_reset()` (not `dc->reset`) for QEMU 9.2.0+
+- `qdev_prop_set_array()` + `QList` for array properties (e.g. GIC `redist-region-count`)
+- Machine type names must end with `-machine` (QEMU assertion)
+- All remu source uses `r100_` prefix; external repos keep their own naming
 
 ## Hardware context
 
 - **Target**: CR03 quad (`PCI_ID 0x2030`, `ASIC_REBEL_QUAD`, 4 chiplets)
-- **CPU**: 8x CA73 per chiplet (2 clusters x 4 cores) = 32 total
+- **CPU**: 8× CA73 per chiplet (2 clusters × 4 cores) = 32 total
 - **CHIPLET_OFFSET**: `0x2000000000` between chiplets
 - **Boot**: TF-A BL1 → BL2 → BL31 → FreeRTOS (q-sys), then q-cp tasks
-- **FW build**: `./remucli fw-build` — `silicon` is the implicit default and the only supported profile. `-p zebu` / `zebu_ci` / `zebu_vdk` are deprecated (still accepted, prints a warning) — see `docs/roadmap.md` Phase 1 Status
-- **UART**: PL011 at `0x1FF9040000` (PERI0_UART0), 250MHz clock
-- **GIC**: GICv3 distributor at `0x1FF3800000`, redistributor at `0x1FF3840000`
-- **Timer**: 500MHz generic timer (`CORE_TIMER_FREQ`)
+- **UART**: PL011 @ `0x1FF9040000` (PERI0_UART0), 250 MHz
+- **GIC**: GICv3 dist @ `0x1FF3800000`, redist @ `0x1FF3840000`
+- **Timer**: 500 MHz (`CORE_TIMER_FREQ`)
 
 ## Key external files
 
-All FW/driver sources live inside `external/ssw-bundle` (initialized via
-`git submodule update --init --recursive`). Shorthand: `$BUNDLE` below is
-`external/ssw-bundle/products`.
-
-When modifying device models, cross-reference these FW/driver sources:
+Cross-references for FW/driver sources — `$BUNDLE` = `external/ssw-bundle/products`:
 
 | What to check | File |
-|----------------|------|
+|---|---|
 | SoC address map | `$BUNDLE/rebel/q/sys/.../autogen/g_sys_addrmap.h` |
 | Platform defs | `$BUNDLE/rebel/q/sys/bootloader/cp/tf-a/plat/rebel/rebel_h/include/platform_def.h` |
-| CMU polling patterns | `$BUNDLE/rebel/q/sys/bootloader/cp/tf-a/drivers/clk/clk_samsung/cmu.c` |
+| CMU polling | `$BUNDLE/rebel/q/sys/bootloader/cp/tf-a/drivers/clk/clk_samsung/cmu.c` |
 | PMU registers | `$BUNDLE/rebel/q/sys/bootloader/cp/tf-a/plat/rebel/rebel_h/rebel_h_pmu.c` |
-| QSPI bridge protocol | `$BUNDLE/rebel/q/sys/bootloader/cp/tf-a/drivers/synopsys/qspi_bridge/qspi_bridge.c` |
+| QSPI bridge | `$BUNDLE/rebel/q/sys/bootloader/cp/tf-a/drivers/synopsys/qspi_bridge/qspi_bridge.c` |
 | PCI BAR layout | `$BUNDLE/common/kmd/rebellions/rebel/rebel.h` |
 | FW-host handshake | `$BUNDLE/common/kmd/rebellions/common/{fw_if.c,ring.c,queue.c}` |

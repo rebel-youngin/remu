@@ -2,253 +2,238 @@
 
 ## Overview
 
-REMU is a QEMU-based system emulator for the R100 (CR03 quad) NPU. It functionally emulates the NPU hardware so that existing firmware (q-sys, q-cp) and drivers (kmd, umd) run unmodified. The primary audience is FW developers who need fast local iteration without hardware access.
+REMU is a QEMU-based system emulator for the R100 (CR03 quad) NPU. It
+functionally emulates the NPU hardware so the existing firmware (q-sys,
+q-cp) and drivers (kmd, umd) run unmodified. Primary audience: FW
+developers who need fast local iteration without hardware.
 
-This is **not** a cycle-accurate simulator. Timing is not modeled — PLLs lock instantly, DMA completes in zero time, and there is no pipeline or cache simulation. The goal is functional correctness: the FW sees the right register values, memory maps, and interrupt behavior to boot and run.
+**Not cycle-accurate.** PLLs lock instantly, DMA completes in zero time,
+no pipeline/cache simulation. Goal: functional correctness — FW sees
+the right register values, memory maps, and interrupt behaviour to boot
+and run.
 
 ## R100 SoC Hardware Overview
 
-The R100 is a multi-chiplet NPU with:
+Multi-chiplet NPU:
 
-- **4 chiplets**, each at a `0x2000000000` address offset from the previous
-- **8 ARM CA73 cores per chiplet**: 2 clusters (CP0, CP1) x 4 cores = 32 cores total
-- **Per-chiplet peripherals**: CMU (clocks), PMU (power), HBM3 (memory), DNC (compute), HDMA (DMA)
-- **Inter-chiplet links**: UCIe via 6 RBC blocks, QSPI bridge for register access
-- **Host interface**: PCIe endpoint with BAR-mapped DRAM, config, and doorbell regions; MSI-X for FW-to-host interrupts
-
-Real hardware:
+- 4 chiplets, each at `0x2000000000` offset from the previous
+- 8 ARM CA73 cores per chiplet (CP0 + CP1, 4 cores each) = 32 total
+- Per-chiplet peripherals: CMU, PMU, HBM3, DNC, HDMA
+- Inter-chiplet: UCIe via 6 RBC blocks, QSPI bridge for register access
+- Host: PCIe endpoint (BAR-mapped DRAM / config / doorbell), MSI-X for
+  FW→host interrupts
 
 ```
-  Host (x86/ARM server)
-    │ PCIe
-    ▼
-  ┌─ R100 NPU Card ─────────────────────────────┐
-  │  Chiplet 0 (primary)    Chiplet 1            │
-  │  ┌──────────────────┐  ┌──────────────────┐  │
-  │  │ CP0 (4x CA73)    │  │ CP0 (4x CA73)    │  │
-  │  │ CP1 (4x CA73)    │  │ CP1 (4x CA73)    │  │
-  │  │ 16x DNC cores    │  │ 16x DNC cores    │  │
-  │  │ HDMA, HBM3       │  │ HDMA, HBM3       │  │
-  │  └───────┬──────────┘  └──────────┬───────┘  │
-  │          │ UCIe (RBC)             │           │
-  │  ┌───────┴──────────┐  ┌──────────┴───────┐  │
-  │  │ Chiplet 2        │  │ Chiplet 3        │  │
-  │  │ (same as above)  │  │ (same as above)  │  │
-  │  └──────────────────┘  └──────────────────┘  │
-  └──────────────────────────────────────────────┘
+Host (x86/ARM server) ── PCIe ──▶ R100 NPU card (4 chiplets × [8 CA73,
+                                   16 DNC, HDMA, HBM3], linked via UCIe)
 ```
 
 ## Emulator Architecture
 
-### Dual-QEMU Model
+### Dual-QEMU Model (Phase 2)
 
-REMU uses two QEMU instances connected by shared memory (Phase 2;
-tracked per-milestone in `docs/roadmap.md`). Both binaries build from
-the single pinned QEMU tree (`./remucli build` → `qemu-system-aarch64`
-+ `qemu-system-x86_64`); `./remucli run --host` wires them up:
+Two QEMU instances connected by shared memory. `./remucli build`
+produces both `qemu-system-{aarch64,x86_64}` from one pinned source
+tree; `./remucli run --host` wires them up.
 
 ```
-┌─ Host QEMU (x86_64 + KVM) ─────────────────────┐
-│  umd (userspace, unmodified)                     │
-│  kmd (kernel module, compiled for x86_64)        │
-│    └─ virtual PCI device: 0x1eff:0x2030 (CR03)  │
-│       BAR0=DRAM  BAR2=config  BAR4=doorbell      │
-├──────────────────────────────────────────────────┤
-│  r100-npu-pci (QEMU device model)                │
-│    └─ BAR0 backed by /dev/shm/remu-* (M4) ✓      │
-│    └─ BAR2/5 lazy RAM + MSI-X table (M3) ✓       │
-│    └─ BAR4 MMIO head:                            │
-│        · INTGR writes → doorbell frame (M6) ✓   │
-│        · MAILBOX_BASE writes → doorbell         │
-│          frame (ISSR payload, M8a) ✓             │
-│        · MAILBOX_BASE reads ← issr-chardev       │
-│          shadow (M8a) ✓                          │
-│    └─ msix chardev → msix_notify() (M7) ✓        │
-│    └─ issr chardev → BAR4 shadow (M8a) ✓         │
+┌─ Host QEMU (x86_64 + KVM) ──────────────────────┐
+│  umd + kmd (unmodified) → PCI 1eff:2030          │
+│    BAR0=DRAM  BAR2=ACP  BAR4=doorbell  BAR5=MSI-X│
+│  r100-npu-pci device                              │
+│    BAR0 memdev splice (M4)                        │
+│    BAR4 4 KB MMIO head: INTGR + MAILBOX_BASE (M6+M8a)│
+│    BAR5 msix_init table + lazy RAM (M3)           │
+│  chardevs: doorbell (out) / msix (in) / issr (in) │
 └────────┬─────────┬─────────┬──────────┬──────────┘
          │ shm     │ doorbell│ msix     │ issr
-         │         │ chardev │ chardev  │ chardev
 ┌────────┴─────────┴─────────┴──────────┴──────────┐
-│  FW QEMU (aarch64, bare-metal)                   │
-│  32x CA73 vCPUs (cortex-a72 w/ MIDR=A73 r1p1)    │
-│  TF-A BL1 → BL2 → BL31 → FreeRTOS              │
-│  ┌────────────────────────────────────────────┐  │
-│  │ Device Models                              │  │
-│  │  CMU (20 blocks) — PLL lock stubs          │  │
-│  │  PMU — boot + arm_set_cpu_on on RVBAR      │  │
-│  │  SYSREG — chiplet ID (per-chiplet view)    │  │
-│  │  HBM3 — sparse regs, training-ready        │  │
-│  │  QSPI bridge — cross-chiplet register I/O  │  │
-│  │  QSPI_ROT (DWC_SSI) — flash boot + NOR SMC │  │
-│  │  RBC — UCIe link-up status                 │  │
-│  │  SMMU-600 TCU — CR0ACK / GBPA / CMDQ+SYNC  │  │
-│  │  PVT — idle/valid-bit stub (pvt_init)      │  │
-│  │  HILS ring tail — drains FreeRTOS .logbuf  │  │
-│  │  Mailbox RAM — inter-chiplet handshake     │  │
-│  │  r100-doorbell — chardev ingress           │  │
-│  │     INTGR offsets → raise_intgr() (M6) ✓   │  │
-│  │     MAILBOX_BASE offsets →                 │  │
-│  │       mailbox_set_issr() (M8a) ✓           │  │
-│  │  r100-mailbox — Samsung ipm SFR (M6) ✓     │  │
-│  │     @ R100_PCIE_MAILBOX_BASE               │  │
-│  │     INTMSR0 → GIC SPI 184 (chiplet 0)      │  │
-│  │     INTMSR1 → GIC SPI 185 (chiplet 0)      │  │
-│  │     ISSR writes → issr chardev (M8a) ✓     │  │
-│  │  r100-imsix — PCIe MSI-X address-match     │  │
-│  │    trap @ R100_PCIE_IMSIX_BASE (M7) ✓      │  │
-│  │    └─ 4-byte write @ off 0xFFC emits       │  │
-│  │       (offset, db_data) frame to host      │  │
-│  │  GIC600 per chiplet (8 CPUs each),         │  │
-│  │    CPU gtimer-outs wired to GIC PPIs       │  │
-│  │    (CNTVIRQ = PPI 27 → FreeRTOS tick)      │  │
-│  │  per-chiplet 16550 UART                    │  │
-│  └────────────────────────────────────────────┘  │
+│  NPU QEMU (aarch64, bare-metal)                  │
+│  32 × CA73 (cortex-a72 w/ MIDR=A73 r1p1)         │
+│  TF-A BL1 → BL2 → BL31 → FreeRTOS                │
+│  Chiplet-0 peripherals wired to chardev bridges: │
+│    r100-doorbell (in)  — INTGR / ISSR ingress    │
+│    r100-mailbox VF0    — SPI 184/185, INTGR      │
+│    r100-mailbox PF     — bootdone, issr egress   │
+│    r100-imsix (out)    — MSI-X egress            │
+│  Per-chiplet: CMU, PMU, HBM3, QSPI, RBC, SMMU,   │
+│   PVT, DNC cfg, SYSREG CP{0,1} triple-mount,     │
+│   arm-gicv3 (num-cpu=8, first-cpu-index=N*8),    │
+│   16550 UART (SPI 33), HILS ring tail (logbuf)   │
+│  CPU gtimer→GIC PPI (CNTVIRQ = PPI 27 → tick)    │
 └──────────────────────────────────────────────────┘
 ```
 
-**Why two instances?** The FW runs bare-metal AArch64 at EL3/EL1 with a 40-bit physical address space starting at `0x1E00000000`. The host kmd runs inside a Linux kernel. These are fundamentally incompatible execution environments. A single QEMU with heterogeneous clusters (like Xilinx ZynqMP) would be far more complex to build and maintain.
+**Why two instances?** FW runs bare-metal AArch64 at EL3/EL1 with a
+40-bit PA space at `0x1E00000000`; kmd runs inside a Linux kernel.
+Fundamentally incompatible — heterogeneous single-QEMU (à la Xilinx
+ZynqMP) would be far more complex to build and maintain.
 
-**Why a QEMU fork?** The machine type needs a custom memory map, custom device models, and custom boot loading. QEMU does not support out-of-tree device compilation, so the device models are symlinked into the QEMU source tree and compiled in-tree.
+**Why a QEMU fork?** Custom memory map, device models, and boot loading;
+QEMU does not support out-of-tree device compilation, so remu device
+sources are symlinked into the QEMU tree and compiled in-tree.
 
 ### Per-Chiplet CPU Memory View
 
-On silicon, the 256 MB `PRIVATE_BASE` window (`0x1E00000000`) is a chiplet-local address-decoder alias: each chiplet's CPUs see their own private peripherals (SYSREMAP, CPMU, CP0/CP1 SYSREG, RBC, OTP, ...) at these addresses. The FW relies on this routing to read `CHIPLET_ID` from `SYSREG_SYSREMAP_PRIVATE+0x444` without having to know which chiplet it runs on, and to execute the same BL1/BL2 binary on all 4 chiplets.
+Silicon routes the 256 MB `PRIVATE_BASE` window (`0x1E00000000`) as a
+chiplet-local alias — each chiplet's CPUs see their own private
+peripherals there. FW reads `CHIPLET_ID` from
+`SYSREG_SYSREMAP_PRIVATE+0x444` to discover which chiplet it runs on,
+so the same BL1/BL2 binary works on all 4.
 
-REMU models this by giving each chiplet's CPUs their own `MemoryRegion` container (built in `r100_build_chiplet_view()` in `r100_soc.c`). Each view:
+REMU models this via per-chiplet `MemoryRegion` containers built in
+`r100_build_chiplet_view()` (see `r100_soc.c`). Each view:
 
-1. Aliases the entire shared `sysmem` at offset 0 (so DRAM, GIC, UART, config-space peripherals, etc. behave normally).
-2. Overlays a 256 MB subregion at `PRIVATE_WIN_BASE` with overlap priority 10 that aliases into `chiplet_id * CHIPLET_OFFSET + PRIVATE_WIN_BASE` — that chiplet's own slice of `sysmem`. The higher priority ensures this overlay wins over the flat `sysmem` alias.
-3. Overlays a 64 KB `SYSREG_CP0` window at the config-space address `R100_CP0_SYSREG_BASE` (`0x1FF1010000`), and a 64 KB `SYSREG_CP1` window at `R100_CP1_SYSREG_BASE` (`0x1FF1810000` = `SYSREG_CP0 + PER_SYSREG_CP`), each aliasing back to the chiplet's own private-alias `SYSREG_CP{0,1}` RAM at `chiplet_base + R100_SYSREG_CP{0,1}_PRIVATE_BASE` (`0x1E01010000` / `0x1E01810000`). BL1's cold-boot CP0 release path writes RVBAR via the QSPI bridge to the private-alias address; BL2's CP1 release (`plat_set_cpu_rvbar(CLUSTER_CP1, ...)` on each chiplet's own CP0.cpu0) writes it to the `SYSREG_CP1` config-space address; BL31's `rebel_h_pm.c:set_rvbar()` (invoked from the PSCI `CPU_ON` SMC handler, CP0 or CP1 half depending on `__TARGET_CP`) writes it to the matching config-space address. The overlays make all three paths converge on the same backing RAM — matching silicon, where each chiplet's decoder routes `0x1FF1010000` / `0x1FF1810000` chiplet-locally. A fourth access path — BL2 running on chiplet M writing the *absolute* cross-chiplet form `chiplet_N * CHIPLET_OFFSET + SYSREG_CP{0,1}_BASE + ...` — is handled by a separate alias of the same RAM mounted inside each chiplet's own `cfg_mr` at offset `SYSREG_CP{0,1}_BASE - CFG_BASE`, with overlap priority 1 so it outranks the chiplet-wide unimpl catch-all.
+1. Aliases shared `sysmem` at offset 0 (so DRAM / GIC / UART / config
+   space all behave normally).
+2. Overlays a 256 MB priority-10 window at `PRIVATE_WIN_BASE` that
+   aliases into `chiplet_id * CHIPLET_OFFSET + PRIVATE_WIN_BASE`.
+3. Overlays `SYSREG_CP{0,1}` config-space windows at
+   `R100_CP{0,1}_SYSREG_BASE` pointing to the chiplet's own
+   private-alias RAM. This makes BL1's QSPI-bridge RVBAR writes, BL2's
+   CP1 release, and BL31's PSCI warm-boot `set_rvbar` all converge on
+   the same backing RAM.
+4. A fourth absolute cross-chiplet form (`chiplet_N * CHIPLET_OFFSET +
+   SYSREG_CP{0,1}_BASE + ...`) is handled by a separate alias of the
+   same RAM mounted inside each chiplet's `cfg_mr` with overlap
+   priority 1, outranking the chiplet-wide unimpl catch-all.
 
-Each CPU's `"memory"` link is set to its chiplet's view before realisation, so all TLB walks and instruction fetches observe the chiplet-local routing. Consequently, secondary CPUs released from power-off must start at the unmodified `0x1E00028000` entry point (the private-alias BL2 base); adding `chiplet_id * CHIPLET_OFFSET` would put PC at an absolute cross-chiplet address and shift every PC-relative ADRP-resolved linker symbol by `CHIPLET_OFFSET`, corrupting expressions like `BL_CODE_END - BL2_BASE` in BL2's MMU setup. The PSCI CPU_ON warm-boot path uses the same mechanism: the PMU hands the FW-written `bl31_warm_entrypoint` straight to `arm_set_cpu_on(mpidr, entry, target_el=3)`, the CPU resumes inside BL31's warm-boot trampoline at EL3, and BL31 `ERET`s to the original `secondary_prep_c` entry at EL1.
+Each CPU's `memory` link is set to its chiplet's view before realise;
+all TLB walks and instruction fetches observe chiplet-local routing.
+Secondary CPUs therefore start at the unmodified `0x1E00028000` entry
+(the private-alias BL2 base) — adding `chiplet_id * CHIPLET_OFFSET`
+would corrupt PC-relative ADRP symbols in BL2's MMU setup. The PSCI
+CPU_ON warm-boot path follows the same mechanism: PMU hands
+`bl31_warm_entrypoint` to `arm_set_cpu_on(mpidr, entry, target_el=3)`,
+BL31 warm-boots at EL3, then `ERET`s to EL1.
 
 ### Per-Chiplet Memory Map
 
-Each of the 4 chiplets has an identical memory layout at offset `chiplet_id * 0x2000000000`:
+Each chiplet is identical at offset `chiplet_id * 0x2000000000`:
 
-| Region | Base Address (chiplet 0) | Size | Description |
-|--------|--------------------------|------|-------------|
-| DRAM | `0x00_0000_0000` | 1GB (emulation) | Device memory, FW images, user data |
-| iROM | `0x1E_0000_0000` | 64KB | Boot ROM |
-| iRAM | `0x1E_0001_0000` | 256KB | BL1 load target, reset vector |
-| SP_MEM | `0x1F_E000_0000` | 64MB | Scratchpad memory (2x 32MB D-Clusters) |
-| SH_MEM | `0x1F_E400_0000` | 64MB | Shared memory (2x 32MB D-Clusters) |
-| Config | `0x1F_F000_0000` | ~3GB | Peripheral MMIO registers |
-
-Config space contains all peripheral registers: CMU, PMU, SYSREG, GIC, UART, DNC, HDMA, RBC, etc.
+| Region | Base (chiplet 0) | Size | Description |
+|---|---|---|---|
+| DRAM   | `0x00_0000_0000` | 1 GB (emu) | FW images, user data |
+| iROM   | `0x1E_0000_0000` | 64 KB | Boot ROM |
+| iRAM   | `0x1E_0001_0000` | 256 KB | BL1 load target |
+| SP_MEM | `0x1F_E000_0000` | 64 MB | Scratchpad (2 × 32 MB D-Clusters) |
+| SH_MEM | `0x1F_E400_0000` | 64 MB | Shared (2 × 32 MB D-Clusters) |
+| Config | `0x1F_F000_0000` | ~3 GB | Peripheral MMIO (CMU/PMU/GIC/…) |
 
 ### Boot Flow
 
 ```
-BL1 (iRAM @ 0x1E00010000)
-  ├─ CMU: Initialize PLLs (stubs return locked instantly)
-  ├─ PMU: Check reset status (stub returns cold boot)
-  ├─ QSPI: Discover secondary chiplets (reads their SYSREMAP_CHIPLET)
-  ├─ RBC: Initialize UCIe links (stubs return link-up)
-  ├─ Load BL2 from flash (or preloaded in emulation)
-  └─ Jump to BL2
-
-BL2 (iRAM @ 0x1E00028000, same binary on all 4 chiplets)
-  ├─ CMU: Chiplet-local PLL init
-  ├─ HBM3: Initialize memory controller (sparse stub returns ready, ICON req RMW works)
-  ├─ Inter-chiplet HBM handshake via mailbox RAM (primary waits for N=1..3)
-  ├─ SMMU-600 TCU: Early init (stub CR0ACK mirror + GBPA.UPDATE auto-clear)
-  ├─ MMU: xlat_tables_v2 — per-chiplet mappings (private window + DRAM + flash + SMMU)
-  ├─ Load BL31 + FreeRTOS images (CP0 + CP1, backed-up copies on secondary chiplets)
-  ├─ Release CP1.cpu0 via plat_pmu_cl_on + plat_pmu_cpu_on    [#ifndef ZEBU_CI]
-  └─ Hand off to BL31_CP0 at BL31_BASE (DRAM @ 0)
-
-BL31_CP0 (DRAM @ 0x00000000)           BL31_CP1 (DRAM @ 0x14100000)
-  ├─ GIC: shared with CP0                ├─ GIC: shared
-  ├─ TZPC for CP0                         ├─ TZPC for CP1
-  └─ ERET → FreeRTOS_CP0 (EL1)            └─ ERET → FreeRTOS_CP1 (EL1)
-
-FreeRTOS_CP0 (DRAM @ 0x00200000)        FreeRTOS_CP1 (DRAM @ 0x14200000)
-  ├─ init_smp() PSCI CPU_ON cpu1..3        ├─ init_smp() PSCI CPU_ON cpu1..3
-  │     → BL31_CP0 warm-boot → EL1         │     → BL31_CP1 warm-boot → EL1
-  └─ q-cp tasks (hq_mgr, cs_mgr, ...)     └─ q-cp tasks (CP1 half)
+BL1  (iRAM @ 0x1E00010000)  — CMU/PMU/QSPI init, discover 3 secondary
+                               chiplets, load BL2 from flash, jump.
+BL2  (iRAM @ 0x1E00028000)  — HBM3 init, inter-chiplet handshake via
+                               mailbox RAM, SMMU TCU early init, MMU,
+                               load BL31+FreeRTOS images, release
+                               CP1.cpu0 (#ifndef ZEBU_CI), jump BL31.
+BL31_CP0 (DRAM @ 0x00000000)              BL31_CP1 (DRAM @ 0x14100000)
+  ├─ GIC shared + TZPC for CP0              ├─ GIC shared + TZPC for CP1
+  └─ ERET → FreeRTOS_CP0 (EL1)              └─ ERET → FreeRTOS_CP1 (EL1)
+FreeRTOS_CP0 (DRAM @ 0x00200000)          FreeRTOS_CP1 (DRAM @ 0x14200000)
+  ├─ init_smp() PSCI CPU_ON → warm-boot → q-cp tasks on both halves
 ```
 
 ### CP0 / CP1 cluster split
 
-Each chiplet has two independent 4-core clusters (CP0 and CP1), each running its own `bl31_cp{0,1}.bin` → `freertos_cp{0,1}.bin` — built from the same TF-A source with `CP=0` vs `CP=1` (`__TARGET_CP`), differing mainly in where `rebel_h_pm.c:set_rvbar()` writes RVBAR (`SYSREG_CP0_OFFSET` vs `SYSREG_CP1_OFFSET = SYSREG_CP0_OFFSET + PER_SYSREG_CP*1`) and which `PERCLUSTER_OFFSET` the PSCI CPU_ON handler uses.
+Each chiplet has two independent 4-core clusters (CP0, CP1), each
+running its own `bl31_cp{0,1}.bin` → `freertos_cp{0,1}.bin`. The q-sys
+build differs mainly in `__TARGET_CP` (= 0 or 1) which picks the
+`SYSREG_CP0` vs `SYSREG_CP1` RVBAR write address.
 
-The release sequence is asymmetric:
+Release sequence:
 
-- **CP0.cpu0** of the primary chiplet is the boot ROM target — started by QEMU at reset with its `rvbar` property.
-- **CP0.cpu0** of chiplets 1-3 is released cross-chiplet by BL1 on the primary via the QSPI bridge (`plat_pmu_cpu_on` with `IMAGE_BL1` branch → `qspi_bridge_write_1word` to each slave's `CPMU_PRIVATE + CPU0_CONFIGURATION`).
-- **CP1.cpu0** of each chiplet is released by BL2 on the *same* chiplet's CP0.cpu0 via direct MMIO (same `plat_pmu_cl_on` / `plat_pmu_cpu_on` helpers, non-`IMAGE_BL1` branch). This is the `#ifndef ZEBU_CI` path in `rebel_h_bl2_setup.c:865-871`.
-- **CP0/CP1.cpu{1,2,3}** are released by their respective FreeRTOS via `init_smp() → psci_cpu_on()` into `BL31_CP{0,1}`'s warm-boot entry — a pure PSCI SMC path, no MMIO from the FreeRTOS side.
+- **CP0.cpu0** of primary: started by QEMU at reset via `rvbar` property.
+- **CP0.cpu0** of chiplets 1-3: released cross-chiplet by BL1 on primary
+  via QSPI bridge (`plat_pmu_cpu_on` + `qspi_bridge_write_1word` to each
+  slave's `CPMU_PRIVATE + CPU0_CONFIGURATION`).
+- **CP1.cpu0** of each chiplet: released by BL2 on the same chiplet's
+  CP0.cpu0 via direct MMIO (`#ifndef ZEBU_CI` branch in
+  `rebel_h_bl2_setup.c`).
+- **CP0/CP1.cpu{1,2,3}**: PSCI `CPU_ON` SMC into `BL31_CP{0,1}` warm-boot.
 
-The PMU device handles all four release variants uniformly: `CPU_CONFIGURATION + cluster*PERCLUSTER_OFFSET + cpu*PERCPU_OFFSET` writes decode cluster/cpu, the stub reads RVBAR back from the matching SYSREG_CP{0,1} backing, and `arm_set_cpu_on(mpidr, RVBAR, target_el=3)` releases the vCPU to either BL2 (cold) or `bl31_warm_entrypoint` (PSCI warm).
+PMU device handles all four variants uniformly: decodes cluster/cpu
+from `CPU_CONFIGURATION + cluster*PERCLUSTER_OFFSET + cpu*PERCPU_OFFSET`,
+reads RVBAR back from `SYSREG_CP{0,1}`, calls `arm_set_cpu_on()`.
 
 ### Log routing
 
-The R100 FW emits boot messages through two independent paths, and REMU captures both:
+FW emits boot messages through two independent paths:
 
-1. **Direct UART (`printf_` / TF-A `NOTICE`/`INFO`)** — TF-A and FreeRTOS's `printf_` call into `uart_putc`, which polls `LSR.THRE|TEMT` and writes to `THR`. REMU wires a QEMU `serial-mm` (16550, `regshift=2`) at `PERI0_UART0_BASE` (`0x1FF9040000`) on each chiplet, with priority-10 overlap over the config-space container. Every chiplet has its own chardev: chiplet 0 is muxed onto stdio + QEMU monitor and tee'd to `output/<run>/uart0.log`; chiplets 1-3 stream into `output/<run>/uart{1,2,3}.log`. The DW-APB UART extras (`DLF` at `0xC0`, `TFL` at `0x80`, etc.) fall into the cfg-space unimplemented catch-all, which is harmless — the FW's init path tolerates zero reads and dropped writes.
+1. **Direct UART** (`printf_`, TF-A `NOTICE/INFO`): QEMU `serial-mm`
+   (16550, `regshift=2`) at `PERI0_UART0_BASE` (`0x1FF9040000`) on each
+   chiplet, priority-10 overlap over the config-space container.
+   Chiplet 0 is muxed to stdio + QEMU monitor and tee'd to `uart0.log`;
+   chiplets 1-3 into `uart{1,2,3}.log`.
 
-2. **HILS ring buffer (`RLOG_*` / `FLOG_*`)** — FreeRTOS's rate-limited structured logging doesn't touch the UART directly. It writes 128-byte `struct rl_log` records (`{tick, type, cpu, func_id, task[16], logstr[100]}`) into a 2 MB ring in DRAM at physical `0x10000000` (16384 entries, see `FreeRTOS.ld` `.logbuf` at virt `0x10010000000`). On silicon a `terminal_task` later drains the ring onto the UART; in REMU we keep the ring tail live from the emulator side too (independent of `terminal_task` scheduling). The `r100-logbuf-tail` device polls the ring on a 50 ms `QEMU_CLOCK_VIRTUAL` timer and writes each new entry as `[HILS <tick> cpu=N LEVEL task|func] <msg>` to its own chardev, which the CLI directs to `output/<run>/hils.log`.
+2. **HILS ring buffer** (`RLOG_*/FLOG_*`): rate-limited structured log
+   written as 128-byte records into a 2 MB DRAM ring at `0x10000000`.
+   `r100-logbuf-tail` polls on a 50 ms `QEMU_CLOCK_VIRTUAL` timer and
+   writes each entry as `[HILS <tick> cpu=N LEVEL task|func] <msg>` to
+   its own chardev (`hils.log`). Independent of `terminal_task`
+   scheduling on silicon.
 
 ### Device Model Design
 
-All device models follow the QEMU QOM (QEMU Object Model) pattern:
+QEMU QOM pattern: `type_init` registration, `MemoryRegionOps` for
+MMIO, properties for parameterisation, `reset` handler for defaults.
 
-1. **TypeInfo registration** via `type_init()` — called at QEMU startup
-2. **MemoryRegionOps** for MMIO read/write — the core of each model
-3. **Properties** for parameterization — chiplet ID, block name, etc.
-4. **Reset** handler — sets default register values
-
-**Stub philosophy**: Return the minimum register values needed for the FW to proceed. Most stubs use store-on-write / return-on-read semantics with specific overrides for status bits (e.g., CMU PLL lock).
+**Stub philosophy**: return the minimum register values needed for FW
+to proceed. Most stubs are store-on-write / return-on-read with
+specific overrides for status bits (e.g. CMU PLL lock).
 
 ### Key Design Decisions
 
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| QEMU CPU model | `cortex-a72` + MIDR override to 0x411FD091 (CA73 r1p1) + per-CPU IMPDEF sysreg stubs (`r100_cortex_a73_impdef_regs` in `r100_soc.c`) | Functionally closest to CA73 in QEMU. r1p1 MIDR skips the *revision-gated* CA73 errata whose workarounds probe IMPDEF sysregs cortex-a72 doesn't model. The remaining CA73 workarounds that TF-A compiles in **unconditionally** (notably CVE-2018-3639, `erratum_cortex_a73_3639_wa`) still read/write `S3_0_C15_C0_{0,1,2}` — we register those encodings as RAZ/WI via `define_arm_cp_regs()` so BL1 no longer traps with "Undefined Instruction" before the UART comes up. Cache-timing side-channel mitigations are a no-op on an emulator without a cache model, so RAZ/WI is behaviorally correct. |
-| GIC model | One `arm-gicv3` per chiplet (`num-cpu=8`, `first-cpu-index=chiplet*8`) | Matches silicon (each chiplet has its own GIC600); the `first-cpu-index` property is added by `cli/qemu-patches/0001-arm-gicv3-first-cpu-index.patch` so multiple GIC instances bind to disjoint CPU ranges without colliding on ICC_* cpreg registration. Each CPU's 5 architectural generic-timer outputs (`GTIMER_PHYS/VIRT/HYP/SEC/HYPVIRT`) are wired to that chiplet's GIC PPI inputs (`ARCH_TIMER_{NS_EL1,VIRT,NS_EL2,S_EL1,NS_EL2_VIRT}_IRQ` = PPIs 30/27/26/29/28) using the same `intidbase = num_irq - GIC_INTERNAL + local_cpu * 32` layout `hw/arm/virt.c` uses — without this the ARM architectural timer fires internally but the GIC never sees it, so PPI 27 (`CNTVIRQ`, FreeRTOS's CA73 tick source per `FreeRTOS_tick_config.c`) never delivers and `vTaskDelay()` wedges forever. |
-| QSPI bridge | Address-space read/write | Uses QEMU's `address_space_read/write` for cross-chiplet access |
-| UART priority | `memory_region_add_subregion_overlap` prio=10 | UART must take precedence over config space container |
-| Machine name | `r100-soc-machine` | QEMU requires `-machine` suffix for `MachineClass` types |
-| Timer frequency | 500MHz (`CNTFRQ_EL0`) | Matches real hardware (`CORE_TIMER_FREQ`) |
-| DRAM size | 1GB per chiplet | Sufficient for FW boot; real hardware has up to 36GB |
+| Decision | Choice | Why |
+|---|---|---|
+| CPU model | `cortex-a72` + MIDR spoofed to CA73 r1p1 (`0x411FD091`) + two IMPDEF sysreg tables (`r100_samsung_impdef_regs`, `r100_cortex_a73_impdef_regs` in `r100_soc.c`) | Closest QEMU model; r1p1 MIDR skips revision-gated CA73 errata; the WA paths TF-A always runs (CVE-2018-3639) read/write IMPDEF regs we register as RAZ/WI. See commit `7a2e232`. |
+| GIC | One `arm-gicv3` per chiplet (`num-cpu=8`, `first-cpu-index=N*8`) | Matches silicon; `first-cpu-index` added by `cli/qemu-patches/0001-arm-gicv3-first-cpu-index.patch` so multi-GIC machines bind disjoint CPU ranges. Generic-timer outs wired to PPIs 30/27/26/29/28 (same layout as `hw/arm/virt.c`); without this FreeRTOS CNTVIRQ tick wedges on the first `vTaskDelay` — see commit `680f964`. |
+| QSPI bridge | QEMU `address_space_read/write` | Cross-chiplet register I/O. |
+| UART overlap | prio 10 over config-space | Outranks the unimpl catch-all. |
+| Machine name | `r100-soc-machine` | `-machine` suffix required by `MachineClass`. |
+| Timer freq | 500 MHz (`CNTFRQ_EL0`) | Matches silicon (`CORE_TIMER_FREQ`). |
+| DRAM size | 1 GB / chiplet | Enough for FW boot (silicon has up to 36 GB). |
 
 ## Source File Map
 
-| File | Device | Instances | Key Behavior |
-|------|--------|-----------|--------------|
-| `r100_soc.c` | Machine type | 1 | Creates chiplets, per-chiplet CPU views, CPUs, per-chiplet GIC (GICv3, 8 CPUs × 4 chiplets, `first-cpu-index` patched in), per-chiplet UARTs, mailbox RAM. Per CPU: spoofs MIDR to CA73 r1p1 and installs two IMPDEF sysreg tables via `define_arm_cp_regs()` — `r100_samsung_impdef_regs` (Samsung L1/L2 cache-flush SYS op at `S1_1_C15_C14_0`) and `r100_cortex_a73_impdef_regs` (A73 `CPUACTLR/ECTLR/MERRSR_EL1` at `S3_0_C15_C0_{0,1,2}`; unblocks TF-A's CVE-2018-3639 WA). Also wires each CPU's 5 generic-timer GPIO-out lines (`GTIMER_PHYS/VIRT/HYP/SEC/HYPVIRT`) to the matching per-chiplet GIC PPI inputs (`ARCH_TIMER_{NS_EL1,VIRT,NS_EL2,S_EL1,NS_EL2_VIRT}_IRQ`) so FreeRTOS's CNTVIRQ (PPI 27) tick actually reaches the GIC — without this, `vTaskDelay()` wedges forever and `bootdone_task` never runs past `hils_check_product_info_ready()` |
-| `r100_cmu.c` | CMU (Clock) | 20 per chiplet | PLL lock = instant, mux_busy = 0 |
-| `r100_pmu.c` | PMU (Power) | 1 per chiplet | Cold reset, all CPUs/clusters ON; `CPU_CONFIGURATION` → `arm_set_cpu_on(mpidr, RVBAR, target_el=3)` at FW-written RVBAR (covers BL1's QSPI-driven cold-boot release, BL2's direct CP1 release, and BL31's PSCI CPU_ON warm-boot release); `read_rvbar()` indexes `SYSREG_CP0_PRIVATE + cluster * PER_SYSREG_CP` so the same path serves CP0 and CP1; DCL config→status mirror |
-| `r100_sysreg.c` | SYSREG | 1 per chiplet | Returns chiplet ID (0-3); CP0 and CP1 RAM triple-mounted per chiplet (private alias + cfg_mr alias + per-chiplet CPU view overlay) — CP0 at `0x1E01010000` / `0x1FF1010000`, CP1 at `0x1E01810000` / `0x1FF1810000` |
-| `r100_hbm.c` | HBM3 controller | 1 per chiplet | Sparse write-back (6 MB window, default 0xFFFFFFFF), ICON req0/req1 RMW mirror |
-| `r100_qspi.c` | QSPI bridge | 1 per chiplet | Designware SSI, cross-chiplet R/W + upper-addr latch (28-bit offset) |
-| `r100_qspi_boot.c` | QSPI_ROT (DWC_SSI master) | 1 per chiplet | Dual-mapped (cfg-space `0x1FF0500000` + private alias `0x1E00500000`); DW SSI status always idle (`TFNF\|TFE\|RFNE`, `BUSY=0`), `TXFLR=0`, DRX reads return `0x82` (`FLASH_READY\|WRITE_ENABLE_LATCH`) so every `qspi_boot.c:tx_available()` and `check_read_*_status()` poll exits on iteration 0; covers BL1 flash-load and BL31 `NOR_FLASH_SVC_*` SMC paths |
-| `r100_rbc.c` | RBC/UCIe | 6 per chiplet | Dual-mapped (cfg-space `0x1FF5xxxxxx` + private alias `0x1E05xxxxxx`); `global_reg_cmn_mcu_scratch_reg1 = 0xFFFFFFFF` (ZEBU link-up) + `lstatus_link_status=1` |
-| `r100_smmu.c` | SMMU-600 TCU | 1 per chiplet (primary only wired) | `CR0→CR0ACK` mirror + `GBPA.UPDATE` auto-clear (BL2 `smmu_early_init`); CMDQ walker: on each `CMDQ_PROD` write, walks entries in DRAM via `cpu_physical_memory_read`, writes 32-bit 0 to MSI address of every `CMD_SYNC` (CS=SIG_IRQ), and auto-advances `CMDQ_CONS` to PROD so FreeRTOS EL1 `smmu_sync()` returns on first iteration |
-| `r100_pvt.c` | PVT monitor | 5 per chiplet (ROT + 4 DCL) | `PVT_CON_STATUS=0x3` (idle), per-sensor `_valid=1`, rest RAM — unblocks FreeRTOS `pvt_init()` `PVT_ENABLE_{PROC,VOLT,TEMP}_CONTROLLER` polls |
-| `r100_dma.c` | PL330 DMA | 1 per chiplet | Fake completion on csr/dbgstatus/dbgcmd polls |
-| `r100_logbuf.c` | HILS ring tail | 1 (chiplet 0 only) | Polls DRAM `.logbuf` ring at 0x10000000 on a 50 ms timer, drains `RLOG_*`/`FLOG_*` entries to own chardev |
-| `r100_doorbell.c` | PCIe doorbell ingress | 1 (chiplet 0 only; M6+M8a) | Reassembles 8-byte `(BAR4 offset, value)` frames on a `CharBackend` and routes by offset: `MAILBOX_INTGR0` (0x8) / `MAILBOX_INTGR1` (0x1c) call `r100_mailbox_raise_intgr(group, val)` for the M6 interrupt-trigger path; `MAILBOX_BASE..MAILBOX_END` (0x80..0x180) call `r100_mailbox_set_issr(idx, val)` for the M8a host → NPU scratch-write path (no IRQ side-effect, and mailbox skips the return-path chardev emit so host writes don't loop back); everything else logs `GUEST_ERROR`. Links to the `r100-mailbox` via `DEFINE_PROP_LINK`. Optional debug chardev echoes every accepted frame (INTGR or ISSR) as `doorbell off=0x... val=0x... count=N` |
-| `r100_mailbox.c` | Samsung `ipm_samsung` SFR | 1 (chiplet 0 only; M6+M8a) | Full register model: `MCUCTRL`, `INTGR{0,1}` (write-1-to-set), `INTCR{0,1}` (write-1-to-clear), `INTMR{0,1}` (mask), `INTSR{0,1}` (raw pending), `INTMSR{0,1}` (`INTSR & ~INTMR`), `MIF_INIT`, `IS_VERSION`, `ISSR0..63`. Two `qemu_irq` outputs (`irq[0]` / `irq[1]`) track the non-zero state of INTMSR0 / INTMSR1. Exposes `r100_mailbox_raise_intgr(group, val)` so the doorbell can inject pending bits without round-tripping through MMIO, and `r100_mailbox_set_issr(idx, val)` for the M8a host-write path (updates the ISSR state *without* re-emitting on the `issr` chardev, so host writes don't loop back). Every MMIO-path ISSR write emits an 8-byte `(bar4_offset, value)` frame on the optional `issr` chardev (M8a) so the host's BAR4 shadow stays live; an `issr-debug` chardev echoes every frame with `status={ok,bad-offset}` |
-| `r100_imsix.c` | PCIe MSI-X address-match trap | 1 (chiplet 0 only; M7) | 4 KB MMIO window at `R100_PCIE_IMSIX_BASE` (`0x1B_FFFF_F000`). Traps 4-byte FW writes to offset `0xFFC` (`R100_PCIE_IMSIX_DB_OFFSET` = `REBELH_PCIE_MSIX_ADDR & 0xFFF`) — the same 32-bit store that DW PCIe `MSIX_ADDRESS_MATCH_*` logic snoops on silicon — and emits 8-byte `(offset, db_data)` frames on the `msix` chardev. Non-doorbell offsets fall through to a local 1 KB register file so FW side-probes don't spam QEMU's unimplemented-device log. Optional `msix-debug` chardev echoes every frame for observability |
-| `r100_npu_pci.c` (x86 side) | PCIe endpoint `0x1eff:0x2030` | 1 | Four BARs: BAR0 splices shared memdev at offset 0 (M4); BAR2 lazy RAM; BAR4 is a container with a 4 KB MMIO head overlay that intercepts both `MAILBOX_INTGR0/1` (M6 interrupt triggers) and the `MAILBOX_BASE` payload range (M8a ISSR scratch writes) and emits 8-byte frames on the `doorbell` chardev, plus an 8 MB lazy-RAM fallback for the rest of BAR4; BAR5 is MSI-X table + PBA + RAM fill (M3). Reverse-direction paths: `msix` chardev consumes `(offset, db_data)` frames from `r100-imsix` and calls `msix_notify(vector & 0x7FF)` (M7); `issr` chardev consumes `(bar4_offset, value)` frames from `r100-mailbox` and mirrors them into `bar4_mmio_regs[]` so guest reads at `BAR4 + MAILBOX_BASE + idx*4` see a live shadow (M8a). The 4 KB MMIO overlay is installed when *either* `doorbell` or `issr` is connected |
-| `remu_addrmap.h` | — | — | All address constants (from `g_sys_addrmap.h`), plus M6 doorbell offsets (`R100_PCIE_MAILBOX_BASE`, `R100_BAR4_MAILBOX_INTGR{0,1}`, `R100_PCIE_MBX_GROUP{0,1}_SPI`), M7 iMSIX-DB offsets (`R100_PCIE_IMSIX_BASE`, `R100_PCIE_IMSIX_DB_OFFSET`, `R100_PCIE_IMSIX_VECTOR_MASK`), and M8a ISSR-payload offsets (`R100_BAR4_MAILBOX_BASE = 0x80`, `R100_BAR4_MAILBOX_COUNT = 64`, `R100_BAR4_MAILBOX_END = 0x180`, `R100_BAR4_MMIO_SIZE = 0x1000`) |
+| File | Device | Instances | Behaviour |
+|---|---|---|---|
+| `r100_soc.c` | Machine | 1 | Builds chiplet views + CPUs + per-chiplet GIC/UART + mailbox cluster. Installs MIDR spoof + two IMPDEF sysreg tables per CPU. Wires gtimer→GIC PPIs. Instantiates `r100-doorbell` / `r100-imsix` on demand. Inline stubs: PCIE sub-controller (PHY{0..3}_SRAM_INIT_DONE seed), CSS600 CNTGEN, inter-chiplet HBM mailbox RAM, cfg/private-window unimpl catch-alls. |
+| `r100_cmu.c` | CMU | 20 / chiplet | PLL-lock instant, `mux_busy=0`. |
+| `r100_pmu.c` | PMU | 1 / chiplet | Cold-reset, `CPU_CONFIGURATION` → `arm_set_cpu_on(mpidr, RVBAR, EL3)` covers BL1 cold, BL2 CP1, BL31 PSCI warm. `read_rvbar()` indexes `SYSREG_CP0_PRIVATE + cluster * PER_SYSREG_CP`. Dual-mapped (cfg + private alias). |
+| `r100_sysreg.c` | SYSREG | 1 / chiplet | Returns chiplet ID. CP0/CP1 RAM triple-mounted (private + cfg alias + CPU-view overlay). |
+| `r100_hbm.c` | HBM3 | 1 / chiplet | Sparse `GHashTable` write-back (default `0xFFFFFFFF`), ICON RMW, PHY-training sentinels. |
+| `r100_qspi.c` | QSPI bridge | 1 / chiplet | DW SSI inter-chiplet R/W (`0x70`/`0x80`/`0x83`) via `PRIVATE_BASE` + upper-addr latch. |
+| `r100_qspi_boot.c` | QSPI_ROT (DWC_SSI) | 1 / chiplet | Dual-mapped; status always idle, DRX = `0x82`; covers BL1 flash-load + BL31 `NOR_FLASH_SVC_*`. |
+| `r100_rbc.c` | RBC/UCIe | 6 / chiplet | Dual-mapped; `scratch_reg1 = 0xFFFFFFFF`, `lstatus_link_status = 1`. |
+| `r100_smmu.c` | SMMU-600 TCU | 1 / chiplet | `CR0→CR0ACK` + `GBPA.UPDATE` auto-clear; CMDQ walker zeroes `CMD_SYNC.MSI_ADDRESS` and auto-advances `CMDQ_CONS=PROD`. |
+| `r100_pvt.c` | PVT monitor | 5 / chiplet | `PVT_CON_STATUS=0x3`, per-sensor `_valid=1`. |
+| `r100_dma.c` | PL330 DMA | 1 / chiplet | Fake-completion stub. |
+| `r100_dnc.c` | DCL cluster + RBDMA | 2+1 / chiplet | Sparse stub for DNC slots, SHM banks, MGLUE (RDSN), RBDMA `IP_INFO`. |
+| `r100_logbuf.c` | HILS ring tail | 1 (chiplet 0) | 50 ms poll of `.logbuf` ring, drains to chardev. |
+| `r100_mailbox.c` | Samsung IPM SFR | 2 on chiplet 0 (VF0, PF) | Full register model (`INTGR/INTCR/INTMR/INTSR/INTMSR/ISSR0..63`), two `qemu_irq` outs (INTMSR0/1), API `r100_mailbox_{raise_intgr,set_issr,cm7_stub_write_issr}`. Every MMIO-path ISSR write emits `(bar4_off, val)` frame on optional `issr-chardev` (M8a). |
+| `r100_doorbell.c` | PCIe doorbell ingress | 1 (chiplet 0; M6+M8a+CM7-stub) | Reassembles 8-byte `(offset, value)` frames; routes by offset to INTGR / ISSR / CM7-stub (INTGR0 bit 0 = SOFT_RESET → synthesises `FW_BOOT_DONE` into PF.ISSR[4], commit `a01d2b5`). |
+| `r100_imsix.c` | PCIe MSI-X trap | 1 (chiplet 0; M7) | 4 KB MMIO at `R100_PCIE_IMSIX_BASE`; 4-byte write @ `0xFFC` emits `(offset, db_data)` frame on `msix` chardev. |
+| `r100_npu_pci.c` (x86) | PCIe endpoint `0x1eff:0x2030` | 1 | Four BARs + three chardev bridges — see commit `7b03328` / `e03b00f` / `cd24aa9` for per-milestone detail. |
+| `remu_addrmap.h` | — | — | Address constants from `g_sys_addrmap.h` + M6/M7/M8a bridge offsets. |
 
 ## FW Source References
 
-These files in the external repos define the hardware behavior that the emulator models:
+These files in `external/ssw-bundle` define the hardware behaviour the
+emulator models. Shorthand: `$BUNDLE` = `external/ssw-bundle/products`.
 
 | What | File |
-|------|------|
-| SoC address map | `q-sys/.../autogen/g_sys_addrmap.h` |
-| Platform defs (memory, GIC, UART) | `q-sys/bootloader/cp/tf-a/plat/rebel/rebel_h/include/platform_def.h` |
-| CMU PLL polling | `q-sys/bootloader/cp/tf-a/drivers/clk/clk_samsung/cmu.c` |
-| PMU boot status | `q-sys/bootloader/cp/tf-a/plat/rebel/rebel_h/rebel_h_pmu.c` |
-| Boot stages | `q-sys/bootloader/cp/tf-a/plat/rebel/rebel_h/rebel_h_bl{1,2,31}_setup.c` |
-| QSPI bridge protocol | `q-sys/bootloader/cp/tf-a/drivers/synopsys/qspi_bridge/qspi_bridge.c` |
-| DWC_SSI master (QSPI_ROT) | `q-sys/drivers/qspi_boot/qspi_boot.{c,h}` + `services/std_svc/nor_flash/nor_flash_main.c` |
-| RBC/UCIe init | `q-sys/bootloader/cp/tf-a/plat/rebel/rebel_h/rebel_h_rbc.c` |
-| PCI BARs + memory map | `kmd/rebellions/rebel/rebel.h` |
-| FW-host handshake | `kmd/rebellions/common/{fw_if.c,ring.c,queue.c}` |
-| Host interface (FW side) | `q-cp/src/hil/hil.c` |
+|---|---|
+| SoC address map | `$BUNDLE/rebel/q/sys/.../autogen/g_sys_addrmap.h` |
+| Platform defs | `$BUNDLE/rebel/q/sys/bootloader/cp/tf-a/plat/rebel/rebel_h/include/platform_def.h` |
+| CMU PLL polling | `$BUNDLE/rebel/q/sys/bootloader/cp/tf-a/drivers/clk/clk_samsung/cmu.c` |
+| PMU boot status | `$BUNDLE/rebel/q/sys/bootloader/cp/tf-a/plat/rebel/rebel_h/rebel_h_pmu.c` |
+| Boot stages | `$BUNDLE/rebel/q/sys/bootloader/cp/tf-a/plat/rebel/rebel_h/rebel_h_bl{1,2,31}_setup.c` |
+| QSPI bridge protocol | `$BUNDLE/rebel/q/sys/bootloader/cp/tf-a/drivers/synopsys/qspi_bridge/qspi_bridge.c` |
+| DWC_SSI / NOR flash | `$BUNDLE/rebel/q/sys/drivers/qspi_boot/qspi_boot.{c,h}` + `services/std_svc/nor_flash/nor_flash_main.c` |
+| RBC/UCIe init | `$BUNDLE/rebel/q/sys/bootloader/cp/tf-a/plat/rebel/rebel_h/rebel_h_rbc.c` |
+| PCI BARs + mmap | `$BUNDLE/common/kmd/rebellions/rebel/rebel.h` |
+| FW-host handshake | `$BUNDLE/common/kmd/rebellions/common/{fw_if.c,ring.c,queue.c}` |
+| Host interface (FW) | `$BUNDLE/rebel/q/cp/src/hil/hil.c` |

@@ -1,83 +1,20 @@
 /*
- * R100 NPU host-side PCIe endpoint (Phase 2, M3).
+ * R100 NPU host-side PCIe endpoint (Phase 2; M3 BARs, M4 shared DRAM,
+ * M6 doorbell, M7 MSI-X, M8a ISSR shadow). Vendor/device = CR03 quad;
+ * stock rebellions.ko binds unmodified.
  *
- * This device model lives in the x86_64 QEMU guest and exposes the
- * R100 NPU to its Linux driver (rebellions.ko, built from
- * external/ssw-bundle/products/common/kmd/). Vendor/device IDs match
- * PCI_VENDOR_ID_REBEL / PCI_ID_CR03 from
- *   external/ssw-bundle/.../common/kmd/rebellions/{common/rebellions.h,
- *                                                 common/rebellions_drv.c}
- * so the stock driver binds to us with no modifications.
+ * BARs (next pow2 >= driver's RBLN_* sizes in rebel.h):
+ *   BAR0 64 GB  DDR (lazy RAM; shared /dev/shm head when memdev wired — M4/M5)
+ *   BAR2 64 MB  ACP/SRAM (lazy RAM)
+ *   BAR4 8 MB   Doorbell: 8 MB container; when doorbell or issr chardev
+ *               is wired, 4 KB MMIO head (prio 10) intercepts
+ *                 - 0x08/0x1c MAILBOX_INTGR{0,1}   → doorbell frame (M6)
+ *                 - 0x80..0x180 MAILBOX_BASE        → doorbell frame (M8a host→NPU)
+ *               Reads of MAILBOX_BASE serve the ISSR shadow fed by
+ *               `issr` chardev (M8a NPU→host). Rest of BAR4 = lazy RAM.
+ *   BAR5 1 MB   MSI-X table+PBA head; rest lazy RAM.
  *
- * BAR layout (from external/ssw-bundle/.../kmd/rebellions/rebel/rebel.h
- * and rebel.c:rebel_check_pci_bars_size). Sizes are the NEXT POWER OF 2
- * >= the driver's minimum, which is what PCI BARs require anyway:
- *
- *   BAR0 (DDR,      64-bit prefetch): >= RBLN_DRAM_SIZE  (36 GB)
- *   BAR2 (ACP/SRAM, 64-bit prefetch): >= RBLN_SRAM_SIZE  (64 MB)
- *   BAR4 (Doorbell, 32-bit MMIO):     >= RBLN_PERI_SIZE  (8 MB)
- *   BAR5 (MSI-X,    32-bit MMIO):     >= RBLN_PCIE_SIZE  (1 MB)
- *
- * BAR2 is plain lazily-allocated host RAM (no side effects on
- * writes); BAR4 is normally lazy RAM too, but when the `doorbell`
- * or `issr` chardev property is wired (M6+M8a) a 4 KB MMIO head
- * overlay intercepts two distinct write classes in a single trap:
- *   (a) MAILBOX_INTGR0/1 (0x8 / 0x1c) — forwarded as 8-byte
- *       (offset, value) frames on the `doorbell` chardev; the
- *       NPU-side r100-doorbell injects them as a GIC SPI via
- *       r100-mailbox (M6).
- *   (b) MAILBOX_BASE range (0x80..0x180) — forwarded as the same
- *       frame format on the *same* `doorbell` chardev; the NPU
- *       side disambiguates by offset and updates its mailbox's
- *       ISSRn scratch register without raising any IRQ (M8a
- *       host → NPU).
- * Reads from MAILBOX_BASE return values previously written into
- * `bar4_mmio_regs[]` by frames arriving on the `issr` chardev
- * (M8a NPU → host) — that's how the KMD's FW_BOOT_DONE poll on
- * BAR4 + MAILBOX_BASE + 0x10 eventually sees the firmware-written
- * magic. The remaining BAR4 space past the MMIO overlay is lazy
- * RAM so driver stores that fall outside the mailbox window don't
- * fault. BAR5 holds the MSI-X table + PBA in its first few KB
- * with plain RAM filling the rest so the driver's size check
- * passes. Lazy allocation keeps the 64 GB BAR0 from actually
- * costing 64 GB of host RSS unless the guest touches every page.
- *
- * BAR0 has two shapes:
- *
- *   - Without `memdev`: plain lazy RAM (M3 behavior). Useful for
- *     bring-up / driver-only experiments where the NPU-side QEMU
- *     isn't involved.
- *
- *   - With `memdev` (M4+): BAR0 is a container MemoryRegion of the
- *     full declared size (64 GB) with the backend's MR added as a
- *     subregion at offset 0 and plain lazy RAM filling the tail.
- *     Both QEMU processes (x86 host + aarch64 NPU) open the same
- *     memory-backend-file with share=on, so writes from the x86
- *     guest into BAR0 offset 0..backend_size land in a page the NPU-
- *     side QEMU also has mmap'd. The NPU-side address-map integration
- *     (so NPU CPUs see those bytes as their DRAM) lands in M5.
- *
- * Later milestones layer real behavior on top:
- *   M5 — alias the same backend into the NPU-side HBM memory map so
- *        NPU CPUs see x86-guest writes as DRAM accesses.  [done]
- *   M6 — hybrid MMIO+RAM BAR4 that forwards MAILBOX_INTGR writes to
- *        the NPU process over a chardev (see `doorbell` property and
- *        src/machine/r100_doorbell.c).                    [done]
- *   M7 — the `msix` chardev consumes 8-byte frames emitted by the
- *        NPU-side r100-imsix device (FW stores to
- *        REBELH_PCIE_MSIX_ADDR = 0x1B_FFFF_FFFC) and calls
- *        msix_notify() for the encoded vector. Mirrors the M6
- *        doorbell wire format but flowing in the opposite direction.
- *   M8 — BAR4 MAILBOX_BASE payload (0x80..0x180) is now a live
- *        shadow of the NPU mailbox's ISSR0..63 scratch registers.
- *        Host writes in that range are forwarded over the existing
- *        `doorbell` chardev (offset disambiguates vs. INTGR) so
- *        the NPU r100-mailbox re-absorbs them via
- *        r100_mailbox_set_issr(). NPU-side ISSR writes from FW come
- *        back on a new `issr` chardev (same 8-byte wire format)
- *        and update bar4_mmio_regs in place, so the KMD's
- *        FW_BOOT_DONE poll on BAR4 + MAILBOX_BASE + 4*4 observes
- *        the FW-written magic.
+ * Wire frames on all three chardevs: u32 bar4_off LE + u32 val LE = 8 B.
  */
 
 #include "qemu/osdep.h"
@@ -118,98 +55,53 @@ OBJECT_DECLARE_SIMPLE_TYPE(R100NpuPciState, R100_NPU_PCI)
 struct R100NpuPciState {
     PCIDevice parent_obj;
 
-    /* When set (via -device r100-npu-pci,memdev=<id>), the backend's
-     * MR is added as a subregion of bar0_ddr at offset 0 for cross-
-     * process DRAM sharing with the NPU-side QEMU. `bar0_tail` then
-     * fills the remainder of BAR0 so the driver's size check passes.
-     * When unset, bar0_ddr is a plain RAM region of the full size and
-     * bar0_tail is unused. */
+    /* memdev (M4): backend spliced over BAR0 head; bar0_tail covers the
+     * rest so driver's size check passes. Unset = full lazy RAM (M3). */
     HostMemoryBackend *hostmem;
 
-    /* When set (via -device r100-npu-pci,doorbell=<chardev-id>),
-     * BAR4 becomes a container with a small MMIO head that intercepts
-     * MAILBOX_INTGR0/INTGR1 writes and emits an 8-byte frame on this
-     * chardev, plus lazy RAM filling the rest of BAR4 for backward-
-     * compatible mailbox-payload semantics. When unset, the whole BAR
-     * is plain RAM (M3/M5 behaviour). */
+    /* doorbell (M6+M8a host→NPU): 8-byte (off, val) frames. */
     CharBackend doorbell_chr;
 
-    /* When set (via -device r100-npu-pci,msix=<chardev-id>, M7+),
-     * receives 8-byte (offset, db_data) frames from the NPU-side
-     * r100-imsix device. On each complete frame we mask the vector
-     * out of db_data[10:0] and call msix_notify() on the PCI device.
-     * When unset the chardev is simply not polled — no MSI-X can
-     * ever be fired from the NPU side, which matches pre-M7
-     * behaviour. */
+    /* msix (M7 NPU→host): frames from r100-imsix → msix_notify(vec). */
     CharBackend msix_chr;
-    /* Optional: per-frame ASCII tail (debug). */
     CharBackend msix_debug_chr;
     uint8_t msix_rx_buf[8];
     uint32_t msix_rx_len;
     uint64_t msix_frames_received;
-    uint64_t msix_frames_dropped;   /* bad offset / vector out of range */
+    uint64_t msix_frames_dropped;
     uint32_t msix_last_db_data;
     uint32_t msix_last_vector;
 
-    /* M8 ISSR ingress — when set (via -device r100-npu-pci,issr=<chardev-id>),
-     * receives 8-byte (bar4_off, val) frames from the NPU-side
-     * r100-mailbox. Each complete frame writes `val` into the
-     * mirrored bar4_mmio_regs[bar4_off >> 2] slot so a subsequent
-     * guest read on BAR4 (the KMD's rebel_mailbox_read(), the
-     * FW_BOOT_DONE poll) observes the FW-written value. Bad offsets
-     * outside the MAILBOX_BASE range are dropped with a
-     * GUEST_ERROR entry. When unset the chardev is simply not
-     * polled and BAR4 payload offsets remain stuck at whatever the
-     * guest last wrote (matches pre-M8 behaviour). */
+    /* issr (M8a NPU→host): frames from r100-mailbox → bar4_mmio_regs. */
     CharBackend issr_chr;
     CharBackend issr_debug_chr;
     uint8_t issr_rx_buf[8];
     uint32_t issr_rx_len;
     uint64_t issr_frames_received;
-    uint64_t issr_frames_dropped;   /* bad offset */
+    uint64_t issr_frames_dropped;
     uint32_t issr_last_offset;
     uint32_t issr_last_value;
-    /* M8 ISSR egress — frames sent to the NPU on bar4_mmio_writes
-     * that land in the MAILBOX_BASE payload range. Routed over the
-     * existing `doorbell` chardev (offset field disambiguates
-     * INTGR trigger vs. ISSR payload on the NPU side via
-     * r100_doorbell_deliver). */
+    /* M8a host→NPU ISSR-payload frames (shared wire with doorbell). */
     uint64_t issr_payload_frames_sent;
 
     MemoryRegion bar0_ddr;
     MemoryRegion bar0_tail;
     MemoryRegion bar2_acp;
 
-    /* BAR4 layout:
-     *   bar4_container (8 MB) holds the BAR. When doorbell_chr is
-     *   connected, bar4_mmio (4 KB MMIO, priority 10) overlays offset
-     *   0..R100_BAR4_MMIO_SIZE and handles INTGR triggers + holds a
-     *   backing register file for reads; bar4_ram (8 MB lazy RAM,
-     *   priority 0) catches everything else (including MAILBOX_BASE
-     *   payload writes). When doorbell_chr is not connected, only
-     *   bar4_ram is added at priority 0 for full-BAR RAM semantics. */
+    /* BAR4: container + prio-0 lazy RAM + optional prio-10 MMIO head
+     * (installed when doorbell or issr chardev is connected). */
     MemoryRegion bar4_container;
     MemoryRegion bar4_mmio;
     MemoryRegion bar4_ram;
 
-    /* Backing for bar4_mmio so reads return the last written value
-     * (KMD doesn't read INTGR registers, but we keep consistent
-     * semantics across save/restore). R100_BAR4_MMIO_SIZE is 4 KB =
-     * 1024 u32s. */
     uint32_t bar4_mmio_regs[R100_BAR4_MMIO_SIZE / 4];
     uint64_t doorbell_frames_sent;
 
     MemoryRegion bar5_msix;
 };
 
-/*
- * Emit an 8-byte (offset, value) frame to the NPU-side doorbell
- * chardev. The NPU process (r100-doorbell) decodes this as "BAR4
- * offset <off> got <val>" and pulses a GIC SPI (see
- * src/machine/r100_doorbell.c). Best-effort write: if the socket is
- * temporarily full we drop the frame and log — silicon doesn't
- * back-pressure on doorbell writes either.
- */
+/* Emit 8-byte (off, val) frame on doorbell chardev. Best-effort;
+ * silicon doesn't back-pressure on doorbell writes either. */
 static void r100_doorbell_emit(R100NpuPciState *s, uint32_t off, uint32_t val)
 {
     uint8_t frame[8];
@@ -242,8 +134,7 @@ static uint64_t r100_bar4_mmio_read(void *opaque, hwaddr addr, unsigned size)
         return 0;
     }
     v = s->bar4_mmio_regs[idx];
-    /* REMU-TRACE: log reads of the FW_BOOT_DONE slot so we can
-     * correlate KMD poll timing with issr_deliver timestamps. */
+    /* Trace MAILBOX_BASE reads for KMD poll-vs-issr-deliver correlation. */
     if (addr >= 0x80 && addr < 0x180) {
         fprintf(stderr, "REMU-TRACE: bar4_mmio_read off=0x%x -> 0x%x\n",
                 (uint32_t)addr, v);
@@ -260,33 +151,17 @@ static void r100_bar4_mmio_write(void *opaque, hwaddr addr, uint64_t val,
 
     if (idx < ARRAY_SIZE(s->bar4_mmio_regs)) {
         s->bar4_mmio_regs[idx] = v32;
-        /* REMU-TRACE: log KMD writes to the mailbox region so
-         * we can spot a late clear that would overwrite the
-         * 0xfb0d emitted by the NPU. */
+        /* Trace MAILBOX_BASE writes to spot KMD clears that would
+         * overwrite an NPU-emitted 0xfb0d. */
         if (addr >= 0x80 && addr < 0x180) {
             fprintf(stderr, "REMU-TRACE: bar4_mmio_write off=0x%x val=0x%x\n",
                     (uint32_t)addr, v32);
         }
     }
 
-    /*
-     * Forwards:
-     *
-     *  INTGR0 / INTGR1  (M6)   — the real doorbell. Emits a frame so
-     *      the NPU r100-doorbell raises the matching INTGR pending
-     *      bit on its r100-mailbox (and the per-group SPI fires).
-     *
-     *  MAILBOX_BASE..MAILBOX_END (M8) — KMD payload writes: reset
-     *      counters, ISSR-encoded commands the FW polls for, etc.
-     *      See rebel_mailbox_write() in the KMD. We emit the same
-     *      8-byte (offset, value) frame on the doorbell chardev;
-     *      r100_doorbell_deliver disambiguates by offset range and
-     *      calls r100_mailbox_set_issr() on the NPU mailbox (no
-     *      SPI — just updates the scratch register).
-     *
-     * Everything else in the 4 KB BAR4 MMIO head is stash-only —
-     * reads come back from bar4_mmio_regs[], writes stay local.
-     */
+    /* INTGR{0,1} (M6): frame → NPU mailbox INTGR → SPI.
+     * MAILBOX_BASE..END (M8a host→NPU): frame → r100_mailbox_set_issr.
+     * Other offsets: local stash only (reads serve from bar4_mmio_regs). */
     if (addr == R100_BAR4_MAILBOX_INTGR0 ||
         addr == R100_BAR4_MAILBOX_INTGR1) {
         r100_doorbell_emit(s, (uint32_t)addr, v32);
@@ -312,14 +187,7 @@ static const MemoryRegionOps r100_bar4_mmio_ops = {
     },
 };
 
-/* ========================================================================
- * M7: MSI-X reverse-direction chardev — consumes frames emitted by
- * the NPU-side r100-imsix device and fires msix_notify() for the
- * encoded vector. Frame format (matches r100-doorbell / r100-imsix):
- *   [0..3]  u32 offset   (always R100_PCIE_IMSIX_DB_OFFSET today)
- *   [4..7]  u32 db_data  (raw value FW wrote to REBELH_PCIE_MSIX_ADDR)
- * vector = db_data & R100_PCIE_IMSIX_VECTOR_MASK (11 bits).
- * ======================================================================== */
+/* M7: MSI-X ingress. Frame = (off, db_data); vector = db_data & MASK. */
 
 static int r100_msix_can_receive(void *opaque)
 {
@@ -356,10 +224,7 @@ static void r100_msix_deliver(R100NpuPciState *s, uint32_t off,
     s->msix_last_db_data = db_data;
     s->msix_last_vector = vector;
 
-    /* The NPU-side r100-imsix only accepts writes to
-     * R100_PCIE_IMSIX_DB_OFFSET today, so in practice we'll always
-     * see that value here. Validate anyway — a mismatched offset
-     * means a frame parser bug or a rogue writer. */
+    /* r100-imsix only accepts IMSIX_DB_OFFSET; validate for parser sanity. */
     if (off != R100_PCIE_IMSIX_DB_OFFSET) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "r100-npu-pci: msix frame with unexpected off=0x%x "
@@ -380,10 +245,8 @@ static void r100_msix_deliver(R100NpuPciState *s, uint32_t off,
 
     s->msix_frames_received++;
 
-    /* msix_notify is a no-op when MSI-X is disabled by the guest
-     * (driver not yet loaded / guest still in SeaBIOS / vector
-     * masked); the pending bit is latched in the PBA either way, so
-     * this is the correct primitive regardless of MSI-X state. */
+    /* msix_notify is idempotent wrt guest state: pending bit latches
+     * in PBA regardless of enable/mask — correct primitive here. */
     msix_notify(pdev, vector);
     r100_msix_emit_debug(s, off, db_data, vector, "ok");
 }
@@ -410,16 +273,8 @@ static void r100_msix_receive(void *opaque, const uint8_t *buf, int size)
     }
 }
 
-/* ========================================================================
- * M8: ISSR reverse-direction chardev — consumes frames emitted by
- * the NPU-side r100-mailbox every time FW writes an ISSR scratch
- * register. Each frame writes through to the host's BAR4 MMIO
- * register file at (bar4_off / 4) so a subsequent guest read (e.g.
- * the KMD's FW_BOOT_DONE polling on BAR4 + MAILBOX_BASE + 4*4)
- * observes the FW-provided value. Frame layout matches M6 / M7:
- *   [0..3]  u32 offset   (KMD-side BAR4 offset: MAILBOX_BASE + idx*4)
- *   [4..7]  u32 value    (raw u32 the FW stored in ISSR[idx])
- * ======================================================================== */
+/* M8a: ISSR ingress. Frame (off, val) → bar4_mmio_regs[off>>2].
+ * Drives KMD FW_BOOT_DONE visibility at BAR4+MAILBOX_BASE+0x10. */
 
 static int r100_issr_can_receive(void *opaque)
 {
@@ -459,19 +314,12 @@ static void r100_issr_deliver(R100NpuPciState *s, uint32_t off, uint32_t val)
         return;
     }
 
-    /* Mirror into the BAR4 MMIO register file so the guest driver's
-     * next readl() on the matching BAR4 offset observes `val`. The
-     * write-through happens unconditionally; no doorbell is fired
-     * (the NPU would separately set INTGR to signal the KMD to
-     * actually consume the ISSR word). */
+    /* Mirror into BAR4 MMIO reg file; no IRQ (NPU sets INTGR separately). */
     s->bar4_mmio_regs[off >> 2] = val;
     s->issr_frames_received++;
     r100_issr_emit_debug(s, off, val, "ok");
-    /* REMU-TRACE: stderr visible in remucli run output.
-     * Echoes the post-write read so we can tell apart
-     *   (a) chardev callback didn't fire
-     *   (b) it fired but the store to bar4_mmio_regs was clobbered later
-     * when FW_BOOT_DONE isn't reaching the guest. */
+    /* Trace for FW_BOOT_DONE visibility debug — did chardev fire, and
+     * does the store survive subsequent KMD writes? */
     fprintf(stderr, "REMU-TRACE: issr_deliver off=0x%x val=0x%x "
             "stored=0x%x received=%" PRIu64 "\n",
             off, val, s->bar4_mmio_regs[off >> 2],
@@ -505,17 +353,8 @@ static void r100_npu_pci_realize(PCIDevice *pdev, Error **errp)
     R100NpuPciState *s = R100_NPU_PCI(pdev);
     Error *err = NULL;
 
-    /* BAR0 — DDR window. Declared at 64 GB (next pow2 >= 36 GB) so the
-     * driver's rebel_check_pci_bars_size() passes. QEMU maps anonymous
-     * RAM with MAP_NORESERVE semantics for the tail, so the host
-     * doesn't actually commit 64 GB unless the guest touches every
-     * page.
-     *
-     * If `memdev` is wired, splice the backend's MR over offset 0 so
-     * stores from the x86 guest land in the shared /dev/shm file that
-     * the NPU-side QEMU has mmap'd as well; a plain RAM subregion
-     * fills offsets [backend_size, BAR0_SIZE). Otherwise the whole BAR
-     * is one plain RAM MR (M3-compatible bring-up path). */
+    /* BAR0 DDR (64 GB, lazy-committed). With memdev: backend @ offset 0
+     * (shared /dev/shm with NPU QEMU) + lazy-RAM tail. Without: full RAM. */
     if (s->hostmem) {
         MemoryRegion *shared = host_memory_backend_get_memory(s->hostmem);
         uint64_t shared_size = memory_region_size(shared);
@@ -556,10 +395,8 @@ static void r100_npu_pci_realize(PCIDevice *pdev, Error **errp)
                      PCI_BASE_ADDRESS_MEM_PREFETCH,
                      &s->bar0_ddr);
 
-    /* BAR2 — ACP / SRAM window. Holds CP firmware logbuf, CPU config,
-     * MMU page tables and (in PF mode) the vserial SMC shim per
-     * rebel.c. Plain RAM is sufficient until the NPU-side models
-     * actually serve reads here. */
+    /* BAR2 ACP/SRAM: CP logbuf, CPU config, MMU page tables, vserial
+     * shim. Plain RAM until NPU-side models serve reads here. */
     memory_region_init_ram(&s->bar2_acp, OBJECT(s), "r100.bar2.acp",
                            R100_BAR2_ACP_SIZE, &err);
     if (err) {
@@ -572,22 +409,9 @@ static void r100_npu_pci_realize(PCIDevice *pdev, Error **errp)
                      PCI_BASE_ADDRESS_MEM_PREFETCH,
                      &s->bar2_acp);
 
-    /* BAR4 — Doorbell window. Always an 8 MB container so the driver's
-     * size check (rebel_check_pci_bars_size) passes. Layout depends on
-     * whether the `doorbell` chardev is wired:
-     *
-     *   - With chardev (M6+): small 4 KB MMIO head overlay (priority
-     *     10) at offset 0 intercepts MAILBOX_INTGR0/INTGR1 writes and
-     *     forwards them as 8-byte frames to the NPU process. The rest
-     *     of the 4 KB head is RAM-backed from an internal register
-     *     file so the MAILBOX_BASE payload (0x80..0x180) is readable.
-     *     A lazy RAM region (priority 0) covers the full 8 MB as a
-     *     fallback for offsets outside the MMIO window.
-     *   - Without chardev (M3/M5 behaviour): plain 8 MB RAM, no MMIO
-     *     overlay. Lets BAR4 mmaps from the guest driver still work
-     *     for single-QEMU bring-up runs.
-     *
-     * 32-bit non-prefetchable to match real PCIe topology. */
+    /* BAR4 Doorbell: 8 MB container, 32-bit non-prefetch. lazy-RAM @
+     * prio 0; 4 KB MMIO head @ prio 10 installed when doorbell or
+     * issr chardev is wired (M6/M8a). */
     memory_region_init(&s->bar4_container, OBJECT(s),
                        "r100.bar4.container", R100_BAR4_DB_SIZE);
     memory_region_init_ram(&s->bar4_ram, OBJECT(s),
@@ -598,24 +422,8 @@ static void r100_npu_pci_realize(PCIDevice *pdev, Error **errp)
     }
     memory_region_add_subregion_overlap(&s->bar4_container, 0,
                                         &s->bar4_ram, 0);
-    /*
-     * Install the 4 KB MMIO overlay when ANY of the three bridges
-     * is wired:
-     *   - doorbell (M6): host → NPU INTGR writes intercepted by
-     *                    r100_bar4_mmio_write.
-     *   - msix     (M7): not touched by BAR4 — doesn't need the
-     *                    overlay, but listed for completeness.
-     *   - issr     (M8): NPU → host ISSR values arrive on the
-     *                    chardev and are mirrored into
-     *                    bar4_mmio_regs[]; subsequent guest
-     *                    readls at BAR4 + MAILBOX_BASE + idx*4
-     *                    flow through r100_bar4_mmio_read, not
-     *                    the plain RAM region.
-     *
-     * When neither doorbell nor issr is connected the whole BAR is
-     * plain RAM — the M3/M5 behaviour that pre-M6 single-QEMU runs
-     * still rely on for lazy BAR mmaps.
-     */
+    /* MMIO head needed for M6 doorbell egress (writes) OR M8a ISSR
+     * shadow reads. Without either, full-BAR lazy RAM matches M3/M5. */
     if (qemu_chr_fe_backend_connected(&s->doorbell_chr) ||
         qemu_chr_fe_backend_connected(&s->issr_chr)) {
         memory_region_init_io(&s->bar4_mmio, OBJECT(s),
@@ -628,11 +436,8 @@ static void r100_npu_pci_realize(PCIDevice *pdev, Error **errp)
                      PCI_BASE_ADDRESS_SPACE_MEMORY,
                      &s->bar4_container);
 
-    /* BAR5 — MSI-X. Driver requires the BAR to be >= 1 MB, but the
-     * actual MSI-X table (32 * 16 B) + PBA (4 B) is tiny. We allocate
-     * the full 1 MB as RAM and let msix_init() overlay its MMIO regions
-     * for the table (offset 0) and PBA (offset 64 KB); unused area
-     * stays as plain RAM so mmap() from the guest still works. */
+    /* BAR5 MSI-X: driver wants 1 MB BAR; table @0 / PBA @64 KB overlay
+     * via msix_init, rest lazy RAM for guest mmap compatibility. */
     memory_region_init_ram(&s->bar5_msix, OBJECT(s), "r100.bar5.msix",
                            R100_BAR5_MSIX_SIZE, &err);
     if (err) {
@@ -649,42 +454,25 @@ static void r100_npu_pci_realize(PCIDevice *pdev, Error **errp)
         return;
     }
 
-    /* Enable every MSI-X vector so the guest driver's unmask path
-     * isn't a prerequisite for host-side msix_notify() to latch a
-     * pending bit — matches silicon (PBA bits latch independent of
-     * the mask register). */
+    /* Enable every vector — PBA latches regardless of guest mask, so
+     * unmask isn't a prerequisite for msix_notify (matches silicon). */
     for (int i = 0; i < R100_NUM_MSIX; i++) {
         msix_vector_use(pdev, i);
     }
 
     pci_config_set_interrupt_pin(pdev->config, 1);
 
-    /* M7: If a msix chardev is wired, install the receive handler.
-     * Mirror of the doorbell ingress path on the NPU side: complete
-     * 8-byte frames get parsed and forwarded to msix_notify(). */
     if (qemu_chr_fe_backend_connected(&s->msix_chr)) {
         qemu_chr_fe_set_handlers(&s->msix_chr,
                                  r100_msix_can_receive,
                                  r100_msix_receive,
-                                 NULL,   /* event */
-                                 NULL,   /* be_change */
-                                 s,
-                                 NULL,   /* context */
-                                 true);  /* set_open */
+                                 NULL, NULL, s, NULL, true);
     }
-
-    /* M8: If an issr chardev is wired, install the receive handler.
-     * Same shape as the M7 ingress but writes through to the BAR4
-     * MMIO register file instead of msix_notify(). */
     if (qemu_chr_fe_backend_connected(&s->issr_chr)) {
         qemu_chr_fe_set_handlers(&s->issr_chr,
                                  r100_issr_can_receive,
                                  r100_issr_receive,
-                                 NULL,   /* event */
-                                 NULL,   /* be_change */
-                                 s,
-                                 NULL,   /* context */
-                                 true);  /* set_open */
+                                 NULL, NULL, s, NULL, true);
     }
 }
 

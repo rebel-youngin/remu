@@ -87,14 +87,9 @@
 #define R100_ROT_MAILBOX_M2_BASE    0x1FF02A0000ULL
 #define R100_ROT_PVT_CON_BASE       0x1FF0260000ULL
 
-/*
- * Master DWC_SSI QSPI controller used by BL1's qspi_boot_config() and by
- * FreeRTOS / BL31 flash-service SMC path (NOR_FLASH_SVC_ERASE_4K etc.) via
- * q-sys drivers/qspi_boot/qspi_boot.c. See QSPI_ROT_REG_OFFSET (0x0500000)
- * + PRIVATE_BASE in rebel_h_baseoffset.h; the FW driver hard-codes the
- * private alias as its reg_base. Reg window is ~0x150 bytes of the Synopsys
- * DWC_SSI register layout (struct dwc_ssi_synopsys in qspi_boot.h).
- */
+/* Master DWC_SSI QSPI (BL1 qspi_boot_config + FreeRTOS/BL31 NOR SMC).
+ * FW reg_base = private alias (rebel_h_baseoffset.h QSPI_ROT_REG_OFFSET
+ * + PRIVATE_BASE). ~0x150 B DWC_SSI regs. */
 #define R100_QSPI_ROT_BASE          0x1FF0500000ULL
 #define R100_QSPI_ROT_PRIVATE_BASE  0x1E00500000ULL
 #define R100_QSPI_ROT_REG_SIZE      0x0000010000ULL  /* 64 KB, same as other SFR blocks */
@@ -129,14 +124,9 @@
 #define R100_DCL1_PVT_CON0_BASE     0x1FF2920000ULL
 #define R100_DCL1_PVT_CON1_BASE     0x1FF2930000ULL
 
-/*
- * Each DCLx CFG block is 1 MB wide (ends at the corresponding CMU base).
- * It packs together the 8 DNC slots (0x000000..0x00E000, stride 0x2000),
- * the 16 SHM banks (0x010000..0x013C00, stride 0x400), and the MGLUE /
- * RDSN-head control block (0x020000). q-cp's shm_init / rdsn_init poll
- * status bits in these regions from CP1 during task init; see
- * src/machine/r100_dnc.c.
- */
+/* DCLx CFG: 1 MB. Packs 8 DNC slots (stride 0x2000), 16 SHM banks
+ * (stride 0x400), MGLUE/RDSN-head at 0x020000. q-cp shm_init/rdsn_init
+ * poll status from CP1 — see r100_dnc.c. */
 #define R100_DCL_CFG_SIZE           0x100000ULL
 
 /* Within a DCL block (offsets from R100_DCLx_CFG_BASE) */
@@ -196,22 +186,12 @@
 #define R100_DRAM_SYSREG_BASE       0x1FF7010000ULL
 #define R100_DRAM_CNTL_BASE         0x1FF7400000ULL
 
-/* --- QSPI NOR flash staging region ---
- *
- * The R100 board has a single serial-NOR flash connected via QSPI. The FW's
- * flash_nor_read() driver memcpy's directly from (FLASH_BASE_ADDR + offset),
- * so the flash must be visible to the CPU as plain memory. In silicon this
- * is the DWC QSPI controller's memory-mapped "direct read" window; on each
- * chiplet the same physical flash is visible at the same local address.
- *
- * Layout (see external/ssw-bundle/.../rebel_h_img_info.h):
- *   0x00000 - 0x7FFFF : board/binning/HW-CFG/SW-CFG area (partition 0)
- *   0x5E000           : NVMEM_FLASH_HW_CFG_ADDR (read by print_ucie_link_speed)
- *   0x80000+          : GPT partition 1 (tboot_s, tboot_p0/p1, tboot_u/n, ...)
- *
- * A blank (zero-filled) flash is enough to unblock BL1: the hw-cfg magic-code
- * check misses and the FW falls back to default UCIe speed.
- */
+/* Board QSPI NOR flash (CPU-visible via DWC direct-read window, same
+ * local addr on each chiplet). FW flash_nor_read memcpy's (FLASH_BASE +
+ * off). Layout (rebel_h_img_info.h):
+ *   0x00000..0x7FFFF : part 0 HW-CFG/SW-CFG; 0x5E000 = NVMEM_HW_CFG
+ *   0x80000+         : GPT part 1 (tboot_*)
+ * Blank flash is enough for BL1 (hw-cfg magic-miss → default UCIe speed). */
 #define R100_FLASH_BASE             0x1F80000000ULL
 #define R100_FLASH_SIZE             0x0004000000ULL  /* 64 MB */
 
@@ -219,19 +199,9 @@
 #define R100_PCIE_INTMEM_BASE       0x1FF8000000ULL
 #define R100_PCIE_CMU_BASE          0x1FF8100000ULL
 #define R100_PCIE_SYSREG_BASE       0x1FF8110000ULL
-/*
- * PCIe Samsung-IPM mailbox cluster: 17 contiguous 4 KB SFR blocks at
- * 0x1FF8160000..0x1FF8170FFF — VF0..VF15 first, then PF. Base points to
- * VF0 (the block q-sys CA73 listens on; see mailbox_data[IDX_MAILBOX_
- * PCIE_VF0] in external/ssw-bundle/.../drivers/mailbox/mailbox.c for
- * __TARGET_CP==0). PF is where the host KMD's BAR4 PCIe TLPs physically
- * land on silicon, and where q-sys's bootdone_notify_to_host(PCIE_PF)
- * writes FW_BOOT_DONE into ISSR[4].
- *
- * Both blocks need an r100-mailbox QEMU device so FW→host ISSR egress
- * (PF) and host→NPU INTGR ingress (VF0, via r100-doorbell) both land on
- * a real peripheral — see src/machine/r100_soc.c for the topology.
- */
+/* PCIe Samsung-IPM mailbox cluster: VF0..VF15 + PF, 4 KB stride. Base =
+ * VF0 (q-sys CA73 listener on __TARGET_CP==0). PF hosts the KMD BAR4
+ * TLP landing and bootdone_notify_to_host(PCIE_PF). See r100_soc.c. */
 #define R100_PCIE_MAILBOX_BASE      0x1FF8160000ULL  /* cluster base = VF0 */
 #define R100_PCIE_MAILBOX_SFR_STRIDE 0x1000ULL       /* per-function SFR */
 #define R100_PCIE_MAILBOX_PF_BASE   (R100_PCIE_MAILBOX_BASE + \
@@ -275,26 +245,17 @@
 #define R100_CPMU_PRIVATE_BASE          0x1E00230000ULL  /* PMU private alias */
 #define R100_SYSREG_CP0_PRIVATE_BASE    0x1E01010000ULL  /* SYSREG_CP0 private alias (RVBAR etc.) */
 #define R100_SYSREG_CP0_SIZE            0x10000ULL       /* 64KB */
-/*
- * SYSREG_CP1 mirrors SYSREG_CP0 at a fixed +0x800000 offset (both in the
- * config-space and private-alias windows). BL2 on each chiplet releases
- * its own CP1.cpu0 via rebel_h_pm.c:set_rvbar(), which writes RVBAR to
- * SYSREG_CP0_OFFSET + PER_SYSREG_CP*1. The PMU device reads the RVBAR
- * back from the matching private alias when CPU_CONFIGURATION triggers
- * the release.
- */
+/* SYSREG_CP1 mirrors CP0 at +0x800000 (cfg + private). BL2
+ * set_rvbar writes CP0+PER_SYSREG_CP*1; PMU reads back from
+ * matching private alias on CPU_CONFIGURATION release. */
 #define R100_PER_SYSREG_CP              0x00800000ULL
 #define R100_SYSREG_CP1_PRIVATE_BASE    (R100_SYSREG_CP0_PRIVATE_BASE + \
                                          R100_PER_SYSREG_CP)
 
-/*
- * Catch-all RAM window for the per-chiplet "private" alias region.
- * Covers SYSREG_ROT_PRIVATE, SYSREG_SYSREMAP_PRIVATE, CPMU_PRIVATE,
- * OTP_CON_PRIVATE, OTP_CON_CPU_PRIVATE, GPIO_ROT_PRIVATE, etc. The specific
- * device aliases (PMU, SYSREMAP) are layered on top via overlap regions.
- */
+/* Private-alias catch-all (SYSREG_ROT/SYSREMAP/CPMU/OTP/GPIO PRIVATE).
+ * PMU/SYSREMAP device aliases layer on top via overlap. */
 #define R100_PRIVATE_WIN_BASE           0x1E00000000ULL
-#define R100_PRIVATE_WIN_SIZE           0x0010000000ULL  /* 256 MB (full chiplet private alias) */
+#define R100_PRIVATE_WIN_SIZE           0x0010000000ULL  /* 256 MB */
 
 /* ========================================================================
  * PCIe sub-controller block (catch-all for pmu_release_cm7 writes)
@@ -325,28 +286,17 @@
 #define R100_PMU_CPU0_OPTION            0x2008
 #define R100_PMU_PERCPU_OFFSET          0x0080
 #define R100_PMU_PERCLUSTER_OFFSET      0x0200
-/*
- * CPU_CONFIGURATION power-on/off encoding — see platform_def.h:
- *   AUTOMATIC_WAKEUP  = BIT(31)
- *   INITIATE_WAKEUP   = 0xF << 16
- *   LOCAL_PWR_ON      = 0xF
- */
+/* CPU_CONFIGURATION bits (platform_def.h): AUTO_WAKEUP=BIT(31),
+ * INITIATE_WAKEUP=0xF<<16, LOCAL_PWR_ON=0xF. */
 #define R100_PMU_CPU_CFG_LOCAL_PWR_MASK 0xFU
-/*
- * SYSREG_CP* per-CPU RVBAR offsets (see platform_def.h).
- * PMU reads these back to route a released vCPU to the FW-chosen entry.
- */
+/* SYSREG_CP* per-CPU RVBAR (platform_def.h). PMU reads back on release. */
 #define R100_SYSREG_RVBARADDR0_LOW      0x354
 #define R100_SYSREG_RVBARADDR0_HIGH     0x358
 #define R100_SYSREG_PERCPU_RVBAR_OFF    0x8
 #define R100_PMU_CP0_NONCPU_CONFIG      0x2400
 #define R100_PMU_CP0_NONCPU_STATUS      0x2404
-/*
- * FW computes the per-cluster NONCPU register address as
- * CP0_NONCPU_CONFIG/STATUS + PERNONCPU_OFFSET (0x40) * cluster, so CP1
- * NONCPU_CONFIG = 0x2440 and CP1 NONCPU_STATUS = 0x2444. Needed by
- * BL2's plat_pmu_cl_on(cluster=CP1) which polls 0x2444 & 0xF == 0xF.
- */
+/* Per-cluster NONCPU = CP0_NONCPU + PERNONCPU_OFFSET*cluster.
+ * BL2 plat_pmu_cl_on(CP1) polls CP1_NONCPU_STATUS (0x2444) & 0xF == 0xF. */
 #define R100_PMU_PERNONCPU_OFFSET       0x0040
 #define R100_PMU_CP1_NONCPU_CONFIG      (R100_PMU_CP0_NONCPU_CONFIG + \
                                          R100_PMU_PERNONCPU_OFFSET)
@@ -375,12 +325,8 @@
 #define R100_PMU_RBCV11_CONFIG          0x4360
 #define R100_PMU_RBCV11_STATUS          0x4364
 
-/* PMU status values */
-/*
- * RST_STAT is a bitmask of reset reasons. The FW's FSB() macro spins
- * until at least one bit is set. PINRESET (bit 16) indicates POR/cold
- * boot — see rebel_h_pmu.h.
- */
+/* PMU status values. RST_STAT is a bitmask of reset reasons; FW's
+ * FSB() spins until any bit is set. PINRESET = POR/cold (rebel_h_pmu.h). */
 #define R100_PMU_COLD_RESET             (1U << 16)  /* PINRESET */
 #define R100_PMU_CHIPLET_RESET          0x1
 #define R100_PMU_CPU_STATUS_ON          0xF
@@ -411,109 +357,35 @@
 #define R100_DOORBELL_BAR_ID        4
 #define R100_MSI_BAR_ID             5
 
-/* BAR4 doorbell trigger offsets (see
- * external/ssw-bundle/.../kmd/rebellions/rebel/rebel_regs.h:143-144).
- * Writes to these MAILBOX_INTGR registers from the x86 guest are the
- * actual doorbells — host QEMU forwards them to the NPU as an 8-byte
- * (offset, value) frame over the M6 chardev. */
+/* BAR4 doorbell: INTGR triggers + MAILBOX_BASE shadow of NPU
+ * ISSR0..63 (rebel_regs.h MAILBOX_BASE/SIZE; ipm_samsung +0x80).
+ * M6/M8a chardev bridge details in src/machine/r100_doorbell.c. */
 #define R100_BAR4_MAILBOX_INTGR0    0x00000008u  /* db_idx >= 32 */
 #define R100_BAR4_MAILBOX_INTGR1    0x0000001cu  /* db_idx <  32 */
-/*
- * BAR4 MAILBOX payload window — the host-visible shadow of the NPU
- * Samsung-IPM mailbox's ISSR0..ISSR63 scratch registers (the 256 B
- * body at offsets 0x80..0x180 in both BAR4 and the NPU SFR, matching
- * rebel_regs.h:MAILBOX_BASE / MAILBOX_SIZE and struct ipm_samsung's
- * issr0..63 layout at +0x80).
- *
- * M8 extends the M6 chardev bridge so host BAR4 writes into this
- * window egress NPU-ward as `(offset, value)` frames on the same
- * `doorbell` chardev (offset distinguishes INTGR trigger vs. ISSR
- * payload on the NPU side), and the NPU-side r100-mailbox re-emits
- * every local ISSR write on a new `issr` chardev back to the host so
- * BAR4 readers see a live mirror. That makes FW_BOOT_DONE (ISSR[4])
- * and reset-counter (ISSR[7]) traffic a plain MMIO exchange for the
- * kmd, with no protocol-specific code anywhere in the device model.
- */
-#define R100_BAR4_MAILBOX_BASE      0x00000080u  /* MAILBOX_BASE in KMD */
-#define R100_BAR4_MAILBOX_COUNT     64u          /* 0x80..0x180, 64 u32 */
+#define R100_BAR4_MAILBOX_BASE      0x00000080u
+#define R100_BAR4_MAILBOX_COUNT     64u          /* 64 u32 = 256 B */
 #define R100_BAR4_MAILBOX_END       \
     (R100_BAR4_MAILBOX_BASE + R100_BAR4_MAILBOX_COUNT * 4u)
-/* The first MMIO-trapped window of BAR4 that the host-side device
- * treats as register-backed (i.e. not lazy RAM). Covers both INTGR
- * registers at 0x8/0x1c and the MAILBOX_BASE body at 0x80..0x180. */
+/* Host-side MMIO-trapped head of BAR4 (INTGR + MAILBOX_BASE body). */
 #define R100_BAR4_MMIO_SIZE         0x1000u
 
-/*
- * Chiplet-0 PCIe mailbox SPI wiring.
- *
- * The r100-mailbox peripheral at R100_PCIE_MAILBOX_BASE has two
- * per-group IRQ outputs that follow INTMSR0 / INTMSR1 (see
- * src/machine/r100_mailbox.c). Each of its two groups gets its own
- * SPI on chiplet 0's GIC:
- *
- *   - Group 1 (INTMSR1) → SPI 185: matches mailbox_data[
- *     IDX_MAILBOX_PCIE_VF0] in external/.../drivers/mailbox/mailbox.c
- *     for __TARGET_CP==0 (cpu_id=CPU1, irq_num_low=185). That is the
- *     line CP0's FreeRTOS is prepared to accept PCIE-mailbox IRQs on
- *     when it eventually runs the q-cp ISR for this device. Host KMD
- *     writes to BAR4 MAILBOX_INTGR1 (idx < 32 in rebel_doorbell_write)
- *     land here.
- *
- *   - Group 0 (INTMSR0) → SPI 184: placeholder one-below-185. On
- *     silicon this IRQ terminates in the PCIE_CM7 subcontroller (not
- *     modelled yet), so wiring it to the CA73 GIC is diagnostic only:
- *     host writes to BAR4 MAILBOX_INTGR0 (idx >= 32, VF → CM7 path)
- *     will leave a GIC-visible assertion we can trace from HMP, but
- *     no FW ISR handles it. Revisit once M8 adds the full PCIE_CM7
- *     model.
- *
- * SPI numbers live below the 256-IRQ cap configured on each chiplet's
- * arm-gicv3 (num-irq=256), well clear of the SPI-33 UART and the
- * 144+ mailbox block the FW uses for its own internal mailboxes.
- */
+/* Chiplet-0 PCIe mailbox (r100-mailbox) SPI wiring:
+ *   SPI 185 (G1/INTMSR1) — matches mailbox_data[IDX_MAILBOX_PCIE_VF0]
+ *                          on __TARGET_CP==0 (KMD INTGR1, idx<32 path).
+ *   SPI 184 (G0/INTMSR0) — placeholder for PCIE_CM7 (not modelled);
+ *                          diagnostic only, no FW ISR subscribes.
+ * Both <256 (GIC num-irq cap), clear of SPI-33 UART. */
 #define R100_PCIE_MBX_GROUP0_SPI    184
 #define R100_PCIE_MBX_GROUP1_SPI    185
 
-/*
- * Integrated MSI-X trigger (iMSIX-DB) — FW→host reverse-direction
- * interrupt path (Phase 2, M7).
- *
- * On silicon the DW PCIe controller has two MSIX_ADDRESS_MATCH_*
- * registers that programmed the MAC to snoop all writes to a specific
- * physical address on the internal fabric; a matching write is turned
- * into a real MSI-X TLP on the wire. The FW (q-sys/q-cp) uses this
- * mechanism to signal the host driver: see pcie_msix_trigger() in
- *   external/ssw-bundle/.../FreeRTOS/Source/rbln/msix.c
- * and the matching DW driver pcie_raise_msix_irq() in
- *   external/ssw-bundle/.../drivers/pcie/pcie_dw_msix.c
- *
- * The snooped address is hard-coded by the FW (BAT.h / msix.h):
- *
- *   PCIE_IMSIX_BASE   = 0x1B_FFFF_F000   (4 KB-aligned base)
- *   PCIE_IMSIX_OFFSET = 0x          FFC   (trigger word at end of page)
- *   REBELH_PCIE_MSIX_ADDR = 0x1B_FFFF_FFFC
- *
- * The 32-bit value written encodes which function + vector to fire:
- *
- *   | 31:29 Rsvd | 28:24 PF | 23:16 VF | 15 VF-Act | 14:12 TC |
- *   | 11 Rsvd    | 10:0 Vector |
- *
- * On REMU the NPU-side `r100-imsix` device (src/machine/r100_imsix.c)
- * overlays an MMIO region at PCIE_IMSIX_BASE on the chiplet-0 CPU view
- * (single PF today); on a 4-byte write to offset IMSIX_OFFSET it emits
- * an 8-byte (offset, db_data) frame to a chardev that the host-side
- * r100-npu-pci consumes (same frame format as the M6 doorbell, just
- * flowing in the opposite direction). On the host side, the frame
- * handler extracts (db_data & IMSIX_VECTOR_MASK) and calls
- * msix_notify() on the PCI device.
- *
- * PF/VF/TC bits are accepted but ignored for now — CR03 exposes a
- * single PF and the KMD uses vectors 0..31 only. Revisit once M9 adds
- * VF-aware routing.
- */
+/* Integrated MSI-X trigger (M7, FW→host). DW PCIe on silicon snoops
+ * REBELH_PCIE_MSIX_ADDR = 0x1BFFFFFFFC; matching writes become MSI-X
+ * TLPs. db_data: [28:24]PF [23:16]VF [15]VF-Act [14:12]TC [10:0]Vec.
+ * REMU: r100-imsix MMIO overlay → (off, db_data) chardev frame →
+ * host r100-npu-pci msix_notify(). PF/VF/TC ignored (single PF today). */
 #define R100_PCIE_IMSIX_BASE        0x1BFFFFF000ULL
 #define R100_PCIE_IMSIX_SIZE        0x0000001000ULL   /* 4 KB page */
-#define R100_PCIE_IMSIX_DB_OFFSET   0x00000FFCU       /* trigger word */
+#define R100_PCIE_IMSIX_DB_OFFSET   0x00000FFCU
 #define R100_PCIE_IMSIX_VECTOR_MASK 0x000007FFU       /* db_data[10:0] */
 
 #endif /* REMU_ADDRMAP_H */

@@ -1,162 +1,127 @@
 # REMU Roadmap
 
+> **Policy**: per-fix debugging history lives in `git log`, not here.
+> Phase 1 was pruned in commit `b869d00`; Phase 2 follows the same
+> pattern. Each status row below is a one-liner + commit SHA — read
+> the commit message for rationale, alternatives rejected, and
+> post-mortem detail.
+
 ## Phase 1: FW Boot — complete
 
-**Goal**: TF-A BL1 → BL2 → BL31 → FreeRTOS boots on all 4 chiplets, with both CP0 and CP1 clusters online on every chiplet.
+**Goal**: TF-A BL1 → BL2 → BL31 → FreeRTOS on all 4 chiplets, both CP0
+and CP1 clusters online everywhere. Platform defaults to `silicon`
+(the `zebu*` profiles warn-and-build but are not part of regression).
 
-**Status**: done. `./remucli fw-build` + `./remucli run` boots every chiplet end-to-end (platform defaults to `silicon`; the `zebu*` profiles warn-and-build but no longer gate anything):
+**Success markers** (all on `./remucli run`):
 
-- CP0 on every chiplet reaches `Hello world FreeRTOS_CP` / `hw_init: done` / `REBELLIONS$` on its own UART (`output/<run>/uart{0,1,2,3}.log`).
-- All 16 CP1 vCPUs run q-cp FreeRTOS steady-state: `CP1.cpu0` in `ipm_samsung_receive`, `CP1.cpu{1,2,3}` in `taskmgr_fetch_dnc_task_worker_cp1`. Verified via `aarch64-none-elf-gdb -ex 'target remote :1234' -x tests/scripts/gdb_inspect_cp1.gdb` (pure-GDB script — the bundled `aarch64-none-elf-gdb` has no Python).
-- HILS ring tail (`output/<run>/hils.log`) drains chiplet 0's CP1 task init (DNC cdump, RDSN / SHM / RBDMA HW INFO dumps, ICPI init, CS tasks started).
-- `bootdone_task` on every chiplet reaches `BOOT_DONE - 0x...(exp: 0x...)` on its own UART, i.e. the FreeRTOS scheduler's tick interrupt is actually being delivered (this is the first thing that breaks if the generic-timer → GIC PPI wiring is missing — see `r100_soc.c` row below). The `Polling hils_check_product_info_ready...` loop and all downstream `vTaskDelay()` users progress through the FW's built-in 3 s time-out gracefully instead of wedging forever.
+- every chiplet's `uart{0,1,2,3}.log` reaches `Hello world FreeRTOS_CP`
+  / `hw_init: done` / `REBELLIONS$`
+- all 16 CP1 vCPUs in q-cp FreeRTOS steady-state (inspect with
+  `tests/scripts/gdb_inspect_cp1.gdb`, see `docs/debugging.md`)
+- every chiplet's `bootdone_task` prints `BOOT_DONE - 0x253c1f` (proves
+  generic-timer → GIC PPI delivery; see `680f964`)
+- HILS ring tail (`hils.log`) drains chiplet-0 CP1 task init
+- 32 GDB threads visible, `aarch64-none-elf-gdb` can step any of them
 
-Per-fix debugging history (MPIDR encoding, per-chiplet GIC, `CP1_NONCPU_STATUS` pre-seed, `SYSREG_CP1` triple-mount, DCL/SHM/RDSN/RBDMA register stubs, per-chiplet CP0 image staging, …) lives in `git log`.
+Phase-1 device models and infra are catalogued in
+`docs/architecture.md` (Source File Map).
 
-**Out of scope** (deliberately):
-- Single-chiplet `CHIPLET_COUNT=1` builds — target is CR03 quad, always 4 chiplets.
-- HBM3 PHY training fidelity — current stub drives `hbm3_phy_training_evt1` end-to-end on every channel; the only residual log line (`read optimal vref (vert) FAILED. No valid window found.`) is a documented FW fallback path.
-- The `-p zebu` / `zebu_ci` / `zebu_vdk` FW profiles. Still buildable, but silicon is the only configuration we boot.
+**Out of scope**: single-chiplet builds, HBM3 PHY-training fidelity,
+cycle accuracy, `-p zebu*` regression (silicon only).
 
-### Device models (`src/machine/`)
+## Phase 2: Host Drivers
 
-| File | Device | Behaviour |
-|---|---|---|
-| `r100_soc.c` | Machine type | 4 chiplets × 8 `cortex-a72` CPUs (MIDR overridden to CA73 r1p1 `0x411FD091`; MPIDR = `chiplet << 24 \| cluster << 8 \| core`, FW masks bits 24-31 when computing `plat_core_pos_by_mpidr`). Each CPU also gets two IMPDEF sysreg tables registered via `define_arm_cp_regs()` — `r100_samsung_impdef_regs` (`S1_1_C15_C14_0` cache-flush NOP) and `r100_cortex_a73_impdef_regs` (A73 `CPUACTLR/ECTLR/MERRSR_EL1` at `S3_0_C15_C0_{0,1,2}` as RAZ/WI; required by TF-A's unconditional CVE-2018-3639 workaround). One `arm-gicv3` per chiplet (`num-cpu=8`, `first-cpu-index = chiplet*8`, one 1 MB / 8-frame redistributor region: frames 0-3 = CP0.cpu0..3, 4-7 = CP1.cpu0..3) mounted in sysmem at priority 1 with priority-10 aliases in each chiplet's CPU view. Each CPU's 5 architectural generic-timer outputs (`GTIMER_PHYS/VIRT/HYP/SEC/HYPVIRT`) are wired to the matching GIC PPI inputs (`ARCH_TIMER_{NS_EL1,VIRT,NS_EL2,S_EL1,NS_EL2_VIRT}_IRQ` = PPIs 30/27/26/29/28) at intidbase `num_irq - GIC_INTERNAL + local_cpu * 32` — same layout as `hw/arm/virt.c`; without this wiring the CPU's internal timers would fire but the GIC would never see them, and FreeRTOS (which ticks on `CNTVIRQ` / PPI 27 on CA73 per `FreeRTOS_tick_config.c`) would wedge the first time any task called `vTaskDelay()`. Per-chiplet 16550 UART on dedicated chardevs, IRQ on SPI 33 of its own GIC. Shared flash RAM at `0x1F80000000`. |
-| `r100_cmu.c` | CMU | 20 blocks / chiplet; PLL-lock + mux-busy idle instantly. |
-| `r100_pmu.c` | PMU | `CPU_CONFIGURATION` → `arm_set_cpu_on(mpidr, RVBAR, EL3)` for both CP0 and CP1 (covers BL1 cold + BL31 PSCI warm). `DCL{0,1}_CONFIGURATION` → `_STATUS` mirror. `{CP0,CP1}_{NONCPU,L2}_STATUS` pre-seeded ON so `plat_pmu_cl_on(cluster)` polls pass on iteration 0. Dual-mapped cfg-space + private-alias. |
-| `r100_sysreg.c` | SYSREG | Chiplet ID via SYSREMAP. Dual-mapped. |
-| `r100_hbm.c` | HBM3 | Sparse `GHashTable` write-back (default `0xFFFFFFFF` outside PHY range / `0` inside). ICON `test_instruction_req0/req1` RMW mirror. EXTEST-aware `rd_wdr` compare-vector stub. PHY training sentinels (`phy_train_done`, `prbs_{read,write}_done`, `schd_fifo_empty_status` all "done=1"); runs `hbm3_run_phy_training` end-to-end on all 16 channels / chiplet. |
-| `r100_qspi.c` | QSPI bridge | DW SSI inter-chiplet R/W (`0x70` read, `0x80` single write, `0x83` 16-word burst) via `PRIVATE_BASE` + upper-addr latch. |
-| `r100_qspi_boot.c` | QSPI_ROT (DWC_SSI) | Status-idle + DRX `FLASH_READY\|WRITE_ENABLE_LATCH`; covers BL1 flash-load and BL31 `NOR_FLASH_SVC_*`. Dual-mapped. |
-| `r100_rbc.c` | RBC/UCIe | 6 blocks / chiplet; link-up sentinel (`scratch_reg1=0xFFFFFFFF`, `lstatus_link_status=1`). Dual-mapped. |
-| `r100_dnc.c` | DCL CFG + RBDMA | Two `r100-dnc-cluster` / chiplet covering DCL0/DCL1 cfg windows: DNC slots (`ip_ver=V1_1`, `SP_STATUS01.test_done=1`), SHM banks (`INTR_VEC.tpg_done=1` + seeded IP info), MGLUE (RDSN `STATUS0=ALL_PREPARED`, `TE{0,3}_RPT0=valid+pass`). One `r100-rbdma` / chiplet seeding `IP_INFO0..2`. Sparse `GHashTable` write-back. |
-| `r100_smmu.c` | SMMU-600 TCU | `CR0 → CR0ACK` + `GBPA.UPDATE` auto-clear. CMDQ walker: on `CMDQ_PROD` write, zeros each `CMD_SYNC.MSI_ADDRESS` and advances `CMDQ_CONS=PROD`. |
-| `r100_pvt.c` | PVT monitor | 5 / chiplet; `PVT_CON_STATUS=0x3`, per-sensor `_valid=1`. |
-| `r100_dma.c` | PL330 DMA | Fake-completion stub. |
-| `r100_logbuf.c` | HILS ring tail | 50 ms poll of chiplet 0's 2 MB `.logbuf` ring; drains `struct rl_log` to a chardev (CLI writes `output/<run>/hils.log`). |
-| `remu_addrmap.h` | — | All address constants (from `g_sys_addrmap.h`). |
+**Prerequisite**: Phase 1 complete (q-cp on CP1 services part of the
+host-facing FW interface).
 
-Additional inline RAM stubs in `r100_soc.c`: PCIe sub-controller (`PHY{0..3}_SRAM_INIT_DONE` seeded so BL1 `cm7_wait_phy_sram_init_done` exits on iteration 0), CSS600 CNTGEN (generic timer reset), inter-chiplet HBM-init mailboxes, triple-mounted `SYSREG_CP{0,1}` RAM (private alias + cfg-space overlay + chiplet-local CPU-view overlay). Chiplet-wide `unimplemented_device` catch-alls on both the config-space container and the 256 MB private-alias window.
+**Goal**: kmd loads in an x86_64 guest, probes the emulated CR03 PCI
+device, handshakes with FW, umd opens the device.
 
-### Infrastructure
+### Milestones
 
-- `r100-soc` machine type registered with `-machine` suffix.
-- `./remucli` (thin wrapper around `cli/remu_cli.py`): `build` / `run` / `status` / `gdb` / `images` / `fw-build` / `test` (M5..M8 bridge suite) / `clean` (per-run or global orphan sweeper). Every `run` invocation auto-calls the cleanup path first so re-using a `--name` after an abort is idempotent — no leftover tmpfs, sockets, or QEMU children.
-- q-sys FW source in `external/ssw-bundle` (TF-A with CA73 errata + Spectre v4 workarounds disabled in `platform.mk`).
-- `external/qemu` pinned at upstream `v9.2.0`, kept unmodified in git terms. `./remucli build` idempotently symlinks remu sources into `hw/arm/r100/`, injects `subdir('r100')` into `hw/arm/meson.build`, and re-applies `cli/qemu-patches/*.patch`. `./remucli fw-build` mirrors the same patch-idempotency dance on the firmware submodule via `cli/fw-patches/*.patch`. **Project policy: `cli/fw-patches/` is kept empty — the q-sys submodule stays byte-identical to upstream, and any unmodelled hardware block is modelled on the QEMU side rather than skipped with an `#ifdef` in firmware.** The apply plumbing is retained so developer-local debug patches dropped into the directory are still picked up; see `cli/fw-patches/README.md`. The QEMU-side patches are small, self-contained, and upstreamable as-is: `0001-arm-gicv3-first-cpu-index.patch` adds a `first-cpu-index` property so per-chiplet GIC instances bind to disjoint CPU ranges (default 0 preserves upstream behaviour); `0002-arm-gicv3-reset-cpuif-after-init.patch` makes `gicv3_init_cpuif()` call `icc_reset()` itself at the tail of each per-CPU setup, so the GIC CPU interface seeds its own reset state (ICC_BPR1_EL1, ICC_CTLR_EL1, …) independently of whether the surrounding machine flow resets the CPU again after the GIC realizes — fixes the M8b Stage 2c `assert(bpr > 0)` abort for bootstrap CPUs that would otherwise miss their ICC_* resetfn entirely. `.gitmodules` uses `ignore = dirty` so build-time mods stay off the superproject's `git status`.
-
-### Success criteria
-
-- All 4 chiplets print `Hello world FreeRTOS_CP` on their UART (both CP0 and CP1) ✓
-- Chiplet 0 discovers 3 secondary chiplets via QSPI bridge ✓
-- All 32 vCPUs (4 chiplets × 2 clusters × 4 cores) reach FreeRTOS steady-state ✓
-- GDB can step through FW code on any chiplet's CP0 or CP1 vCPU ✓ (see `docs/debugging.md`)
-
-## Phase 2: Host Drivers — in progress (M1-M8a done, M8b Stage 3 CM7-stub soft-reset handshake done)
-
-**Prerequisite**: Phase 1 complete. `q-cp` tasks on CP1 service a non-trivial slice of the host-facing FW interface, so opening the PCIe endpoint without CP1 online would hit missing task-registration paths.
-
-**Goal**: kmd loads in an x86_64 QEMU guest, probes virtual PCI device, handshakes with FW, umd opens device.
-
-### Milestone breakdown
-
-Phase 2 is sliced into 9 incremental milestones. Each one boots end-to-end and commits cleanly.
-
-| # | Milestone | Status | Deliverable |
+| # | Milestone | Status | Commit |
 |---|---|---|---|
-| M1 | Two-binary build | done | `./remucli build` produces `qemu-system-{aarch64,x86_64}` from the single pinned QEMU tree |
-| M2 | Shared-memory plumbing | done | `/dev/shm/remu-<name>/remu-shm` opened `share=on` by both QEMUs; `./remucli run --host` orchestrates both with clean signal-driven teardown |
-| M3 | `r100-npu-pci` skeleton | done | PCI function `0x1eff:0x2030` exposes BAR0/2/4/5 at the sizes `rebel.h` expects; lazy RAM backing + `msix_init` table on BAR5 |
-| M4 | Host BAR0 → shm splice | done | BAR0 is a container: shared backend at offset 0, lazy RAM on the tail. `./remucli run --host` auto-verifies via `info pci` / `info mtree` / `/proc/<pid>/maps` |
-| M5 | NPU DRAM → shm splice | done | Chiplet-0 DRAM is a container: same shared backend at offset 0, lazy RAM on the tail past the FW image region. `tests/m5_dataflow_test.py` proves coherency both ways |
-| M6 | Doorbell path (guest → FW) | done | BAR4 `MAILBOX_INTGR0/1` writes on the x86 side emit 8-byte `(offset, value)` frames over a Unix socket chardev; NPU-side `r100-doorbell` parses frames and injects them into the chiplet-0 `r100-mailbox` peripheral (Samsung `ipm` SFR at `R100_PCIE_MAILBOX_BASE`), which asserts its two masked-status outputs on chiplet-0 GIC SPI 184 (Group0) / SPI 185 (Group1) — matching silicon routing. `tests/m6_doorbell_test.py` drives synthetic frames end-to-end |
-| M7 | MSI-X path (FW → guest) | done | Reverse direction. NPU-side `r100-imsix` MMIO trap at `R100_PCIE_IMSIX_BASE` (`0x1B_FFFF_F000`) catches 4-byte stores to `R100_PCIE_IMSIX_DB_OFFSET` (`0xFFC` = `REBELH_PCIE_MSIX_ADDR` on silicon), emits 8-byte `(offset, db_data)` frames over a second Unix socket chardev (mirror of M6's wire format). Host-side `r100-npu-pci` consumes the frames, decodes `vector = db_data & 0x7FF`, and calls `msix_notify()` — identical semantics to the DW PCIe MAC's address-match-to-MSI-X-TLP path. `tests/m7_msix_test.py` drives synthetic frames end-to-end (3 accepted + 1 oor + 1 bad-offset) and checks the per-frame debug tail + `GUEST_ERROR` log entries |
-| M8a | ISSR bridge (both dirs) | done | Bidirectional plumbing for the Samsung-IPM `ISSR0..63` scratch words on both sides. NPU → host: `r100-mailbox` emits every MMIO-path ISSR write as an 8-byte `(bar4_offset, value)` frame on a third Unix socket chardev (`issr`); host-side `r100-npu-pci` consumes the frames, mirrors them into `bar4_mmio_regs[]` so subsequent guest `readl`s at `BAR4 + MAILBOX_BASE + idx*4` return the live value. Host → NPU: host BAR4 writes into the `MAILBOX_BASE` (0x80..0x180) range of the 4 KB MMIO overlay egress on the *existing* M6 `doorbell` chardev (offset disambiguates INTGR-triggers vs ISSR payload on the NPU side); `r100-doorbell` routes `MAILBOX_BASE` frames to `r100_mailbox_set_issr()` which updates the NPU-side ISSR without asserting any INTGR SPI — and without re-emitting the value on the `issr` chardev, so the update does not loop back. `tests/m8_issr_test.py` drives synthetic frames end-to-end for both directions, verifying host BAR4 readback mirrors NPU writes, NPU ISSR registers mirror host writes, and out-of-range offsets log `GUEST_ERROR` on both sides. No protocol-specific state lives in the device model — this is pure MMIO transport |
-| M8b | `FW_BOOT_DONE` + `TEST_IB` ring | in progress (Stages 1, 2, 2c, 3a done; Stage 3b starting) | First real protocol driven over the M8a ISSR plumbing: kmd polls BAR4+MAILBOX_BASE+0x10 for `FW_BOOT_DONE` (0xFB0D in ISSR[4]), then kmd and q-cp HIL exchange `TEST_IB` messages on the shared-DRAM ring. Approach (a): real kmd against full q-sys FW end-to-end. Staged (see next table) |
-| M9 | DNC stub + trivial umd job | pending | umd opens `/dev/rebellions0`, submits a zero-op job, DNC stub signals completion via MSI-X |
+| M1 | Two-binary build (`qemu-system-{aarch64,x86_64}` from one tree) | done | `7b03328` |
+| M2 | Shared `/dev/shm/remu-<name>/remu-shm`, signal-driven teardown | done | `7b03328` |
+| M3 | `r100-npu-pci` skeleton (vendor 0x1eff / dev 0x2030, four BARs, MSI-X table) | done | `7b03328` |
+| M4 | BAR0 splices shared memdev at offset 0, lazy RAM on tail | done | `e03b00f` |
+| M5 | NPU chiplet-0 DRAM splices the same memdev; `tests/m5_dataflow_test.py` | done | `72c98f0` |
+| M6 | BAR4 INTGR → `doorbell` chardev → `r100-doorbell` → `r100-mailbox` → chiplet-0 GIC SPI 184/185 | done | `85b76bb`, `500856b` |
+| M7 | `r100-imsix` MMIO trap at `0x1BFFFFF000 + 0xFFC` → `msix` chardev → `msix_notify()` | done | `db3d1df` |
+| M8a | ISSR bridge both dirs (NPU→host on new `issr` chardev, host→NPU on same `doorbell` wire, offset-disambiguated) | done | `cd24aa9` |
+| M8b | `FW_BOOT_DONE` + `TEST_IB` ring on top of M8a | in progress (3a done, 3b active) | see sub-table |
+| M9  | DNC stub + trivial umd job | pending | — |
+
+Each milestone boots end-to-end and the run-harness (`./remucli run --host`)
+auto-verifies its bridge via `info pci/mtree/qtree` — see the checklist in
+`CLAUDE.md` for the exact HMP strings.
 
 #### M8b sub-milestones
 
-| Stage | What | Status |
-|---|---|---|
-| 1 — FW side | q-sys FreeRTOS writes `0xFB0D` to PF-mailbox ISSR[4] and `r100-mailbox` egresses it on the `issr` chardev. `issr.log` shows `off=0x90 val=0xfb0d`. Required two device-model fixes — seeding `CM7_BOOT_DONE_STATE` bits in chiplet-0 PMU so `bootdone_task` doesn't wait on the unmodelled Cortex-M7 sub-controller, and instantiating a **second** `r100-mailbox` at `R100_PCIE_MAILBOX_PF_BASE` (`0x1FF8170000`) alongside the existing VF0 instance because `bootdone_notify_to_host(PCIE_PF)` picks `idx = IDX_MAILBOX_PCIE_PF = 16` → physical `0x1FF8170090`. Originally shipped with a firmware-side `REMU_FAST_BOOTDONE` shortcut in `bootdone_service.c` that skipped the unmodelled late-boot phases; that patch was dropped once the project adopted the "no FW patches — model in QEMU instead" policy. Removing the shortcut uncovered one prerequisite device-model gap: CA73 CPUs' architectural generic-timer outputs (`GTIMER_PHYS/VIRT/HYP/SEC/HYPVIRT`) were not wired to the per-chiplet GIC's PPI inputs, so FreeRTOS's CNTVIRQ tick (PPI 27) fired inside the CPU but the GIC never saw it — the first `vTaskDelay()` in `bootdone_task` then wedged the scheduler on every chiplet. Fixed in `r100_soc.c` by adding the standard `qdev_connect_gpio_out()` timer→GIC PPI wiring (same layout as `hw/arm/virt.c`, intidbase = `num_irq - GIC_INTERNAL + local_cpu * 32`). With the timer wired, `bootdone_task` now runs to completion on all 4 chiplets against the upstream firmware — CL0/1/3 print `BOOT_DONE - 0x253c1f (exp: 0x253c1f)` on their UARTs, but CL2 falls short at `bootdone_mask 0x01000101 (exp: 0x01010101)` because its `CHIPLET_RESET_FLAG` read back `RESET_STATUS: 0x7F` (vs `0x80` on the other three chiplets) and the chiplet took the "reboot" branch in `set_chiplet_reset_flag()` instead of writing its `CL_BOOTDONE` byte into the shared `QUAD_CL_BOOTDONE_MASK` region. That `RESET_STATUS` comes from `CPMU_PRIVATE + 0x404` (`_SET_RESET_STATUS` macro) — the next unmodelled PMU register, to be stubbed per-chiplet in `r100_pmu.c`. | done (CL2 reset-status stub pending; tracked below as next Stage-1 follow-up) |
-| 2a — guest mount dir | `guest/` shared-folder payload: `build-kmd.sh`, `build-guest-image.sh`, `setup.sh`, `README.md`. The `.ko` artifacts (`rebellions.ko`, `rblnfs.ko`) are kernel-vermagic-locked so they're gitignored — rebuild via `./guest/build-kmd.sh`. | done |
-| 2b — guest QEMU wiring | `_build_host_cmd` auto-wires `-kernel images/x86_guest/bzImage -initrd images/x86_guest/initramfs.cpio.gz -fsdev local,id=remu,path=<repo>/guest -device virtio-9p-pci,fsdev=remu,mount_tag=remu` when the staged artifacts exist, and flips x86 `-cpu qemu64 → -cpu max` whenever a kernel is configured (kmd is built with `-march=native` and emits BMI2 that traps `#UD` on `qemu64`). New CLI flags: `--guest-kernel`, `--guest-initrd`, `--guest-share`, `--no-guest-boot`, `--guest-cmdline-extra`. `./guest/build-guest-image.sh` fetches the Ubuntu-HWE `linux-{image,modules}-$(uname -r)` + `busybox-static` debs via `apt-get download` (no sudo), builds a ~1.3 MB cpio initramfs with busybox + 4 9p-stack modules + a `/init` that mounts the share and runs `setup.sh`. Validated end-to-end: guest boots → 9p mounts → `setup.sh` finds `1eff:2030` at `0000:00:05.0` → `insmod rebellions.ko` → driver prints `pci main[1eff,2030]` and the correct four BAR sizes → 32 MSI-X vectors registered → `rebel_soft_reset + 0`. | done |
-| 2c — GIC `bpr>0` assertion | Immediately after `rebel_soft_reset`, NPU QEMU aborts with `arm_gicv3_cpuif.c:1004: icc_gprio_mask: Assertion \`bpr > 0'`. Root cause: the ARM CPU is cold-reset exactly once at `qdev_realize` time (CPU 0, the BSP); the GIC's `gicv3_init_cpuif` installs the ICC_* coproc regs (including `icc_reset` as `.resetfn`) only *afterwards*, during the GIC's own realize, so the BSP's one and only cold reset runs on an empty cp-regs table and `icc_reset` never fires. Secondary CPUs are unaffected because `start-powered-off=true` makes their realize-time reset a no-op and `arm_set_cpu_on` resets them again after the GIC is realized. Consequence: `ICC_BPR1_EL1` on CPU 0 stays at the C-zero-init value 0 for the whole run; the first SPI asserted as Group 1 NS into CPU 0 trips the spec-mandated `bpr > 0` assertion. This is the `rebel_soft_reset` INTGR0 write landing on SPI 184. Fix at the proper layer (upstream-ready QEMU patch: `cli/qemu-patches/0002-arm-gicv3-reset-cpuif-after-init.patch`): `gicv3_init_cpuif()` calls `icc_reset(&cpu->env, NULL)` itself at the tail of each per-CPU setup, after pribits/prebits/vpribits/vprebits are final and every ICC_* / ICH_* CPReg has been registered. This makes the CPU interface self-seed its own reset state (ICC_BPR1_EL1 = `icc_min_bpr_ns` = 3 for CA73 `prebits == 5`, etc.) so the fix works regardless of how the surrounding machine orders CPU realize vs. GIC realize vs. system reset — and works equally for upstream single-GIC machines (virt, sbsa-ref) and our multi-GIC chiplet machine. No machine-side workaround required. Verified end-to-end: Phase 2 (`--host`) clears the assertion, doorbell now accepts Group-1 INTGR1 frames (`off=0x1c`) that previously never reached the NPU; Phase 1 still reaches `Notify Host - PF FW_BOOT_DONE` with no regression. | done |
-| 3a — KMD soft-reset handshake (CM7-stub) | `kmd`'s `rbln_init` probe path always rings `REBEL_DOORBELL_SOFT_RESET` on BAR4 `MAILBOX_INTGR0` bit 0 and then blocks in `rebel_reset_done` waiting for PF.ISSR[4] to re-become `FW_BOOT_DONE` (0xFB0D). On silicon this is `PCIE_CM7`'s job — it catches the INTGR on SPI 184, runs `pcie_soft_reset_handler` (PMU cluster down/up), and the CA73-side `bootdone_task` rewrites ISSR[4] on the way back up. REMU models neither CM7 nor the PMU reset sequence, and on the CA73 FreeRTOS target the PCIe mailbox ISR resolves to `default_cb` (the handler table in `drivers/pcie/pcie_mailbox_callback.c` is gated `FREERTOS_PORT != GCC_ARM_CA73`, verified against `drivers/pcie/CMakeLists.txt`). Fix: synthesise CM7's terminal side-effect **entirely in QEMU**. `src/machine/r100_doorbell.c` grows a `pf-mailbox` link, and its `R100_BAR4_MAILBOX_INTGR0` branch now (a) when bit 0 is set, calls a new helper `r100_mailbox_cm7_stub_write_issr(pf_mailbox, 4, 0xFB0D)` on `src/machine/r100_mailbox.c` that updates ISSR state *and* emits the NPU→host `issr` egress frame — same wire as any real FW ISSR write — so the host BAR4 shadow converges to 0xFB0D and `rebel_reset_done` observes it; (b) relays any leftover non-SOFT_RESET bits onto VF0.INTGR1 for visibility. No firmware-side patching hooks this — the CA73 FW never runs a `SOFT_RESET` handler in REMU, intentionally. Verified: `output/<name>/host/serial.log` now shows `rebel_soft_reset + 0` followed by `FW_BOOT_DONE` back-to-back, unblocking kmd probe. Debug-visibility upgrade: NPU QEMU's `stderr` is now captured at `output/<name>/npu/qemu.stderr.log`, so `fprintf(stderr, ...)` breadcrumbs from device models (e.g. `REMU-TRACE: doorbell_deliver off=0x8 val=0x1 ...`) survive alongside the UART logs. (The stale `REMU_FAST_BOOTDONE` block that briefly lived in the uncompiled `pcie_mailbox_callback.c` was removed as part of this stage; the trace breadcrumbs that temporarily accompanied it were later retired when the project adopted the "no FW patches — model in QEMU instead" policy — see `cli/fw-patches/README.md`.) | done |
-| 3b — `TEST_IB` ring | Stage 3a cleared — kmd gets `FW_BOOT_DONE` reliably. Next block: `kmd` proceeds into `rebel_hw_init`, which hits a soft-lockup after ~25 s (visible at `rebel_hw_init+0x439/0xa60` in guest `serial.log`). This is the subsequent wait-state — almost certainly another unmodelled FW-side wait (likely the shared-DRAM `TEST_IB` ring handshake or a post-bootdone scratch-register poll). Next step: decode what `rebel_hw_init` is polling for (offset + expected value), then either wire it up on the FW side or synthesise it in QEMU analogous to the CM7-stub. | in progress |
+| Stage | What | Status | Commit |
+|---|---|---|---|
+| 1 | q-sys FreeRTOS writes `0xFB0D` to PF.ISSR[4]; second `r100-mailbox` instance at `R100_PCIE_MAILBOX_PF_BASE`; `CM7_BOOT_DONE_STATE` bits in chiplet-0 PMU; generic-timer → GIC PPI wiring | done | `1ef7208`, `680f964` |
+| 2a | `guest/` shared-folder payload (build-kmd.sh, build-guest-image.sh, setup.sh) | done | `1ef7208` |
+| 2b | `--host` auto-wires `-kernel/-initrd/-fsdev virtio-9p`, `-cpu max` for BMI2 in kmd | done | `1ef7208` |
+| 2c | GIC CPU-interface `bpr > 0` assertion fix (QEMU patch `0002-arm-gicv3-reset-cpuif-after-init.patch`) | done | `985fd58` |
+| 3a | KMD soft-reset handshake: `r100-doorbell` CM7-stub synthesises `FW_BOOT_DONE` → PF.ISSR[4] in QEMU, bypassing unmodelled PCIE_CM7 | done | `a01d2b5` |
+| 3b | `rebel_hw_init` soft-lockup at t+25 s — decode the next unmodelled FW wait-state (likely `TEST_IB` ring or another ISSR poll) and either wire it on FW side or synthesise in QEMU | in progress | — |
 
-### Components (current state after M8a)
+### Components (current state)
 
-- **`r100-npu-pci`** (`src/host/r100_npu_pci.c`): x86-side PCI device, vendor/device `0x1eff:0x2030`, four BARs. BAR0 splices in a `HostMemoryBackend` via the `memdev` link at offset 0 (M4); BAR2 is plain lazy RAM; BAR4 is a container with a 4 KB MMIO head overlay (priority 10) that intercepts `MAILBOX_INTGR0/1` (0x8 / 0x1c) and emits `(offset, value)` frames on the `doorbell` chardev (M6), plus the `MAILBOX_BASE` payload range (0x80..0x180) — writes egress on the *same* `doorbell` chardev (the NPU side routes them to ISSR by offset), reads return values written-through from NPU-emitted `issr` frames (M8a); the remaining BAR4 space is lazy RAM. BAR5 carries the 32-vector MSI-X table + PBA (`msix_vector_use` called for every vector so `msix_notify` latches PBA bits even before the guest driver enables masking). An optional `msix` `CharBackend` consumes 8-byte `(offset, db_data)` frames emitted by the NPU-side `r100-imsix` and calls `msix_notify(pdev, db_data & 0x7FF)` (M7). An optional `issr` `CharBackend` consumes 8-byte `(bar4_offset, value)` frames emitted by the NPU-side `r100-mailbox` on every local ISSR write and mirrors them into `bar4_mmio_regs[]` so the guest sees a live shadow (M8a). The 4 KB MMIO overlay is installed whenever *either* `doorbell` or `issr` is connected.
-- **`r100-soc` machine** (`src/machine/r100_soc.c`): `memdev` string property splices chiplet 0 DRAM over a shared `HostMemoryBackend` (M5). `doorbell` / `doorbell-debug` string properties resolve to `Chardev` instances; the machine instantiates a chiplet-0 `r100-mailbox` at `R100_PCIE_MAILBOX_BASE` (`0x1FF8160000`, VF0 block, mapped with `sysbus_mmio_map_overlap` at priority 10 so it outranks the `cfg_mr` catch-all) and wires its two masked-status outputs to chiplet-0 GIC SPI 184 (Group0) / SPI 185 (Group1), matching the silicon routing described in the Samsung `ipm` driver. M8b Stage 1 adds a **second** `r100-mailbox` at `R100_PCIE_MAILBOX_PF_BASE` (`0x1FF8170000` = VF0 + 16 × `R100_PCIE_MAILBOX_SFR_STRIDE`) to catch `bootdone_notify_to_host(PCIE_PF)` writes; the PF instance is the one carrying the `issr` chardev (QEMU's `CharBackend` can only frontend one device). A `r100-doorbell` sysbus device is linked to the VF0 mailbox via `DEFINE_PROP_LINK` `mailbox` (M6) and, as of M8b Stage 3a, a second `DEFINE_PROP_LINK` `pf-mailbox` to the PF instance so the doorbell's CM7-stub can synthesise the `SOFT_RESET` → ISSR[4] re-emit. `msix` / `msix-debug` string properties cause the machine to instantiate a chiplet-0 `r100-imsix` device overlaid at `R100_PCIE_IMSIX_BASE` (`0x1B_FFFF_F000`) on the global sysmem (visible through every chiplet's `sysmem_alias`) so FW stores on CA73 cores and the CM7 PCIe subsystem both reach it (M7). `issr` / `issr-debug` string properties are forwarded to the PF `r100-mailbox` instance as `issr-chardev` / `issr-debug-chardev` and drive the NPU → host ISSR egress (M8a + M8b Stage 1).
-- **`r100-mailbox`** (`src/machine/r100_mailbox.c`): models the Samsung `ipm_samsung` register block. Implements `MCUCTRL` / `INTGR{0,1}` (write-1-to-set) / `INTCR{0,1}` (write-1-to-clear) / `INTMR{0,1}` (mask) / `INTSR{0,1}` (raw pending) / `INTMSR{0,1}` (masked pending = `INTSR & ~INTMR`) / `MIF_INIT` / `IS_VERSION` / `ISSR0..63`. The two `qemu_irq` outputs (`irq[0]` for INTMSR0, `irq[1]` for INTMSR1) are asserted whenever the corresponding masked-pending word is non-zero. Exposes `r100_mailbox_raise_intgr(group, val)` so the doorbell can inject pending bits without round-tripping through MMIO, `r100_mailbox_set_issr(idx, val)` so the doorbell's M8a host-write path can update scratch words without re-emitting them on the chardev, and `r100_mailbox_cm7_stub_write_issr(idx, val)` (M8b Stage 3a) which does the opposite — updates an ISSR word **and** emits the NPU→host `issr` egress frame, mimicking a CM7-side MMIO ISSR write. Every MMIO-path ISSR write emits an 8-byte `(bar4_offset, value)` frame on the optional `issr-chardev` (M8a); an `issr-debug-chardev` echoes `issr off=... val=... status=... count=...` per frame.
-- **`r100-doorbell`** (`src/machine/r100_doorbell.c`): receives 8-byte `(offset, value)` frames on a `CharBackend`. Offsets in the `MAILBOX_INTGR0` slot: bit 0 (`PCIE_DOORBELL_SOFT_RESET`) triggers the **CM7-relay shortcut** (M8b Stage 3a) — the doorbell calls `r100_mailbox_cm7_stub_write_issr(pf_mailbox, 4, 0xFB0D)` on its optional `pf-mailbox` link to directly re-emit `FW_BOOT_DONE` into PF.ISSR[4] and egress it to the host, bypassing the unmodelled PCIE_CM7 + `pcie_soft_reset_handler` entirely; any leftover non-SOFT_RESET bits are relayed onto VF0.INTGR1 for visibility via `r100_mailbox_raise_intgr()`. `MAILBOX_INTGR1` slots call `r100_mailbox_raise_intgr()` (M6 trigger path); offsets in the `MAILBOX_BASE` payload range (0x80..0x180) call `r100_mailbox_set_issr()` (M8a host → NPU scratch-write path, no INTGR side-effect); everything else logs `GUEST_ERROR`. Optional debug chardev traces every frame as `doorbell off=... val=... status={intgr,issr,bad-offset} count=...` lines; the same events also land in `output/<name>/npu/qemu.stderr.log` via `fprintf(stderr, ...)` when something needs cross-checking against QEMU-internal state.
-- **`r100-imsix`** (`src/machine/r100_imsix.c`): 4 KB MMIO window at `R100_PCIE_IMSIX_BASE`. Trapped 4-byte writes to offset `0xFFC` (`R100_PCIE_IMSIX_DB_OFFSET` = `REBELH_PCIE_MSIX_ADDR & 0xFFF`) emit 8-byte `(offset, db_data)` frames on a `CharBackend` to the host side. FW stores to the full `REBELH_PCIE_MSIX_ADDR` (`0x1B_FFFF_FFFC`) land here on CA73 / CM7 alike — silicon's DW PCIe `MSIX_ADDRESS_MATCH_*` snoop is modelled by this device's MMIO trap. Non-doorbell offsets inside the page read/write a local register file so FW side-probes don't trip QEMU's unimplemented-device log. Optional `debug-chardev` echoes every emitted frame as `imsix off=0xfff db_data=0x... vector=... count=...` lines.
-- **Shared memory bridge**: `memory-backend-file` at `/dev/shm/remu-<name>/remu-shm`, opened with `share=on` by both QEMUs. Declared on x86 side as `-device r100-npu-pci,memdev=remushm`, on NPU side as `-machine r100-soc,memdev=remushm`.
-- **Doorbell bridge (M6+M8a)**: Unix socket chardev at `output/<name>/host/doorbell.sock`. Host QEMU owns the listener (`server=on,wait=off`), NPU QEMU is a `reconnect=1` client. Carries both INTGR triggers (M6) and `MAILBOX_BASE` scratch writes (M8a) on the same wire, disambiguated by offset on the NPU side. ASCII trace of each NPU-observed frame at `output/<name>/doorbell.log` (including the M8a `status=issr` tag).
-- **iMSIX-DB bridge (M7)**: second Unix socket chardev at `output/<name>/host/msix.sock`, same wire format as M6 but flowing in the opposite direction (NPU → host). Host owns the listener; NPU `reconnect=1` connects as client. Per-frame ASCII trace at `output/<name>/msix.log` (`msix off=... db_data=... vector=... status={ok,oor,bad-offset} count=...`).
-- **ISSR bridge (M8a)**: third Unix socket chardev at `output/<name>/host/issr.sock`, same 8-byte `(bar4_offset, value)` frame format as M6/M7, flowing NPU → host. Emitted by `r100-mailbox` on every MMIO ISSR write (MAILBOX_BASE+4*idx), consumed by `r100-npu-pci` which mirrors the value into `bar4_mmio_regs[]`. Per-frame ASCII trace at `output/<name>/issr.log` (`issr off=... val=... status={ok,bad-offset} count=...`). Reverse direction (host → NPU) reuses the M6 doorbell socket.
-- **`./remucli run --host`**: dual-QEMU orchestrator. Auto-verifies every bridge end-to-end: M4/M5 via PCI enumeration + host/NPU `info mtree` + `/proc/<pid>/maps`; M6 via host `info mtree` (`r100.bar4.mmio` overlay) + NPU `info qtree` (both `r100-doorbell` and `r100-mailbox` present); M7 via NPU `info mtree` (`r100-imsix` subregion at `0x1B_FFFF_F000`) + host `info mtree` (`r100.bar5.msix` with `msix-table` / `msix-pba` overlays, proving `msix_init` succeeded); M8a via NPU `info qtree` showing `issr-chardev = "issr"` on the PF `r100-mailbox` and host `info qtree` showing `issr = "issr"` on `r100-npu-pci`. M8b Stage 2 adds optional `-kernel / -initrd / -fsdev virtio-9p` wiring: when `images/x86_guest/{bzImage,initramfs.cpio.gz}` exist (built by `./guest/build-guest-image.sh`), the x86 QEMU boots a real Ubuntu HWE kernel with a busybox initramfs that mounts `guest/` at `/mnt/remu` and runs `setup.sh` (which insmod's `rebellions.ko` and waits for the kmd to print `FW_BOOT_DONE` in dmesg). Both QEMU monitors exposed as unix sockets under `output/<name>/{host,npu}/monitor.sock`.
+Device models + chardev bridges — see `docs/architecture.md`
+"Source File Map" for per-file behaviour, and `docs/debugging.md`
+for the HMP sanity recipes.
+
+- `src/host/r100_npu_pci.c` — x86-side endpoint. BAR0 splice, BAR2 lazy RAM,
+  BAR4 container with 4 KB MMIO head (INTGR + MAILBOX_BASE shadow),
+  BAR5 MSI-X + RAM fill.
+- `src/machine/r100_soc.c` — machine. Splices memdev into chiplet-0 DRAM,
+  instantiates two PF/VF0 `r100-mailbox` blocks, optional `r100-doorbell`
+  / `r100-imsix` gated on chardev machine-props.
+- `src/machine/r100_mailbox.c` — Samsung IPM SFR (`INTGR/INTCR/INTMR/INTSR/INTMSR/ISSR0..63`),
+  two `qemu_irq` outs tracking INTMSR. API: `r100_mailbox_raise_intgr`,
+  `r100_mailbox_set_issr`, `r100_mailbox_cm7_stub_write_issr`.
+- `src/machine/r100_doorbell.c` — reassembles 8-byte `(offset, value)` frames,
+  routes by offset into mailbox INTGR / ISSR / CM7-stub.
+- `src/machine/r100_imsix.c` — 4 KB MMIO trap at `R100_PCIE_IMSIX_BASE`,
+  emits `(offset, db_data)` frames on write to `0xFFC`.
+- Three Unix-socket chardevs under `output/<name>/host/`: `doorbell.sock`
+  (M6+M8a, host → NPU), `msix.sock` (M7, NPU → host), `issr.sock`
+  (M8a, NPU → host).
+- `./remucli run --host` orchestrates both QEMUs + auto-verifies bridges;
+  M8b Stage 2 adds optional `-kernel/-initrd/-fsdev virtio-9p` wiring when
+  `images/x86_guest/{bzImage,initramfs.cpio.gz}` are staged.
 
 ### Pending components
 
-- **DNC stub**: accepts tasks, immediately generates completion interrupt (M9).
-- **HDMA stub**: performs actual memcpy between DRAM regions (M9).
+- DNC stub (accept task, generate completion MSI-X) — M9
+- HDMA stub (actual memcpy between DRAM regions) — M9
 
 ### Success criteria
 
 - `insmod rebellions.ko` succeeds, device probes, BAR sizes match
-- MSI-X vectors allocated, `FW_BOOT_DONE` handshake completes
-- Message ring `TEST_IB` passes
-- umd opens device, creates context, submits simple job
+- MSI-X vectors allocated, `FW_BOOT_DONE` handshake completes (M8b 3a ✓)
+- `TEST_IB` ring passes (M8b 3b)
+- umd opens device, creates context, submits simple job (M9)
 
 ## Phase 3: Full Inference
 
-**Goal**: Real tensor operations on emulated DNCs.
+Real tensor ops on emulated DNCs.
 
-### New components
-
-- **DNC behavioral model**: parse task descriptors, execute tensor operations on host CPU
-- **HDMA scatter-gather**: full DMA with address translation
-- **SMMU model**: honor page tables set by FW
-- **Performance counters**: return synthetic cycle counts
-
-## Peripheral Model Fidelity
-
-| Peripheral | Phase 1 | Phase 2 | Phase 3 |
-|------------|---------|---------|---------|
-| CMU (20 blocks x4) | PLL-lock stub | Same | Same |
-| PMU (x4) | Boot-status + `CPU_CONFIGURATION` → `arm_set_cpu_on/off` for both CP0 and CP1 (BL1 cold, BL2 CP1 release, BL31 PSCI warm); DCL status mirror; `{CP0,CP1}_{NONCPU,L2}_STATUS` pre-seeded ON so `plat_pmu_cl_on(cluster)` polls pass on iteration 0 for either cluster. `read_rvbar()` indexes `SYSREG_CP0_PRIVATE + cluster * PER_SYSREG_CP` so both clusters share the same code path. M8b Stage 1: chiplet-0 `BOOT_LOG_ADDR` read returns `CM7_BOOT_DONE_STATE` bits ORed in so `bootdone_task` doesn't block on the unmodelled Cortex-M7 PCIe sub-controller | TZPC enforcement | Same |
-| SYSREG_CP{0,1} (x4) | RAM (RVBAR), triple-mounted per chiplet: private alias + cfg-space overlay inside `cfg_mr` (absolute cross-chiplet form) + chiplet-local overlay in the per-chiplet CPU view (local form) | Same | Same |
-| GIC600 (x4) | Four `arm-gicv3` instances (num-cpu=8 each, one 8-frame redistributor region per GIC), mounted into the owning chiplet's CPU view at priority 10 at the FW-hardcoded chiplet-local `R100_GIC_DIST_BASE` / `R100_GIC_REDIST_CP0_BASE` | Same (cross-chiplet SPI routing if ever needed) | Same |
-| UART (x4) | Per-chiplet 16550 on dedicated chardevs + HILS ring tail; each UART's IRQ wired to SPI 33 of its own chiplet's GIC | Same | Same |
-| Timer | QEMU built-in + CSS600 CNTGEN stub | Same | Same |
-| QSPI bridge | Cross-chiplet R/W via `PRIVATE_BASE` + upper-addr latch | Same | Same |
-| QSPI_ROT (DWC_SSI) | Status-idle + `FLASH_READY\|WRITE_ENABLE_LATCH` DRX stub | Same | Same |
-| RBC/UCIe (6 x4) | Link-ready stub + PMU RBC status=ON | Same | Same |
-| DMA (PL330) | Fake-completion stub | Stub | Behavioral model |
-| PCIe sub-controller | RAM stub (pmu_release_cm7 writes + PHY{0..3}_SRAM_INIT_DONE seed) | Real model | Same |
-| PCIe/doorbell | N/A | Shared-mem bridge (M4/M5) + BAR4 MMIO overlay → chardev frame → `r100-mailbox` INTGR → chiplet-0 GIC SPI 184/185 (M6). M8a extends same chardev wire to carry `MAILBOX_BASE` payload writes → `r100_mailbox_set_issr()` | Same |
-| `r100-mailbox` (Samsung `ipm` SFR, PCIe instance) | N/A | Full `INTGR/INTCR/INTMR/INTSR/INTMSR/ISSR0..63` register model; two instances — VF0 at `R100_PCIE_MAILBOX_BASE` (`0x1FF8160000`, wired to chiplet-0 GIC SPI 184 / 185, receives M6 doorbell INTGR); PF at `R100_PCIE_MAILBOX_PF_BASE` (`0x1FF8170000` = VF0 + 16×`R100_PCIE_MAILBOX_SFR_STRIDE`, carries the `issr` chardev so `bootdone_notify_to_host(PCIE_PF)` writes to ISSR[4] egress to the host). M6 doorbell asserts INTGR via `r100_mailbox_raise_intgr()`; M8a exposes `r100_mailbox_set_issr()` for host-direction writes and emits every MMIO ISSR write on the `issr` chardev for NPU→host shadow | Same | Full set of mailbox instances modelled |
-| `r100-imsix` (DW PCIe iMSIX-DB trap) | N/A | 4 KB MMIO window at `R100_PCIE_IMSIX_BASE` (`0x1B_FFFF_F000`); 4-byte stores to offset `0xFFC` (`REBELH_PCIE_MSIX_ADDR` low 12 bits) emit 8-byte `(offset, db_data)` frames on the `msix` chardev → host-side `r100-npu-pci` → `msix_notify(db_data & 0x7FF)` (M7) | Same | Full silicon-accurate DW PCIe MAC with per-PF/VF MSI-X TLP generation |
-| DNC (16 x4) | Register-window stub via DCL CFG row (ip_ver + SP test) | Return-success task dispatch | Behavioral model |
-| HDMA (x4) | N/A | Memcpy | Scatter-gather |
-| HBM3 (x4) | Sparse-writeback + ICON RMW mirror + EXTEST-aware `rd_wdr` sentinels + PHY fail/busy default 0 with `phy_train_done` / `prbs_{read,write}_done` / `schd_fifo_empty_status` overrides | Same | Same |
-| DCL CFG / SHM / MGLUE (x4 × 2 DCLs) | `r100-dnc-cluster` sparse stub: DNC `ip_ver=V1_1` + `SP_STATUS01.test_done=1`, SHM `INTR_VEC.tpg_done=1` + seeded IP info, RDSN `STATUS0=ALL_PREPARED` + `TE{0,3}_RPT0=valid+pass` | Behavioral (DNC task dispatch) | Full behavioral model |
-| RBDMA (x4) | `r100-rbdma` sparse stub: seeded `IP_INFO0..2` (rel_date, ver, chiplet_id) | Stub → real HDMA | Behavioral model |
-| SMMU TCU (x4) | CR0/GBPA mirror + CMDQ walker (CMD_SYNC MSI=0 + auto-advance CONS) | Bypass | Translation model |
-| Mailboxes (x4) | Shared RAM (HBM-init handshake) | Same | Same |
+- **DNC behavioral model** — parse task descriptors, execute on host CPU
+- **HDMA scatter-gather** — full DMA with address translation
+- **SMMU model** — honour FW page tables (today: bypass)
+- **Performance counters** — synthetic cycle counts
 
 ## Timing Considerations
 
-REMU is purely functional — no timing model. Implications:
+REMU is purely functional. Consequences:
 
-- PLL locks, DMA, and HBM training complete instantly
-- Timeout paths in FW may never trigger
-- Race conditions that depend on hardware timing may not reproduce
+- PLL / DMA / HBM training complete instantly
+- FW time-out paths may never trigger
+- Hardware-timing race conditions may not reproduce
 - Performance counter values are meaningless
-- FreeRTOS tick timer fires correctly, but wall-clock ratios differ
+- FreeRTOS tick fires, but wall-clock ratios differ
 
-For timing-sensitive tests, annotated delays can be added to device models later.
+Annotated delays can be added per-device if a future workload needs them.
