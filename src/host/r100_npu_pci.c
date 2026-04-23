@@ -242,7 +242,7 @@ static uint64_t r100_bar4_mmio_read(void *opaque, hwaddr addr, unsigned size)
         return 0;
     }
     v = s->bar4_mmio_regs[idx];
-    /* REMU_HOST_TRACE: log reads of the FW_BOOT_DONE slot so we can
+    /* REMU-TRACE: log reads of the FW_BOOT_DONE slot so we can
      * correlate KMD poll timing with issr_deliver timestamps. */
     if (addr >= 0x80 && addr < 0x180) {
         fprintf(stderr, "REMU-TRACE: bar4_mmio_read off=0x%x -> 0x%x\n",
@@ -260,7 +260,7 @@ static void r100_bar4_mmio_write(void *opaque, hwaddr addr, uint64_t val,
 
     if (idx < ARRAY_SIZE(s->bar4_mmio_regs)) {
         s->bar4_mmio_regs[idx] = v32;
-        /* REMU_HOST_TRACE: log KMD writes to the mailbox region so
+        /* REMU-TRACE: log KMD writes to the mailbox region so
          * we can spot a late clear that would overwrite the
          * 0xfb0d emitted by the NPU. */
         if (addr >= 0x80 && addr < 0x180) {
@@ -467,7 +467,7 @@ static void r100_issr_deliver(R100NpuPciState *s, uint32_t off, uint32_t val)
     s->bar4_mmio_regs[off >> 2] = val;
     s->issr_frames_received++;
     r100_issr_emit_debug(s, off, val, "ok");
-    /* REMU_HOST_TRACE: stderr visible in remucli run output.
+    /* REMU-TRACE: stderr visible in remucli run output.
      * Echoes the post-write read so we can tell apart
      *   (a) chardev callback didn't fire
      *   (b) it fired but the store to bar4_mmio_regs was clobbered later

@@ -158,24 +158,21 @@ on) copies the 6 CA73 binaries into `images/`. Toolchains are taken from
 
 Before invoking `build.sh`, `fw-build` idempotently applies every
 `cli/fw-patches/*.patch` to the q-sys submodule — same
-forward/reverse check dance as `cli/qemu-patches/`. These carry the
-REMU-side tweaks that let the unmodified upstream firmware boot all
-the way to `FW_BOOT_DONE` inside a purely functional emulator:
+forward/reverse check dance as `cli/qemu-patches/`. **Project policy:
+`cli/fw-patches/` is kept empty.** The q-sys submodule stays
+byte-identical to upstream; any unmodelled hardware block that would
+hang or `-EBUSY` the boot is modelled on the QEMU side (a `src/machine/`
+or `src/host/` stub, however minimal), never skipped with an `#ifdef`
+in firmware. The plumbing stays in place so a developer can drop a
+**local, uncommitted** debug patch into the directory while bisecting
+a wedge and have `./remucli fw-build` pick it up — see
+`cli/fw-patches/README.md`.
 
-- `0001-bootdone-remu-fast-path.patch`: `REMU_FAST_BOOTDONE` shortcut in
-  `bootdone_service.c` — skips the unmodelled late-boot phases (RoT
-  handshake, DVFS voltage, sysinfo broadcast over HBM mailboxes) that
-  would otherwise block `bootdone_task` short of
-  `bootdone_notify_to_host(PCIE_PF)`.
-- `0002-host-path-trace.patch`: `REMU_HOST_TRACE` breadcrumbs in
-  `ipm_samsung_isr`, `bootdone_task`, and (latent, not compiled on
-  CA73) the PCIe soft-reset dispatch path — prints entry/exit with
-  `inst` / `cpu_id` / `chan` / `val` so the NPU's soft-reset sequence
-  is traceable on `uart0.log`.
-
-The runtime-side counterpart to the firmware `SOFT_RESET` handler is
-the CM7-stub in `src/machine/r100_doorbell.c` (M8b Stage 3a) — see
-the BAR4 row above and `docs/debugging.md` for the handshake recipe.
+The runtime-side example of this policy is the CM7-stub in
+`src/machine/r100_doorbell.c` (M8b Stage 3a), which synthesises the
+terminal side-effect of the unmodelled PCIE_CM7 `SOFT_RESET` handler
+entirely in QEMU — see the BAR4 row above and `docs/debugging.md` for
+the handshake recipe.
 
 ## Project layout
 

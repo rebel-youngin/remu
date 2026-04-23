@@ -98,7 +98,10 @@ the single pinned QEMU tree (`./remucli build` → `qemu-system-aarch64`
 │  │    trap @ R100_PCIE_IMSIX_BASE (M7) ✓      │  │
 │  │    └─ 4-byte write @ off 0xFFC emits       │  │
 │  │       (offset, db_data) frame to host      │  │
-│  │  GIC600, per-chiplet 16550 UART, Timer     │  │
+│  │  GIC600 per chiplet (8 CPUs each),         │  │
+│  │    CPU gtimer-outs wired to GIC PPIs       │  │
+│  │    (CNTVIRQ = PPI 27 → FreeRTOS tick)      │  │
+│  │  per-chiplet 16550 UART                    │  │
 │  └────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────┘
 ```
@@ -203,7 +206,7 @@ All device models follow the QEMU QOM (QEMU Object Model) pattern:
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | QEMU CPU model | `cortex-a72` + MIDR override to 0x411FD091 (CA73 r1p1) + per-CPU IMPDEF sysreg stubs (`r100_cortex_a73_impdef_regs` in `r100_soc.c`) | Functionally closest to CA73 in QEMU. r1p1 MIDR skips the *revision-gated* CA73 errata whose workarounds probe IMPDEF sysregs cortex-a72 doesn't model. The remaining CA73 workarounds that TF-A compiles in **unconditionally** (notably CVE-2018-3639, `erratum_cortex_a73_3639_wa`) still read/write `S3_0_C15_C0_{0,1,2}` — we register those encodings as RAZ/WI via `define_arm_cp_regs()` so BL1 no longer traps with "Undefined Instruction" before the UART comes up. Cache-timing side-channel mitigations are a no-op on an emulator without a cache model, so RAZ/WI is behaviorally correct. |
-| GIC model | Single GICv3 for all 32 CPUs | Simpler than per-chiplet GIC; sufficient for Phase 1 |
+| GIC model | One `arm-gicv3` per chiplet (`num-cpu=8`, `first-cpu-index=chiplet*8`) | Matches silicon (each chiplet has its own GIC600); the `first-cpu-index` property is added by `cli/qemu-patches/0001-arm-gicv3-first-cpu-index.patch` so multiple GIC instances bind to disjoint CPU ranges without colliding on ICC_* cpreg registration. Each CPU's 5 architectural generic-timer outputs (`GTIMER_PHYS/VIRT/HYP/SEC/HYPVIRT`) are wired to that chiplet's GIC PPI inputs (`ARCH_TIMER_{NS_EL1,VIRT,NS_EL2,S_EL1,NS_EL2_VIRT}_IRQ` = PPIs 30/27/26/29/28) using the same `intidbase = num_irq - GIC_INTERNAL + local_cpu * 32` layout `hw/arm/virt.c` uses — without this the ARM architectural timer fires internally but the GIC never sees it, so PPI 27 (`CNTVIRQ`, FreeRTOS's CA73 tick source per `FreeRTOS_tick_config.c`) never delivers and `vTaskDelay()` wedges forever. |
 | QSPI bridge | Address-space read/write | Uses QEMU's `address_space_read/write` for cross-chiplet access |
 | UART priority | `memory_region_add_subregion_overlap` prio=10 | UART must take precedence over config space container |
 | Machine name | `r100-soc-machine` | QEMU requires `-machine` suffix for `MachineClass` types |
@@ -214,7 +217,7 @@ All device models follow the QEMU QOM (QEMU Object Model) pattern:
 
 | File | Device | Instances | Key Behavior |
 |------|--------|-----------|--------------|
-| `r100_soc.c` | Machine type | 1 | Creates chiplets, per-chiplet CPU views, CPUs, GIC, per-chiplet UARTs, mailbox RAM. Per CPU: spoofs MIDR to CA73 r1p1 and installs two IMPDEF sysreg tables via `define_arm_cp_regs()` — `r100_samsung_impdef_regs` (Samsung L1/L2 cache-flush SYS op at `S1_1_C15_C14_0`) and `r100_cortex_a73_impdef_regs` (A73 `CPUACTLR/ECTLR/MERRSR_EL1` at `S3_0_C15_C0_{0,1,2}`; unblocks TF-A's CVE-2018-3639 WA) |
+| `r100_soc.c` | Machine type | 1 | Creates chiplets, per-chiplet CPU views, CPUs, per-chiplet GIC (GICv3, 8 CPUs × 4 chiplets, `first-cpu-index` patched in), per-chiplet UARTs, mailbox RAM. Per CPU: spoofs MIDR to CA73 r1p1 and installs two IMPDEF sysreg tables via `define_arm_cp_regs()` — `r100_samsung_impdef_regs` (Samsung L1/L2 cache-flush SYS op at `S1_1_C15_C14_0`) and `r100_cortex_a73_impdef_regs` (A73 `CPUACTLR/ECTLR/MERRSR_EL1` at `S3_0_C15_C0_{0,1,2}`; unblocks TF-A's CVE-2018-3639 WA). Also wires each CPU's 5 generic-timer GPIO-out lines (`GTIMER_PHYS/VIRT/HYP/SEC/HYPVIRT`) to the matching per-chiplet GIC PPI inputs (`ARCH_TIMER_{NS_EL1,VIRT,NS_EL2,S_EL1,NS_EL2_VIRT}_IRQ`) so FreeRTOS's CNTVIRQ (PPI 27) tick actually reaches the GIC — without this, `vTaskDelay()` wedges forever and `bootdone_task` never runs past `hils_check_product_info_ready()` |
 | `r100_cmu.c` | CMU (Clock) | 20 per chiplet | PLL lock = instant, mux_busy = 0 |
 | `r100_pmu.c` | PMU (Power) | 1 per chiplet | Cold reset, all CPUs/clusters ON; `CPU_CONFIGURATION` → `arm_set_cpu_on(mpidr, RVBAR, target_el=3)` at FW-written RVBAR (covers BL1's QSPI-driven cold-boot release, BL2's direct CP1 release, and BL31's PSCI CPU_ON warm-boot release); `read_rvbar()` indexes `SYSREG_CP0_PRIVATE + cluster * PER_SYSREG_CP` so the same path serves CP0 and CP1; DCL config→status mirror |
 | `r100_sysreg.c` | SYSREG | 1 per chiplet | Returns chiplet ID (0-3); CP0 and CP1 RAM triple-mounted per chiplet (private alias + cfg_mr alias + per-chiplet CPU view overlay) — CP0 at `0x1E01010000` / `0x1FF1010000`, CP1 at `0x1E01810000` / `0x1FF1810000` |

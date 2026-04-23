@@ -21,7 +21,9 @@
 #include "hw/boards.h"
 #include "hw/qdev-properties.h"
 #include "hw/arm/armv7m.h"
+#include "hw/arm/bsa.h"
 #include "hw/intc/arm_gicv3.h"
+#include "hw/intc/arm_gic_common.h"
 #include "hw/char/pl011.h"
 #include "hw/char/serial-mm.h"
 #include "hw/misc/unimp.h"
@@ -35,6 +37,7 @@
 #include "exec/address-spaces.h"
 #include "target/arm/cpu.h"
 #include "target/arm/cpregs.h"
+#include "target/arm/gtimer.h"
 #include "qapi/qmp/qlist.h"
 #include "r100_soc.h"
 
@@ -1197,6 +1200,48 @@ static void r100_soc_init(MachineState *machine)
                                qdev_get_gpio_in(cpudev, ARM_CPU_VIRQ));
             sysbus_connect_irq(gbd, local + 3 * cpus_per_gic,
                                qdev_get_gpio_in(cpudev, ARM_CPU_VFIQ));
+
+            /*
+             * Wire each CPU's generic-timer outputs back into the GIC PPI
+             * inputs. Without this the ARM architectural timers fire
+             * internally inside target/arm/helper.c (gt_update_irq →
+             * qemu_set_irq on cpu->gt_timer_outputs[]) but nothing is
+             * listening, so the GIC never sees the interrupt and the
+             * corresponding CPU never wakes from wfi.
+             *
+             * On CA73/R100 FreeRTOS's FreeRTOS_tick_config.c wires its
+             * tick to CNTVIRQ (PPI 27 = ARCH_TIMER_VIRT_IRQ), so without
+             * this wiring vTaskDelay() never fires and any task that
+             * blocks on delay wedges forever — notably bootdone_task's
+             * hils_check_product_info_ready() poll.
+             *
+             * Layout mirrors hw/arm/virt.c: the CPU device publishes 5
+             * unnamed gpio-outs at indices GTIMER_PHYS..GTIMER_HYPVIRT;
+             * the GICv3 gpio-in layout is
+             *   [0..num_irq-GIC_INTERNAL-1]         SPIs
+             *   [num_irq-GIC_INTERNAL + i*32 + ppi] PPIs for CPU i
+             * (see gicv3_init_irqs_and_mmio in arm_gicv3_common.c).
+             *
+             * We pass num-irq = 256 to the GIC, so the base index for
+             * this CPU's PPIs is (256 - 32) + local*32.
+             */
+            {
+                static const int gt_ppi[NUM_GTIMERS] = {
+                    [GTIMER_PHYS]    = ARCH_TIMER_NS_EL1_IRQ,      /* 30 */
+                    [GTIMER_VIRT]    = ARCH_TIMER_VIRT_IRQ,        /* 27 */
+                    [GTIMER_HYP]     = ARCH_TIMER_NS_EL2_IRQ,      /* 26 */
+                    [GTIMER_SEC]     = ARCH_TIMER_S_EL1_IRQ,       /* 29 */
+                    [GTIMER_HYPVIRT] = ARCH_TIMER_NS_EL2_VIRT_IRQ, /* 28 */
+                };
+                const int intidbase = (256 - GIC_INTERNAL) + local * 32;
+
+                for (unsigned t = 0; t < NUM_GTIMERS; t++) {
+                    qdev_connect_gpio_out(
+                        cpudev, t,
+                        qdev_get_gpio_in(gic_dev[chiplet],
+                                         intidbase + gt_ppi[t]));
+                }
+            }
         }
     }
 

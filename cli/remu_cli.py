@@ -246,10 +246,12 @@ def _apply_qemu_patches():
 def _apply_fw_patches():
     """Idempotently apply every *.patch file under cli/fw-patches/ to the
     q-sys firmware submodule (external/ssw-bundle/products/rebel/q/sys).
-    These carry the REMU-side tweaks that let the unmodified upstream
-    firmware boot all the way to FW_BOOT_DONE inside a purely functional
-    emulator (skipping unmodelled RoT / SPI / DVFS / sysinfo-broadcast
-    paths that would otherwise deadlock bootdone_task)."""
+
+    Project policy: cli/fw-patches/ is kept empty. Unmodelled-block
+    workarounds are implemented on the QEMU side (src/machine/,
+    src/host/) rather than as firmware diffs. See
+    cli/fw-patches/README.md. This plumbing is retained as a no-op for
+    ad-hoc local debugging patches that never get committed."""
     _apply_patches(FW_PATCHES, SSW_SYS, "fw")
 
 
@@ -452,10 +454,12 @@ def fw_build(components, platform, mode, chiplets, clean, install):
     click.echo("  ARM64: %s" % env["COMPILER_PATH_ARM64"])
     click.echo("  ARM32: %s" % env["COMPILER_PATH_ARM32"])
 
-    # Apply REMU-side firmware patches before invoking build.sh so the
-    # shortcut-through-unmodelled-silicon tweaks (e.g. REMU_FAST_BOOTDONE
-    # in bootdone_service.c) are baked into every build without relying
-    # on an out-of-tree manual edit of the submodule.
+    # Apply any patches under cli/fw-patches/ before invoking build.sh.
+    # Policy: this directory is kept empty (the q-sys submodule must stay
+    # byte-identical to upstream; unmodelled-block workarounds live on the
+    # QEMU side). The apply call is still made so any ad-hoc local
+    # debugging patch a developer drops into cli/fw-patches/ gets picked
+    # up automatically — see cli/fw-patches/README.md.
     click.echo("Applying FW source patches...")
     _apply_fw_patches()
 

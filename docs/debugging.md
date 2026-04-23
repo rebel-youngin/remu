@@ -550,10 +550,12 @@ exists and is writable.
 The stub is deliberately silicon-agnostic: it does not simulate
 the PMU reset or re-run `bootdone_task`, it only reproduces the
 one externally-visible side-effect the host kmd is actually
-polling for. When REMU eventually grows a CM7 model, the
-`REMU_HOST_TRACE` breadcrumbs in
-`drivers/pcie/pcie_mailbox_callback.c` light up automatically and
-this shortcut can be retired.
+polling for. When REMU eventually grows a CM7 model,
+`pcie_soft_reset_handler` will run for real and this shortcut
+can be retired — at that point set breakpoints in
+`drivers/pcie/pcie_mailbox_callback.c` via `./remucli gdb` (or
+drop a local debug patch into `cli/fw-patches/` per the policy
+in `cli/fw-patches/README.md`) to trace the sequence.
 
 ### x86 Linux guest boot (M8b Stage 2)
 
@@ -707,6 +709,7 @@ through these markers in order. Missing markers pinpoint the stall:
 | BL31 secondary crashes into `plat_panic_handler` before banner | MPIDR encoding mismatch, or GIC distributor read hitting `cfg_mr` catch-all | `r100_soc.c:r100_build_chiplet_view` (GIC aliases) + MPIDR layout. |
 | BL2 ERETs to zero page on a secondary | `bl31_cp0.bin` / `freertos_cp0.bin` not staged at `chiplet_id * CHIPLET_OFFSET + {0x0, 0x200000}` | `cli/remu_cli.py:FW_PER_CHIPLET_IMAGES`. |
 | HBM poll never clears | New "done" bit not whitelisted | `r100_hbm.c` PHY region defaults (default 0, plus `phy_train_done` / `prbs_*_done` / `schd_fifo_empty_status` overrides). |
+| FreeRTOS banner prints then boot hangs silently; a CPU sits in `vApplicationPassiveIdleHook` forever (visible under GDB as `wfi` in the idle task) | CPU generic-timer outputs not wired to the GIC PPI inputs — FreeRTOS's CNTVIRQ (PPI 27) tick fires inside `target/arm/helper.c` but the GIC never sees it, so `vTaskDelay()` never returns and `bootdone_task`'s `hils_check_product_info_ready()` wedges | `r100_soc.c`: verify the `qdev_connect_gpio_out(cpudev, GTIMER_*, qdev_get_gpio_in(gic_dev[chiplet], intidbase + ARCH_TIMER_*_IRQ))` block runs per CPU with `intidbase = (num_irq - GIC_INTERNAL) + local*32`. |
 
 Cross-reference the FW side via the table in `CLAUDE.md` ("Key external
 files"). In practice the bootloader sources under

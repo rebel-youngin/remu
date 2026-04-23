@@ -136,7 +136,7 @@ static void r100_doorbell_deliver(R100DoorbellState *s,
     s->last_offset = off;
     s->last_value = val;
 
-    /* REMU_HOST_TRACE: visible in NPU qemu.stderr.log */
+    /* REMU-TRACE: visible in NPU qemu.stderr.log */
     fprintf(stderr, "REMU-TRACE: doorbell_deliver off=0x%x val=0x%x count=%" PRIu64 "\n",
             off, val, s->frames_received);
     fflush(stderr);
