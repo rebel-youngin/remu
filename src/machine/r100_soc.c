@@ -35,6 +35,7 @@
 #include "r100_soc.h"
 
 static HostMemoryBackend *r100_soc_resolve_memdev(R100SoCMachineState *r100m);
+static Chardev *r100_soc_resolve_chr(const char *id, const char *role);
 
 /*
  * Samsung IMPDEF cache-flush encoding used by TF-A/BL31 cache-maintenance
@@ -154,7 +155,7 @@ static void r100_create_pmu(MemoryRegion *cfg_mr, MemoryRegion *sysmem,
      * beat the lower-priority private-window catch-all. */
     alias = g_new(MemoryRegion, 1);
     snprintf(name, sizeof(name), "r100.chiplet%d.pmu_priv", chiplet_id);
-    memory_region_init_alias(alias, NULL, name, iomem, 0, R100_PMU_REG_SIZE);
+    memory_region_init_alias(alias, NULL, name, iomem, 0, R100_SFR_SIZE);
     memory_region_add_subregion_overlap(sysmem,
                                         chiplet_base + R100_CPMU_PRIVATE_BASE,
                                         alias, 0);
@@ -183,7 +184,7 @@ static void r100_create_sysreg(MemoryRegion *cfg_mr, MemoryRegion *sysmem,
     alias = g_new(MemoryRegion, 1);
     snprintf(name, sizeof(name), "r100.chiplet%d.sysremap_priv", chiplet_id);
     memory_region_init_alias(alias, NULL, name, iomem, 0,
-                             R100_SYSREG_REG_SIZE);
+                             R100_SFR_SIZE);
     memory_region_add_subregion_overlap(sysmem,
                                         chiplet_base + R100_SYSREMAP_PRIVATE_BASE,
                                         alias, 0);
@@ -960,31 +961,16 @@ static void r100_soc_init(MachineState *machine)
         R100SoCMachineState *r100m = R100_SOC_MACHINE(machine);
         DeviceState *mbx_vf0_dev;
         DeviceState *mbx_pf_dev;
-        R100MailboxState *mbx_vf0;
         Chardev *issr_chr = NULL;
         Chardev *issr_dbg = NULL;
 
         /* Resolve issr/debug chardevs once; both mailbox blocks latch
          * them. Unset in single-QEMU runs — egress short-circuits on
          * qemu_chr_fe_backend_connected. */
-        if (r100m->issr_chardev_id != NULL &&
-            *r100m->issr_chardev_id != '\0') {
-            issr_chr = qemu_chr_find(r100m->issr_chardev_id);
-            if (issr_chr == NULL) {
-                error_report("r100-soc: issr chardev '%s' not found",
-                             r100m->issr_chardev_id);
-                exit(1);
-            }
-            if (r100m->issr_debug_chardev_id != NULL &&
-                *r100m->issr_debug_chardev_id != '\0') {
-                issr_dbg = qemu_chr_find(r100m->issr_debug_chardev_id);
-                if (issr_dbg == NULL) {
-                    error_report("r100-soc: issr debug chardev "
-                                 "'%s' not found",
-                                 r100m->issr_debug_chardev_id);
-                    exit(1);
-                }
-            }
+        issr_chr = r100_soc_resolve_chr(r100m->issr_chardev_id, "issr");
+        if (issr_chr) {
+            issr_dbg = r100_soc_resolve_chr(r100m->issr_debug_chardev_id,
+                                            "issr debug");
         }
 
         /* VF0 — q-sys CA73 SPI 185 sink. No issr-chardev here: QEMU
@@ -1002,7 +988,6 @@ static void r100_soc_init(MachineState *machine)
         sysbus_connect_irq(SYS_BUS_DEVICE(mbx_vf0_dev), 1,
                            qdev_get_gpio_in(gic_dev[0],
                                             R100_PCIE_MBX_GROUP1_SPI));
-        mbx_vf0 = R100_MAILBOX(mbx_vf0_dev);
 
         /* PF — bootdone_notify_to_host(PCIE_PF) target; on silicon also
          * where KMD BAR4 TLPs decode. No SPI wire (PF's IRQ subscriber
@@ -1019,41 +1004,28 @@ static void r100_soc_init(MachineState *machine)
         sysbus_mmio_map_overlap(SYS_BUS_DEVICE(mbx_pf_dev), 0,
                                 R100_PCIE_MAILBOX_PF_BASE, 10);
 
-        if (r100m->doorbell_chardev_id != NULL &&
-            *r100m->doorbell_chardev_id != '\0') {
-            Chardev *chr = qemu_chr_find(r100m->doorbell_chardev_id);
-            Chardev *dbg = NULL;
-            DeviceState *db;
+        {
+            Chardev *chr = r100_soc_resolve_chr(r100m->doorbell_chardev_id,
+                                                "doorbell");
+            if (chr) {
+                Chardev *dbg = r100_soc_resolve_chr(
+                                   r100m->doorbell_debug_chardev_id,
+                                   "doorbell debug");
+                DeviceState *db = qdev_new(TYPE_R100_DOORBELL);
 
-            if (chr == NULL) {
-                error_report("r100-soc: doorbell chardev '%s' not found",
-                             r100m->doorbell_chardev_id);
-                exit(1);
-            }
-            if (r100m->doorbell_debug_chardev_id != NULL &&
-                *r100m->doorbell_debug_chardev_id != '\0') {
-                dbg = qemu_chr_find(r100m->doorbell_debug_chardev_id);
-                if (dbg == NULL) {
-                    error_report("r100-soc: doorbell debug chardev "
-                                 "'%s' not found",
-                                 r100m->doorbell_debug_chardev_id);
-                    exit(1);
+                qdev_prop_set_chr(db, "chardev", chr);
+                if (dbg) {
+                    qdev_prop_set_chr(db, "debug-chardev", dbg);
                 }
+                /* mailbox=VF0 (shortcut PCIE_CM7 relay — INTGR bits raise
+                 * SPI 185 q-sys services). pf-mailbox=PF so SOFT_RESET can
+                 * synthesise FW_BOOT_DONE→PF.ISSR[4] (CM7 stub, a01d2b5). */
+                object_property_set_link(OBJECT(db), "mailbox",
+                                         OBJECT(mbx_vf0_dev), &error_fatal);
+                object_property_set_link(OBJECT(db), "pf-mailbox",
+                                         OBJECT(mbx_pf_dev), &error_fatal);
+                sysbus_realize_and_unref(SYS_BUS_DEVICE(db), &error_fatal);
             }
-
-            db = qdev_new(TYPE_R100_DOORBELL);
-            qdev_prop_set_chr(db, "chardev", chr);
-            if (dbg) {
-                qdev_prop_set_chr(db, "debug-chardev", dbg);
-            }
-            /* mailbox=VF0 (shortcut PCIE_CM7 relay — INTGR bits raise
-             * SPI 185 q-sys services). pf-mailbox=PF so SOFT_RESET can
-             * synthesise FW_BOOT_DONE→PF.ISSR[4] (CM7 stub, a01d2b5). */
-            object_property_set_link(OBJECT(db), "mailbox",
-                                     OBJECT(mbx_vf0), &error_fatal);
-            object_property_set_link(OBJECT(db), "pf-mailbox",
-                                     OBJECT(mbx_pf_dev), &error_fatal);
-            sysbus_realize_and_unref(SYS_BUS_DEVICE(db), &error_fatal);
         }
     }
 
@@ -1063,30 +1035,13 @@ static void r100_soc_init(MachineState *machine)
      * Optional: only when -machine r100-soc,msix=<id>. */
     {
         R100SoCMachineState *r100m = R100_SOC_MACHINE(machine);
+        Chardev *chr = r100_soc_resolve_chr(r100m->msix_chardev_id, "msix");
 
-        if (r100m->msix_chardev_id != NULL &&
-            *r100m->msix_chardev_id != '\0') {
-            Chardev *chr = qemu_chr_find(r100m->msix_chardev_id);
-            Chardev *dbg = NULL;
-            DeviceState *imsix;
+        if (chr) {
+            Chardev *dbg = r100_soc_resolve_chr(r100m->msix_debug_chardev_id,
+                                                "msix debug");
+            DeviceState *imsix = qdev_new(TYPE_R100_IMSIX);
 
-            if (chr == NULL) {
-                error_report("r100-soc: msix chardev '%s' not found",
-                             r100m->msix_chardev_id);
-                exit(1);
-            }
-            if (r100m->msix_debug_chardev_id != NULL &&
-                *r100m->msix_debug_chardev_id != '\0') {
-                dbg = qemu_chr_find(r100m->msix_debug_chardev_id);
-                if (dbg == NULL) {
-                    error_report("r100-soc: msix debug chardev "
-                                 "'%s' not found",
-                                 r100m->msix_debug_chardev_id);
-                    exit(1);
-                }
-            }
-
-            imsix = qdev_new(TYPE_R100_IMSIX);
             qdev_prop_set_chr(imsix, "chardev", chr);
             if (dbg) {
                 qdev_prop_set_chr(imsix, "debug-chardev", dbg);
@@ -1165,152 +1120,94 @@ static void r100_soc_init(MachineState *machine)
  * `memdev` and chardev machine props are strings (not links): QEMU
  * parses -machine BEFORE creating memory-backend-* / chardevs, so link
  * properties would fail with "not found". Resolved lazily at machine-init.
+ *
+ * All 7 props are plain `char *` fields on R100SoCMachineState that get
+ * strdup'd on set, freed on finalize, and dup'd on get. The macro below
+ * emits one getter/setter pair per field; the description table drives
+ * instance_init's single registration loop and the offset list drives
+ * finalize.
  */
-static char *r100_soc_get_memdev(Object *obj, Error **errp)
-{
-    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
-    return g_strdup(r100m->memdev_id);
+#define R100_SOC_DEF_STRPROP(_sym, _field)                                  \
+    static char *r100_soc_get_##_sym(Object *o, Error **errp)               \
+    {                                                                       \
+        (void)errp;                                                         \
+        return g_strdup(R100_SOC_MACHINE(o)->_field);                       \
+    }                                                                       \
+    static void r100_soc_set_##_sym(Object *o, const char *v, Error **errp) \
+    {                                                                       \
+        (void)errp;                                                         \
+        R100SoCMachineState *m = R100_SOC_MACHINE(o);                       \
+        g_free(m->_field);                                                  \
+        m->_field = g_strdup(v);                                            \
+    }
+
+R100_SOC_DEF_STRPROP(memdev,         memdev_id)
+R100_SOC_DEF_STRPROP(doorbell,       doorbell_chardev_id)
+R100_SOC_DEF_STRPROP(doorbell_debug, doorbell_debug_chardev_id)
+R100_SOC_DEF_STRPROP(msix,           msix_chardev_id)
+R100_SOC_DEF_STRPROP(msix_debug,     msix_debug_chardev_id)
+R100_SOC_DEF_STRPROP(issr,           issr_chardev_id)
+R100_SOC_DEF_STRPROP(issr_debug,     issr_debug_chardev_id)
+
+#undef R100_SOC_DEF_STRPROP
+
+typedef struct R100SoCStrProp {
+    const char *name;                                  /* -machine ...,<name>= */
+    char *(*get)(Object *, Error **);
+    void  (*set)(Object *, const char *, Error **);
+    size_t field_off;                                  /* for finalize */
+    const char *description;
+} R100SoCStrProp;
+
+#define R100_SOC_STR_PROP(_name, _sym, _field, _desc) { \
+    .name        = (_name),                             \
+    .get         = r100_soc_get_##_sym,                 \
+    .set         = r100_soc_set_##_sym,                 \
+    .field_off   = offsetof(R100SoCMachineState, _field),\
+    .description = (_desc),                             \
 }
 
-static void r100_soc_set_memdev(Object *obj, const char *value, Error **errp)
-{
-    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
-    g_free(r100m->memdev_id);
-    r100m->memdev_id = g_strdup(value);
-}
+static const R100SoCStrProp r100_soc_str_props[] = {
+    R100_SOC_STR_PROP("memdev", memdev, memdev_id,
+        "memory-backend-* id spliced over chiplet-0 DRAM head "
+        "(Phase 2 M5)."),
+    R100_SOC_STR_PROP("doorbell", doorbell, doorbell_chardev_id,
+        "chardev id: host→NPU 8-byte (BAR4 off, val) frames into "
+        "INTGR/ISSR (M6/M8a)."),
+    R100_SOC_STR_PROP("doorbell-debug", doorbell_debug,
+                      doorbell_debug_chardev_id,
+        "chardev id for an ASCII trace of every doorbell frame accepted."),
+    R100_SOC_STR_PROP("msix", msix, msix_chardev_id,
+        "chardev id: NPU→host MSI-X frames from REBELH_PCIE_MSIX_ADDR (M7)."),
+    R100_SOC_STR_PROP("msix-debug", msix_debug, msix_debug_chardev_id,
+        "chardev id for an ASCII trace of every iMSIX doorbell frame."),
+    R100_SOC_STR_PROP("issr", issr, issr_chardev_id,
+        "chardev id: NPU→host 8-byte (BAR4 off, val) ISSR-shadow frames "
+        "(M8a)."),
+    R100_SOC_STR_PROP("issr-debug", issr_debug, issr_debug_chardev_id,
+        "chardev id for an ASCII trace of every ISSR frame emitted."),
+};
 
-static char *r100_soc_get_doorbell(Object *obj, Error **errp)
-{
-    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
-    return g_strdup(r100m->doorbell_chardev_id);
-}
-
-static void r100_soc_set_doorbell(Object *obj, const char *value, Error **errp)
-{
-    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
-    g_free(r100m->doorbell_chardev_id);
-    r100m->doorbell_chardev_id = g_strdup(value);
-}
-
-static char *r100_soc_get_doorbell_debug(Object *obj, Error **errp)
-{
-    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
-    return g_strdup(r100m->doorbell_debug_chardev_id);
-}
-
-static void r100_soc_set_doorbell_debug(Object *obj, const char *value,
-                                        Error **errp)
-{
-    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
-    g_free(r100m->doorbell_debug_chardev_id);
-    r100m->doorbell_debug_chardev_id = g_strdup(value);
-}
-
-static char *r100_soc_get_msix(Object *obj, Error **errp)
-{
-    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
-    return g_strdup(r100m->msix_chardev_id);
-}
-
-static void r100_soc_set_msix(Object *obj, const char *value, Error **errp)
-{
-    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
-    g_free(r100m->msix_chardev_id);
-    r100m->msix_chardev_id = g_strdup(value);
-}
-
-static char *r100_soc_get_msix_debug(Object *obj, Error **errp)
-{
-    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
-    return g_strdup(r100m->msix_debug_chardev_id);
-}
-
-static void r100_soc_set_msix_debug(Object *obj, const char *value,
-                                    Error **errp)
-{
-    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
-    g_free(r100m->msix_debug_chardev_id);
-    r100m->msix_debug_chardev_id = g_strdup(value);
-}
-
-static char *r100_soc_get_issr(Object *obj, Error **errp)
-{
-    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
-    return g_strdup(r100m->issr_chardev_id);
-}
-
-static void r100_soc_set_issr(Object *obj, const char *value, Error **errp)
-{
-    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
-    g_free(r100m->issr_chardev_id);
-    r100m->issr_chardev_id = g_strdup(value);
-}
-
-static char *r100_soc_get_issr_debug(Object *obj, Error **errp)
-{
-    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
-    return g_strdup(r100m->issr_debug_chardev_id);
-}
-
-static void r100_soc_set_issr_debug(Object *obj, const char *value,
-                                    Error **errp)
-{
-    R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
-    g_free(r100m->issr_debug_chardev_id);
-    r100m->issr_debug_chardev_id = g_strdup(value);
-}
+#undef R100_SOC_STR_PROP
 
 static void r100_soc_machine_instance_init(Object *obj)
 {
-    object_property_add_str(obj, "memdev",
-                            r100_soc_get_memdev, r100_soc_set_memdev);
-    object_property_set_description(obj, "memdev",
-        "memory-backend-* id spliced over chiplet-0 DRAM head (Phase 2 M5).");
-
-    object_property_add_str(obj, "doorbell",
-                            r100_soc_get_doorbell, r100_soc_set_doorbell);
-    object_property_set_description(obj, "doorbell",
-        "chardev id: host→NPU 8-byte (BAR4 off, val) frames into INTGR/ISSR (M6/M8a).");
-
-    object_property_add_str(obj, "doorbell-debug",
-                            r100_soc_get_doorbell_debug,
-                            r100_soc_set_doorbell_debug);
-    object_property_set_description(obj, "doorbell-debug",
-        "chardev id for an ASCII trace of every doorbell frame accepted.");
-
-    object_property_add_str(obj, "msix",
-                            r100_soc_get_msix, r100_soc_set_msix);
-    object_property_set_description(obj, "msix",
-        "chardev id: NPU→host MSI-X frames from REBELH_PCIE_MSIX_ADDR (M7).");
-
-    object_property_add_str(obj, "msix-debug",
-                            r100_soc_get_msix_debug,
-                            r100_soc_set_msix_debug);
-    object_property_set_description(obj, "msix-debug",
-        "chardev id for an ASCII trace of every iMSIX doorbell frame.");
-
-    object_property_add_str(obj, "issr",
-                            r100_soc_get_issr, r100_soc_set_issr);
-    object_property_set_description(obj, "issr",
-        "chardev id: NPU→host 8-byte (BAR4 off, val) ISSR-shadow frames (M8a).");
-
-    object_property_add_str(obj, "issr-debug",
-                            r100_soc_get_issr_debug,
-                            r100_soc_set_issr_debug);
-    object_property_set_description(obj, "issr-debug",
-        "chardev id for an ASCII trace of every ISSR frame emitted.");
+    for (size_t i = 0; i < ARRAY_SIZE(r100_soc_str_props); i++) {
+        const R100SoCStrProp *p = &r100_soc_str_props[i];
+        object_property_add_str(obj, p->name, p->get, p->set);
+        object_property_set_description(obj, p->name, p->description);
+    }
 }
 
 static void r100_soc_machine_instance_finalize(Object *obj)
 {
     R100SoCMachineState *r100m = R100_SOC_MACHINE(obj);
-    g_free(r100m->memdev_id);
-    g_free(r100m->doorbell_chardev_id);
-    g_free(r100m->doorbell_debug_chardev_id);
-    g_free(r100m->msix_chardev_id);
-    g_free(r100m->msix_debug_chardev_id);
-    g_free(r100m->issr_chardev_id);
-    g_free(r100m->issr_debug_chardev_id);
+    for (size_t i = 0; i < ARRAY_SIZE(r100_soc_str_props); i++) {
+        char **slot = (char **)((char *)r100m +
+                                r100_soc_str_props[i].field_off);
+        g_free(*slot);
+        *slot = NULL;
+    }
 }
 
 /* Resolve memdev=<id> to HostMemoryBackend; NULL if unset; exit on bad id. */
@@ -1334,6 +1231,27 @@ static HostMemoryBackend *r100_soc_resolve_memdev(R100SoCMachineState *r100m)
         exit(1);
     }
     return MEMORY_BACKEND(obj);
+}
+
+/*
+ * Resolve one -machine r100-soc,<role>=<id> chardev. Unset (NULL or "")
+ * returns NULL so the caller can skip the matching device instantiation
+ * in single-QEMU runs. A non-empty id that doesn't name a known chardev
+ * is a configuration error and aborts the boot.
+ */
+static Chardev *r100_soc_resolve_chr(const char *id, const char *role)
+{
+    Chardev *chr;
+
+    if (id == NULL || *id == '\0') {
+        return NULL;
+    }
+    chr = qemu_chr_find(id);
+    if (chr == NULL) {
+        error_report("r100-soc: %s chardev '%s' not found", role, id);
+        exit(1);
+    }
+    return chr;
 }
 
 static void r100_soc_machine_class_init(ObjectClass *oc, void *data)

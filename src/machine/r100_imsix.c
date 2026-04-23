@@ -11,7 +11,6 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu/bswap.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qapi/error.h"
@@ -21,11 +20,9 @@
 #include "chardev/char-fe.h"
 #include "migration/vmstate.h"
 #include "r100_soc.h"
+#include "remu_frame.h"
 
 OBJECT_DECLARE_SIMPLE_TYPE(R100IMSIXState, R100_IMSIX)
-
-/* 8 B frame: u32 off LE + u32 db_data LE (shared parser with doorbell). */
-#define R100_IMSIX_FRAME_SIZE   8
 
 struct R100IMSIXState {
     SysBusDevice parent_obj;
@@ -65,25 +62,13 @@ static void r100_imsix_emit_debug(R100IMSIXState *s, uint32_t off,
 
 static void r100_imsix_emit(R100IMSIXState *s, uint32_t off, uint32_t db_data)
 {
-    uint8_t frame[R100_IMSIX_FRAME_SIZE];
-    int rc;
+    RemuFrameEmitResult res;
 
     s->last_db_data = db_data;
-
-    if (!qemu_chr_fe_backend_connected(&s->chr)) {
-        /* Expected during socket-client settle; count+drop. */
-        s->frames_dropped++;
-        return;
-    }
-
-    stl_le_p(&frame[0], off);
-    stl_le_p(&frame[4], db_data);
-
-    rc = qemu_chr_fe_write(&s->chr, frame, sizeof(frame));
-    if (rc != sizeof(frame)) {
-        qemu_log_mask(LOG_UNIMP,
-                      "r100-imsix: frame off=0x%x db_data=0x%x "
-                      "dropped (rc=%d)\n", off, db_data, rc);
+    res = remu_frame_emit(&s->chr, "r100-imsix", off, db_data);
+    if (res != REMU_FRAME_EMIT_OK) {
+        /* Disconnected is expected during socket-client settle; the
+         * host doesn't back-pressure, so we just drop-count either way. */
         s->frames_dropped++;
         return;
     }

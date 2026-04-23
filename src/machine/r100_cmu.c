@@ -21,6 +21,21 @@
 #include "migration/vmstate.h"
 #include "r100_soc.h"
 
+#define R100_CMU_REG_COUNT      (R100_CMU_BLOCK_SIZE / 4)
+
+struct R100CMUState {
+    SysBusDevice parent_obj;
+
+    MemoryRegion iomem;
+    uint32_t regs[R100_CMU_REG_COUNT];
+    uint32_t chiplet_id;
+    char *name;  /* e.g., "CP0", "ROT", "DCL0" for debug */
+};
+
+typedef struct R100CMUState R100CMUState;
+
+DECLARE_INSTANCE_CHECKER(R100CMUState, R100_CMU, TYPE_R100_CMU)
+
 /*
  * CMU PLL register bit positions.
  * These match the Samsung CMU IP used in the R100 SoC.

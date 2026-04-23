@@ -45,6 +45,22 @@
 #include "hw/qdev-properties.h"
 #include "r100_soc.h"
 
+#define R100_PVT_REG_SIZE       0x10000
+#define R100_PVT_REG_COUNT      (R100_PVT_REG_SIZE / 4)
+
+struct R100PVTState {
+    SysBusDevice parent_obj;
+
+    MemoryRegion iomem;
+    uint32_t regs[R100_PVT_REG_COUNT];
+    uint32_t chiplet_id;
+    char *name;  /* e.g. "ROT", "DCL0_0", "DCL0_1" for debug */
+};
+
+typedef struct R100PVTState R100PVTState;
+
+DECLARE_INSTANCE_CHECKER(R100PVTState, R100_PVT, TYPE_R100_PVT)
+
 /* Top-level PVT registers (see struct pvt_regs in pvt_con_reg.h). */
 #define PVT_CON_STATUS              0x1C
 #define PVT_CON_STATUS_RESET        0x3u  /* ts_con_idle | ps_con_idle */

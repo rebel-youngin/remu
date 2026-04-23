@@ -170,8 +170,18 @@ example of this policy: the CM7-stub in `src/machine/r100_doorbell.c`
 ```
 remucli               Bash wrapper — the one entry point
 src/machine/          NPU-side QEMU device models (symlinked into external/qemu/hw/arm/r100/)
+                        r100_soc.{c,h}      machine + QOM type-name registry
+                        r100_mailbox.{c,h}  mailbox — .c private state, .h public helpers
+                        r100_<dev>.c        one file per device (state struct private)
 src/host/             Host-side (x86 guest) PCI device models (symlinked into external/qemu/hw/misc/r100-host/)
-src/include/          Shared headers (remu_addrmap.h)
+src/include/          Added to -I during QEMU configure
+                        r100/remu_addrmap.h — `#include "r100/remu_addrmap.h"`
+src/bridge/           Added to -I during QEMU configure — cross-side shared headers
+                        remu_frame.h         8-byte frame codec (RX accumulator + emit)
+                        remu_doorbell_proto.h BAR4 offset classifier
+                      Header-only `static inline`, so both host-side (system_ss)
+                      and NPU-side (arm_ss) TUs pick up the same definitions
+                      without introducing a shared object.
 cli/remu_cli.py       Click-based CLI implementation
 tests/                Test binaries and test scripts
 docs/                 Architecture, roadmap, debugging
@@ -190,6 +200,18 @@ output/               Per-run log directories (gitignored; see docs/debugging.md
 - `qdev_prop_set_array()` + `QList` for array properties (e.g. GIC `redist-region-count`)
 - Machine type names must end with `-machine` (QEMU assertion)
 - All remu source uses `r100_` prefix; external repos keep their own naming
+- **Header discipline**: per-device `struct R100XxxState` and `DECLARE_INSTANCE_CHECKER(...)`
+  live in the device's `.c` file, not in `r100_soc.h`. Cross-device access goes through
+  QOM `link<>` properties or a small public-API header (see `r100_mailbox.h`), never
+  by dereferencing another device's state.
+- **Logging**: use `qemu_log_mask(LOG_{TRACE,UNIMP,GUEST_ERROR}, ...)` in hot paths, never
+  `fprintf(stderr, ...)` — it bypasses the `-d`/`qemu.log` knobs and pollutes terminals.
+- **Inter-QEMU wire format**: use `remu_frame_emit` / `remu_frame_rx_feed` from
+  `src/bridge/remu_frame.h` for any 8-byte `(a, b)` chardev channel; don't hand-roll
+  byte-swap + short-write bookkeeping inline.
+- **BAR4 doorbell offsets**: classify via `remu_doorbell_classify()` from
+  `src/bridge/remu_doorbell_proto.h`; don't add ad-hoc `off == 0x8 || off == 0x1c` checks
+  in new code — the wire protocol must stay single-sourced across host + NPU.
 
 ## Hardware context
 

@@ -55,7 +55,7 @@ NPU_MON = RUN_DIR / "monitor.sock"
 
 # MAILBOX_INTGR offsets as seen by the host QEMU on BAR4 (must match
 # R100_BAR4_MAILBOX_INTGR0 / R100_BAR4_MAILBOX_INTGR1 in
-# src/include/remu_addrmap.h).
+# src/include/r100/remu_addrmap.h).
 INTGR0 = 0x00000008
 INTGR1 = 0x0000001C
 # BOGUS must be outside BOTH the INTGR trigger offsets (0x08 / 0x1c)

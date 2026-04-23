@@ -40,6 +40,29 @@
 #include "hw/qdev-properties.h"
 #include "r100_soc.h"
 
+/*
+ * HBM3 controller covers 16 memory channels at 0x40000 stride plus
+ * 16 PHY blocks at 0x10000 stride plus the ICON block, all in a
+ * contiguous 6MB window from 0x1FF7400000. See hbm3.h for the layout.
+ * The stub returns 0xFFFFFFFF for unwritten offsets (which satisfies
+ * dfi_init_complete and other "training ready" polls) and remembers
+ * individual writes in a sparse hash so ioctl-style RMW patterns work.
+ */
+#define R100_HBM_REG_SIZE       0x600000
+
+struct R100HBMState {
+    SysBusDevice parent_obj;
+
+    MemoryRegion iomem;
+    GHashTable *regs;     /* hwaddr -> uint32_t (sparse write-back store) */
+    uint32_t chiplet_id;
+    uint8_t extest_mode;  /* current ICON EXTEST scan: see below */
+};
+
+typedef struct R100HBMState R100HBMState;
+
+DECLARE_INSTANCE_CHECKER(R100HBMState, R100_HBM, TYPE_R100_HBM)
+
 #define HBM_STATUS_READY            0xFFFFFFFFU
 
 /*

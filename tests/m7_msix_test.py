@@ -71,7 +71,7 @@ MSIX_LOG = RUN_DIR / "msix.log"
 HOST_MON = HOST_DIR / "monitor.sock"
 HOST_QEMU_LOG = HOST_DIR / "qemu.log"
 
-# Constants — must match src/include/remu_addrmap.h and the REBEL_MSIX_ENTRIES
+# Constants — must match src/include/r100/remu_addrmap.h and the REBEL_MSIX_ENTRIES
 # constant the driver uses (32 on CR03).
 IMSIX_DB_OFFSET = 0x00000FFC    # R100_PCIE_IMSIX_DB_OFFSET
 VECTOR_MASK     = 0x000007FF    # R100_PCIE_IMSIX_VECTOR_MASK

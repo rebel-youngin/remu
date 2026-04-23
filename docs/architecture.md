@@ -196,11 +196,48 @@ specific overrides for status bits (e.g. CMU PLL lock).
 | Timer freq | 500 MHz (`CNTFRQ_EL0`) | Matches silicon (`CORE_TIMER_FREQ`). |
 | DRAM size | 1 GB / chiplet | Enough for FW boot (silicon has up to 36 GB). |
 
+## Source Tree Layout
+
+```
+src/
+  machine/          NPU-side QEMU device models (aarch64-softmmu)
+    r100_soc.{c,h}     machine + type-name registry (no device state structs)
+    r100_mailbox.{c,h} mailbox state (private to .c) + public helper API
+    r100_<dev>.c       one file per device — state struct, ops, type_init
+  host/             x86 host-side PCIe endpoint (x86_64-softmmu)
+    r100_npu_pci.c
+  include/          Headers added to QEMU's -I search path
+    r100/remu_addrmap.h  SoC address constants, BAR4/BAR5 offsets, PCI IDs
+  bridge/           Cross-side shared headers added to -I (host + NPU TUs)
+    remu_frame.h         8-byte (a, b) frame codec: RX accumulator + emit
+    remu_doorbell_proto.h BAR4 offset classifier (INTGR0 / INTGR1 / ISSR)
+```
+
+**Header discipline.** Each device's `struct R100XxxState`,
+`DECLARE_INSTANCE_CHECKER(...)`, and private register-count defines
+live in its own `.c` file. `r100_soc.h` only exposes the machine-state
+subclass, the `TYPE_R100_*` type names, and (via `#include
+"r100_mailbox.h"`) the mailbox helper prototypes that
+`r100_doorbell.c` needs to drive the mailbox from outside its own
+MMIO path. This keeps the state layout private, forces cross-device
+communication through either QOM properties (e.g. `link<>`) or
+purpose-specific helper headers, and means touching `R100MailboxState`
+fields no longer rebuilds every NPU-side device.
+
+**Cross-side shared code.** The host side (`r100_npu_pci.c`, compiled
+into `system_ss`) and the NPU side (`r100_doorbell.c` /
+`r100_imsix.c` / `r100_mailbox.c`, compiled into `arm_ss`) live in
+different meson subsystems, so a single `.c` would need to link twice.
+`src/bridge/*.h` sidesteps this: the wire format (`remu_frame.h`) and
+the BAR4 protocol classifier (`remu_doorbell_proto.h`) are header-only
+`static inline` — both sides pick up the same definitions from `-I
+src/bridge` without introducing a shared TU.
+
 ## Source File Map
 
 | File | Device | Instances | Behaviour |
 |---|---|---|---|
-| `r100_soc.c` | Machine | 1 | Builds chiplet views + CPUs + per-chiplet GIC/UART + mailbox cluster. Installs MIDR spoof + two IMPDEF sysreg tables per CPU. Wires gtimer→GIC PPIs. Instantiates `r100-doorbell` / `r100-imsix` on demand. Inline stubs: PCIE sub-controller (PHY{0..3}_SRAM_INIT_DONE seed), CSS600 CNTGEN, inter-chiplet HBM mailbox RAM, cfg/private-window unimpl catch-alls. |
+| `r100_soc.c` | Machine | 1 | Builds chiplet views + CPUs + per-chiplet GIC/UART + mailbox cluster. Installs MIDR spoof + two IMPDEF sysreg tables per CPU. Wires gtimer→GIC PPIs. Instantiates `r100-doorbell` / `r100-imsix` on demand. Seven `-machine r100-soc,<key>=<id>` string props (memdev + 6 chardev slots) registered via a single `R100_SOC_DEF_STRPROP` macro-generated table. Inline stubs: PCIE sub-controller (PHY{0..3}_SRAM_INIT_DONE seed), CSS600 CNTGEN, inter-chiplet HBM mailbox RAM, cfg/private-window unimpl catch-alls. |
 | `r100_cmu.c` | CMU | 20 / chiplet | PLL-lock instant, `mux_busy=0`. |
 | `r100_pmu.c` | PMU | 1 / chiplet | Cold-reset, `CPU_CONFIGURATION` → `arm_set_cpu_on(mpidr, RVBAR, EL3)` covers BL1 cold, BL2 CP1, BL31 PSCI warm. `read_rvbar()` indexes `SYSREG_CP0_PRIVATE + cluster * PER_SYSREG_CP`. Dual-mapped (cfg + private alias). |
 | `r100_sysreg.c` | SYSREG | 1 / chiplet | Returns chiplet ID. CP0/CP1 RAM triple-mounted (private + cfg alias + CPU-view overlay). |
@@ -213,11 +250,13 @@ specific overrides for status bits (e.g. CMU PLL lock).
 | `r100_dma.c` | PL330 DMA | 1 / chiplet | Fake-completion stub. |
 | `r100_dnc.c` | DCL cluster + RBDMA | 2+1 / chiplet | Sparse stub for DNC slots, SHM banks, MGLUE (RDSN), RBDMA `IP_INFO`. |
 | `r100_logbuf.c` | HILS ring tail | 1 (chiplet 0) | 50 ms poll of `.logbuf` ring, drains to chardev. |
-| `r100_mailbox.c` | Samsung IPM SFR | 2 on chiplet 0 (VF0, PF) | Full register model (`INTGR/INTCR/INTMR/INTSR/INTMSR/ISSR0..63`), two `qemu_irq` outs (INTMSR0/1), API `r100_mailbox_{raise_intgr,set_issr,cm7_stub_write_issr}`. Every MMIO-path ISSR write emits `(bar4_off, val)` frame on optional `issr-chardev` (M8a). |
-| `r100_doorbell.c` | PCIe doorbell ingress | 1 (chiplet 0; M6+M8a+CM7-stub) | Reassembles 8-byte `(offset, value)` frames; routes by offset to INTGR / ISSR / CM7-stub (INTGR0 bit 0 = SOFT_RESET → synthesises `FW_BOOT_DONE` into PF.ISSR[4], commit `a01d2b5`). |
-| `r100_imsix.c` | PCIe MSI-X trap | 1 (chiplet 0; M7) | 4 KB MMIO at `R100_PCIE_IMSIX_BASE`; 4-byte write @ `0xFFC` emits `(offset, db_data)` frame on `msix` chardev. |
-| `r100_npu_pci.c` (x86) | PCIe endpoint `0x1eff:0x2030` | 1 | Four BARs + three chardev bridges — see commit `7b03328` / `e03b00f` / `cd24aa9` for per-milestone detail. |
-| `remu_addrmap.h` | — | — | Address constants from `g_sys_addrmap.h` + M6/M7/M8a bridge offsets. |
+| `r100_mailbox.{c,h}` | Samsung IPM SFR | 2 on chiplet 0 (VF0, PF) | Full register model (`INTGR/INTCR/INTMR/INTSR/INTMSR/ISSR0..63`) + two `qemu_irq` outs (INTMSR0/1). All ISSR writes funnel through `r100_mailbox_issr_store(src, ...)` with an `MbxIssrSrc` tag (`NPU_MMIO` / `CM7_STUB` / `HOST_RELAY`); NPU-sourced writes egress an `(bar4_off, val)` frame on `issr-chardev` (M8a), host-relayed writes deliberately skip the re-emit to avoid loopback. Public helpers exposed via `r100_mailbox.h`: `r100_mailbox_{raise_intgr,set_issr,cm7_stub_write_issr}` — everything else stays `static`. |
+| `r100_doorbell.c` | PCIe doorbell ingress | 1 (chiplet 0; M6+M8a+CM7-stub) | Reassembles 8-byte frames via `remu_frame_rx_feed`; dispatches each via `remu_doorbell_classify()` onto INTGR / ISSR / CM7-stub (INTGR0 bit 0 = SOFT_RESET → synthesises `FW_BOOT_DONE` into PF.ISSR[4], commit `a01d2b5`). Offsets classified as `OTHER` emit `GUEST_ERROR`. |
+| `r100_imsix.c` | PCIe MSI-X trap | 1 (chiplet 0; M7) | 4 KB MMIO at `R100_PCIE_IMSIX_BASE`; 4-byte write @ `0xFFC` → `remu_frame_emit` of `(offset, db_data)` on `msix` chardev. |
+| `r100_npu_pci.c` (x86) | PCIe endpoint `0x1eff:0x2030` | 1 | Four BARs + three chardev bridges. Host → NPU BAR4 writes use `remu_doorbell_classify()` to decide whether to forward (and to which sub-protocol). NPU → host MSI-X / ISSR ingress uses `RemuFrameRx` for stream reassembly. See commits `7b03328` / `e03b00f` / `cd24aa9` for per-milestone detail. |
+| `src/include/r100/remu_addrmap.h` | — | — | Address constants from `g_sys_addrmap.h` + M6/M7/M8a bridge offsets (BAR4 INTGR0/INTGR1/MAILBOX_BASE, BAR5 MSI-X, `R100_PCIE_IMSIX_*`). Included as `"r100/remu_addrmap.h"`. |
+| `src/bridge/remu_frame.h` | — | — | Header-only: `RemuFrameRx` streaming decoder, `remu_frame_rx_feed` + `remu_frame_emit` helpers, `RemuFrameEmitResult` for emit status. Used by all four chardev endpoints (host + 3 NPU devices). |
+| `src/bridge/remu_doorbell_proto.h` | — | — | Header-only: `RemuDoorbellKind` + `remu_doorbell_classify(bar4_off, &issr_idx)` — single source of truth for the BAR4 wire protocol, used on both ends of the doorbell / ISSR path. |
 
 ## FW Source References
 

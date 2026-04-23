@@ -30,6 +30,22 @@
 #include "target/arm/arm-powerctl.h"
 #include "r100_soc.h"
 
+#define R100_PMU_REG_SIZE       0x10000
+#define R100_PMU_REG_COUNT      (R100_PMU_REG_SIZE / 4)
+
+struct R100PMUState {
+    SysBusDevice parent_obj;
+
+    MemoryRegion iomem;
+    uint32_t regs[R100_PMU_REG_COUNT];
+    uint32_t chiplet_id;
+    uint32_t secondary_chiplet_count;
+};
+
+typedef struct R100PMUState R100PMUState;
+
+DECLARE_INSTANCE_CHECKER(R100PMUState, R100_PMU, TYPE_R100_PMU)
+
 static void r100_pmu_set_defaults(R100PMUState *s)
 {
     /*

@@ -72,7 +72,7 @@ IMAGES_DIR = REPO / "images"
 RUN_NAME = "m8-issr"
 RUN_DIR = REPO / "output" / RUN_NAME
 
-# ── Constants — must match src/include/remu_addrmap.h ───────────────────────
+# ── Constants — must match src/include/r100/remu_addrmap.h ─────────────────
 MAILBOX_BASE        = 0x00000080   # R100_BAR4_MAILBOX_BASE
 MAILBOX_COUNT       = 64           # R100_BAR4_MAILBOX_COUNT
 MAILBOX_END         = MAILBOX_BASE + MAILBOX_COUNT * 4

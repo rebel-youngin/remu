@@ -44,6 +44,25 @@
 #include "exec/cpu-common.h"
 #include "r100_soc.h"
 
+#define R100_SMMU_REG_SIZE      0x10000
+#define R100_SMMU_REG_COUNT     (R100_SMMU_REG_SIZE / 4)
+
+struct R100SMMUState {
+    SysBusDevice parent_obj;
+
+    MemoryRegion iomem;
+    uint32_t regs[R100_SMMU_REG_COUNT];
+    uint32_t chiplet_id;
+
+    /* Cached CMDQ geometry from the last SMMU_CMDQ_BASE write. */
+    uint64_t cmdq_base_pa;      /* PA of first entry in guest memory */
+    uint32_t cmdq_log2size;     /* log2(#entries); valid range 0..19 */
+};
+
+typedef struct R100SMMUState R100SMMUState;
+
+DECLARE_INSTANCE_CHECKER(R100SMMUState, R100_SMMU, TYPE_R100_SMMU)
+
 /* SMMU-600 register offsets used by TF-A (see struct smmu600_regs). */
 #define SMMU_CR0            0x20
 #define SMMU_CR0ACK         0x24

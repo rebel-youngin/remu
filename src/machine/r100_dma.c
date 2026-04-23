@@ -26,6 +26,20 @@
 #include "hw/qdev-properties.h"
 #include "r100_soc.h"
 
+#define R100_DMA_REG_COUNT      (R100_DMA_PL330_SIZE / 4)
+
+struct R100DMAPl330State {
+    SysBusDevice parent_obj;
+
+    MemoryRegion iomem;
+    uint32_t regs[R100_DMA_REG_COUNT];
+    uint32_t chiplet_id;
+};
+
+typedef struct R100DMAPl330State R100DMAPl330State;
+
+DECLARE_INSTANCE_CHECKER(R100DMAPl330State, R100_DMA_PL330, TYPE_R100_DMA_PL330)
+
 /* Completion-poll register offsets (from struct pl330 in pl330.h) */
 #define PL330_CH0_CSR       0x100   /* ch_stat[0].csr */
 #define PL330_DBGSTATUS     0xD00

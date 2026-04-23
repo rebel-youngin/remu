@@ -20,7 +20,6 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu/bswap.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qapi/error.h"
@@ -31,11 +30,10 @@
 #include "chardev/char-fe.h"
 #include "migration/vmstate.h"
 #include "r100_soc.h"
+#include "remu_frame.h"
+#include "remu_doorbell_proto.h"
 
 OBJECT_DECLARE_SIMPLE_TYPE(R100DoorbellState, R100_DOORBELL)
-
-/* Wire frame: off (u32 LE) + val (u32 LE) = 8 bytes. */
-#define R100_DOORBELL_FRAME_SIZE 8
 
 struct R100DoorbellState {
     SysBusDevice parent_obj;
@@ -45,9 +43,8 @@ struct R100DoorbellState {
     R100MailboxState *mailbox;      /* VF0: M6 INTGR sink + M8a ISSR sink */
     R100MailboxState *pf_mailbox;   /* PF: CM7-stub FW_BOOT_DONE target (M8b 3a) */
 
-    /* char-socket may split a frame across callbacks; accumulate to 8 bytes. */
-    uint8_t rx_buf[R100_DOORBELL_FRAME_SIZE];
-    uint32_t rx_len;
+    /* Chardev byte stream may split a frame across callbacks. */
+    RemuFrameRx rx;
 
     uint64_t frames_received;
     uint32_t last_offset;
@@ -57,7 +54,7 @@ struct R100DoorbellState {
 static int r100_doorbell_can_receive(void *opaque)
 {
     R100DoorbellState *s = opaque;
-    return R100_DOORBELL_FRAME_SIZE - s->rx_len;
+    return remu_frame_rx_headroom(&s->rx);
 }
 
 static void r100_doorbell_emit_debug(R100DoorbellState *s,
@@ -78,18 +75,25 @@ static void r100_doorbell_emit_debug(R100DoorbellState *s,
     }
 }
 
+/* FW_BOOT_DONE value written into PF.ISSR[4] by the CM7 stub on SOFT_RESET. */
+#define REMU_FW_BOOT_DONE 0xFB0D
+
 static void r100_doorbell_deliver(R100DoorbellState *s,
                                   uint32_t off, uint32_t val)
 {
+    uint32_t issr_idx = 0;
+    RemuDoorbellKind kind = remu_doorbell_classify(off, &issr_idx);
+
     s->frames_received++;
     s->last_offset = off;
     s->last_value = val;
 
-    fprintf(stderr, "REMU-TRACE: doorbell_deliver off=0x%x val=0x%x count=%" PRIu64 "\n",
-            off, val, s->frames_received);
-    fflush(stderr);
+    qemu_log_mask(LOG_TRACE,
+                  "r100-doorbell: deliver off=0x%x val=0x%x count=%" PRIu64 "\n",
+                  off, val, s->frames_received);
 
-    if (off == R100_BAR4_MAILBOX_INTGR0) {
+    switch (kind) {
+    case REMU_DB_KIND_INTGR0:
         /*
          * REMU CM7-relay shortcut (M8b Stage 3a, commit a01d2b5).
          * Silicon routes host INTGR0 through PCIE_CM7 →
@@ -100,22 +104,21 @@ static void r100_doorbell_deliver(R100DoorbellState *s,
          *   - other bits: relay to VF0.INTGR1 (visible IRQ; default_cb no-op)
          * VF0.INTGR0 untouched — no q-sys subscriber, would just noise dumps.
          */
-        if ((val & 0x1) && s->pf_mailbox) {
-            #define REMU_FW_BOOT_DONE 0xFB0D
+        if ((val & 0x1U) && s->pf_mailbox) {
             r100_mailbox_cm7_stub_write_issr(s->pf_mailbox, 4,
                                              REMU_FW_BOOT_DONE);
-            #undef REMU_FW_BOOT_DONE
         }
         if (val & ~0x1U) {
             r100_mailbox_raise_intgr(s->mailbox, 1, val & ~0x1U);
         }
-    } else if (off == R100_BAR4_MAILBOX_INTGR1) {
+        break;
+    case REMU_DB_KIND_INTGR1:
         r100_mailbox_raise_intgr(s->mailbox, 1, val);
-    } else if (off >= R100_BAR4_MAILBOX_BASE &&
-               off < R100_BAR4_MAILBOX_END) {
-        uint32_t idx = (off - R100_BAR4_MAILBOX_BASE) >> 2;
-        r100_mailbox_set_issr(s->mailbox, idx, val);
-    } else {
+        break;
+    case REMU_DB_KIND_ISSR:
+        r100_mailbox_set_issr(s->mailbox, issr_idx, val);
+        break;
+    case REMU_DB_KIND_OTHER:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "r100-doorbell: unexpected frame off=0x%x val=0x%x\n",
                       off, val);
@@ -125,24 +128,13 @@ static void r100_doorbell_deliver(R100DoorbellState *s,
     r100_doorbell_emit_debug(s, off, val);
 }
 
-/* char-socket may split frames; accumulate 8 bytes per deliver. */
 static void r100_doorbell_receive(void *opaque, const uint8_t *buf, int size)
 {
     R100DoorbellState *s = opaque;
+    uint32_t off, val;
 
     while (size > 0) {
-        uint32_t want = R100_DOORBELL_FRAME_SIZE - s->rx_len;
-        uint32_t take = size < (int)want ? (uint32_t)size : want;
-
-        memcpy(s->rx_buf + s->rx_len, buf, take);
-        s->rx_len += take;
-        buf += take;
-        size -= take;
-
-        if (s->rx_len == R100_DOORBELL_FRAME_SIZE) {
-            uint32_t off = ldl_le_p(s->rx_buf);
-            uint32_t val = ldl_le_p(s->rx_buf + 4);
-            s->rx_len = 0;
+        if (remu_frame_rx_feed(&s->rx, &buf, &size, &off, &val)) {
             r100_doorbell_deliver(s, off, val);
         }
     }
@@ -181,18 +173,17 @@ static void r100_doorbell_reset(DeviceState *dev)
 {
     R100DoorbellState *s = R100_DOORBELL(dev);
 
-    s->rx_len = 0;
+    remu_frame_rx_reset(&s->rx);
     /* frames_received / last_* kept across reset for test inspection. */
 }
 
 static const VMStateDescription r100_doorbell_vmstate = {
     .name = "r100-doorbell",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (VMStateField[]) {
-        VMSTATE_UINT32(rx_len, R100DoorbellState),
-        VMSTATE_UINT8_ARRAY(rx_buf, R100DoorbellState,
-                            R100_DOORBELL_FRAME_SIZE),
+        VMSTATE_UINT32(rx.len, R100DoorbellState),
+        VMSTATE_UINT8_ARRAY(rx.buf, R100DoorbellState, REMU_FRAME_SIZE),
         VMSTATE_UINT64(frames_received, R100DoorbellState),
         VMSTATE_UINT32(last_offset, R100DoorbellState),
         VMSTATE_UINT32(last_value, R100DoorbellState),

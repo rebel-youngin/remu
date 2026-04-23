@@ -19,7 +19,6 @@
 
 #include "qemu/osdep.h"
 #include "qemu/units.h"
-#include "qemu/bswap.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "hw/pci/pci.h"
@@ -32,7 +31,9 @@
 #include "migration/vmstate.h"
 #include "qom/object.h"
 #include "qapi/error.h"
-#include "hw/arm/remu_addrmap.h"
+#include "r100/remu_addrmap.h"
+#include "remu_frame.h"
+#include "remu_doorbell_proto.h"
 
 #define R100_PCI_REVISION       0x01
 #define R100_PCI_CLASS          0x1200  /* Processing accelerator */
@@ -65,8 +66,7 @@ struct R100NpuPciState {
     /* msix (M7 NPU→host): frames from r100-imsix → msix_notify(vec). */
     CharBackend msix_chr;
     CharBackend msix_debug_chr;
-    uint8_t msix_rx_buf[8];
-    uint32_t msix_rx_len;
+    RemuFrameRx msix_rx;
     uint64_t msix_frames_received;
     uint64_t msix_frames_dropped;
     uint32_t msix_last_db_data;
@@ -75,8 +75,7 @@ struct R100NpuPciState {
     /* issr (M8a NPU→host): frames from r100-mailbox → bar4_mmio_regs. */
     CharBackend issr_chr;
     CharBackend issr_debug_chr;
-    uint8_t issr_rx_buf[8];
-    uint32_t issr_rx_len;
+    RemuFrameRx issr_rx;
     uint64_t issr_frames_received;
     uint64_t issr_frames_dropped;
     uint32_t issr_last_offset;
@@ -104,24 +103,10 @@ struct R100NpuPciState {
  * silicon doesn't back-pressure on doorbell writes either. */
 static void r100_doorbell_emit(R100NpuPciState *s, uint32_t off, uint32_t val)
 {
-    uint8_t frame[8];
-    int rc;
-
-    if (!qemu_chr_fe_backend_connected(&s->doorbell_chr)) {
-        return;
+    if (remu_frame_emit(&s->doorbell_chr, "r100-npu-pci doorbell",
+                        off, val) == REMU_FRAME_EMIT_OK) {
+        s->doorbell_frames_sent++;
     }
-
-    stl_le_p(&frame[0], off);
-    stl_le_p(&frame[4], val);
-
-    rc = qemu_chr_fe_write(&s->doorbell_chr, frame, sizeof(frame));
-    if (rc != sizeof(frame)) {
-        qemu_log_mask(LOG_UNIMP,
-                      "r100-npu-pci: doorbell frame off=0x%x val=0x%x "
-                      "dropped (rc=%d)\n", off, val, rc);
-        return;
-    }
-    s->doorbell_frames_sent++;
 }
 
 static uint64_t r100_bar4_mmio_read(void *opaque, hwaddr addr, unsigned size)
@@ -136,8 +121,9 @@ static uint64_t r100_bar4_mmio_read(void *opaque, hwaddr addr, unsigned size)
     v = s->bar4_mmio_regs[idx];
     /* Trace MAILBOX_BASE reads for KMD poll-vs-issr-deliver correlation. */
     if (addr >= 0x80 && addr < 0x180) {
-        fprintf(stderr, "REMU-TRACE: bar4_mmio_read off=0x%x -> 0x%x\n",
-                (uint32_t)addr, v);
+        qemu_log_mask(LOG_TRACE,
+                      "r100-npu-pci: bar4 read off=0x%x -> 0x%x\n",
+                      (uint32_t)addr, v);
     }
     return v;
 }
@@ -154,21 +140,28 @@ static void r100_bar4_mmio_write(void *opaque, hwaddr addr, uint64_t val,
         /* Trace MAILBOX_BASE writes to spot KMD clears that would
          * overwrite an NPU-emitted 0xfb0d. */
         if (addr >= 0x80 && addr < 0x180) {
-            fprintf(stderr, "REMU-TRACE: bar4_mmio_write off=0x%x val=0x%x\n",
-                    (uint32_t)addr, v32);
+            qemu_log_mask(LOG_TRACE,
+                          "r100-npu-pci: bar4 write off=0x%x val=0x%x\n",
+                          (uint32_t)addr, v32);
         }
     }
 
-    /* INTGR{0,1} (M6): frame → NPU mailbox INTGR → SPI.
-     * MAILBOX_BASE..END (M8a host→NPU): frame → r100_mailbox_set_issr.
-     * Other offsets: local stash only (reads serve from bar4_mmio_regs). */
-    if (addr == R100_BAR4_MAILBOX_INTGR0 ||
-        addr == R100_BAR4_MAILBOX_INTGR1) {
+    /* Only bridge-relevant offsets (INTGR{0,1} → M6 SPI path, ISSR
+     * payload range → M8a host→NPU) cross the chardev; other BAR4
+     * writes stay local (reads serve from bar4_mmio_regs). Classifier
+     * is shared with the NPU-side deliver path so there's one wire
+     * spec. */
+    switch (remu_doorbell_classify((uint32_t)addr, NULL)) {
+    case REMU_DB_KIND_INTGR0:
+    case REMU_DB_KIND_INTGR1:
         r100_doorbell_emit(s, (uint32_t)addr, v32);
-    } else if (addr >= R100_BAR4_MAILBOX_BASE &&
-               addr < R100_BAR4_MAILBOX_END) {
+        break;
+    case REMU_DB_KIND_ISSR:
         r100_doorbell_emit(s, (uint32_t)addr, v32);
         s->issr_payload_frames_sent++;
+        break;
+    case REMU_DB_KIND_OTHER:
+        break;
     }
 }
 
@@ -192,7 +185,7 @@ static const MemoryRegionOps r100_bar4_mmio_ops = {
 static int r100_msix_can_receive(void *opaque)
 {
     R100NpuPciState *s = opaque;
-    return sizeof(s->msix_rx_buf) - s->msix_rx_len;
+    return remu_frame_rx_headroom(&s->msix_rx);
 }
 
 static void r100_msix_emit_debug(R100NpuPciState *s, uint32_t off,
@@ -254,20 +247,10 @@ static void r100_msix_deliver(R100NpuPciState *s, uint32_t off,
 static void r100_msix_receive(void *opaque, const uint8_t *buf, int size)
 {
     R100NpuPciState *s = opaque;
+    uint32_t off, db;
 
     while (size > 0) {
-        uint32_t want = sizeof(s->msix_rx_buf) - s->msix_rx_len;
-        uint32_t take = size < (int)want ? (uint32_t)size : want;
-
-        memcpy(s->msix_rx_buf + s->msix_rx_len, buf, take);
-        s->msix_rx_len += take;
-        buf += take;
-        size -= take;
-
-        if (s->msix_rx_len == sizeof(s->msix_rx_buf)) {
-            uint32_t off = ldl_le_p(s->msix_rx_buf);
-            uint32_t db  = ldl_le_p(s->msix_rx_buf + 4);
-            s->msix_rx_len = 0;
+        if (remu_frame_rx_feed(&s->msix_rx, &buf, &size, &off, &db)) {
             r100_msix_deliver(s, off, db);
         }
     }
@@ -279,7 +262,7 @@ static void r100_msix_receive(void *opaque, const uint8_t *buf, int size)
 static int r100_issr_can_receive(void *opaque)
 {
     R100NpuPciState *s = opaque;
-    return sizeof(s->issr_rx_buf) - s->issr_rx_len;
+    return remu_frame_rx_headroom(&s->issr_rx);
 }
 
 static void r100_issr_emit_debug(R100NpuPciState *s, uint32_t off,
@@ -304,8 +287,9 @@ static void r100_issr_deliver(R100NpuPciState *s, uint32_t off, uint32_t val)
     s->issr_last_offset = off;
     s->issr_last_value = val;
 
-    if (off < R100_BAR4_MAILBOX_BASE || off >= R100_BAR4_MAILBOX_END ||
-        (off & 0x3u) != 0) {
+    /* ISSR frames must land in the MAILBOX_BASE range and be 4-byte
+     * aligned; the shared classifier is the single source of truth. */
+    if (remu_doorbell_classify(off, NULL) != REMU_DB_KIND_ISSR) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "r100-npu-pci: issr frame off=0x%x out of "
                       "MAILBOX_BASE range / unaligned\n", off);
@@ -320,29 +304,20 @@ static void r100_issr_deliver(R100NpuPciState *s, uint32_t off, uint32_t val)
     r100_issr_emit_debug(s, off, val, "ok");
     /* Trace for FW_BOOT_DONE visibility debug — did chardev fire, and
      * does the store survive subsequent KMD writes? */
-    fprintf(stderr, "REMU-TRACE: issr_deliver off=0x%x val=0x%x "
-            "stored=0x%x received=%" PRIu64 "\n",
-            off, val, s->bar4_mmio_regs[off >> 2],
-            s->issr_frames_received);
+    qemu_log_mask(LOG_TRACE,
+                  "r100-npu-pci: issr deliver off=0x%x val=0x%x "
+                  "stored=0x%x received=%" PRIu64 "\n",
+                  off, val, s->bar4_mmio_regs[off >> 2],
+                  s->issr_frames_received);
 }
 
 static void r100_issr_receive(void *opaque, const uint8_t *buf, int size)
 {
     R100NpuPciState *s = opaque;
+    uint32_t off, val;
 
     while (size > 0) {
-        uint32_t want = sizeof(s->issr_rx_buf) - s->issr_rx_len;
-        uint32_t take = size < (int)want ? (uint32_t)size : want;
-
-        memcpy(s->issr_rx_buf + s->issr_rx_len, buf, take);
-        s->issr_rx_len += take;
-        buf += take;
-        size -= take;
-
-        if (s->issr_rx_len == sizeof(s->issr_rx_buf)) {
-            uint32_t off = ldl_le_p(s->issr_rx_buf);
-            uint32_t val = ldl_le_p(s->issr_rx_buf + 4);
-            s->issr_rx_len = 0;
+        if (remu_frame_rx_feed(&s->issr_rx, &buf, &size, &off, &val)) {
             r100_issr_deliver(s, off, val);
         }
     }

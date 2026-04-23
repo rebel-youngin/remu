@@ -19,6 +19,21 @@
 #include "hw/qdev-properties.h"
 #include "r100_soc.h"
 
+#define R100_SYSREG_REG_SIZE    0x10000
+#define R100_SYSREG_REG_COUNT   (R100_SYSREG_REG_SIZE / 4)
+
+struct R100SysregState {
+    SysBusDevice parent_obj;
+
+    MemoryRegion iomem;
+    uint32_t regs[R100_SYSREG_REG_COUNT];
+    uint32_t chiplet_id;
+};
+
+typedef struct R100SysregState R100SysregState;
+
+DECLARE_INSTANCE_CHECKER(R100SysregState, R100_SYSREG, TYPE_R100_SYSREG)
+
 static uint64_t r100_sysreg_read(void *opaque, hwaddr addr, unsigned size)
 {
     R100SysregState *s = R100_SYSREG(opaque);

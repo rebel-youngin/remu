@@ -42,6 +42,7 @@ FW_PATCHES = REMU_ROOT / "cli" / "fw-patches"
 MACHINE_SRC = REMU_ROOT / "src" / "machine"
 HOST_SRC = REMU_ROOT / "src" / "host"
 INCLUDE_SRC = REMU_ROOT / "src" / "include"
+BRIDGE_SRC = REMU_ROOT / "src" / "bridge"   # cross-side shared helpers (remu_frame.h, ...)
 IMAGES_DIR = REMU_ROOT / "images"
 OUTPUT_ROOT = REMU_ROOT / "output"
 
@@ -52,6 +53,11 @@ OUTPUT_ROOT = REMU_ROOT / "output"
 # host-side PCI device compile into both binaries.
 QEMU_TARGETS = "aarch64-softmmu,x86_64-softmmu"
 QEMU_TARGETS_MARKER = QEMU_BUILD / ".remu-targets"
+# Stores the full configure argv; any change (targets, extra-cflags, ...)
+# triggers an automatic reconfigure. Independent of QEMU_TARGETS_MARKER
+# so existing build trees from before this file existed still upgrade
+# on the next run.
+QEMU_CONFIGURE_MARKER = QEMU_BUILD / ".remu-configure"
 
 # Phase 2 shared-memory bridge defaults.
 # 128 MB is a power-of-2 scratch size — plenty to prove cross-process
@@ -92,7 +98,7 @@ FW_INSTALL_MAP = [
     ("FreeRTOS_CP1/freertos_kernel.bin",   "freertos_cp1.bin"),
 ]
 
-# R100 chiplet offset (must match R100_CHIPLET_OFFSET in remu_addrmap.h).
+# R100 chiplet offset (must match R100_CHIPLET_OFFSET in r100/remu_addrmap.h).
 R100_CHIPLET_OFFSET = 0x2000000000
 R100_NUM_CHIPLETS = 4
 
@@ -160,11 +166,6 @@ def _link_sources():
     if not r100_dir.exists():
         r100_dir.symlink_to(MACHINE_SRC)
         click.echo("  Linked %s -> %s" % (r100_dir, MACHINE_SRC))
-
-    include_link = QEMU_SRC / "include" / "hw" / "arm" / "remu_addrmap.h"
-    if not include_link.exists():
-        include_link.symlink_to(INCLUDE_SRC / "remu_addrmap.h")
-        click.echo("  Linked %s" % include_link)
 
     r100_soc_h_link = QEMU_SRC / "include" / "hw" / "arm" / "r100_soc.h"
     if not r100_soc_h_link.exists():
@@ -317,35 +318,35 @@ def build(clean, jobs):
 
     QEMU_BUILD.mkdir(parents=True, exist_ok=True)
 
-    # Configure if the build dir is fresh OR the target list has changed
-    # since the last configure. The marker file lets us detect an old
-    # aarch64-only build tree and transparently upgrade it to the dual
-    # aarch64+x86_64 configuration without requiring --clean.
+    # Full configure argv — written verbatim to QEMU_CONFIGURE_MARKER so
+    # any change (targets, extra-cflags, debug flags, ...) re-triggers
+    # configure. QEMU_TARGETS_MARKER is still written for backward
+    # compatibility with older build trees / tooling that reads it.
+    configure_cmd = [
+        str(QEMU_SRC / "configure"),
+        "--target-list=%s" % QEMU_TARGETS,
+        "--prefix=%s" % (REMU_ROOT / "install"),
+        "--enable-debug",
+        "--disable-werror",
+        "--disable-docs",
+        "--disable-guest-agent",
+        "--extra-cflags=-I%s -I%s" % (INCLUDE_SRC, BRIDGE_SRC),
+    ]
+    configure_key = "\n".join(configure_cmd) + "\n"
+
     have_build = (QEMU_BUILD / "build.ninja").exists()
-    have_targets = (
-        QEMU_TARGETS_MARKER.is_file()
-        and QEMU_TARGETS_MARKER.read_text().strip() == QEMU_TARGETS
+    have_configure = (
+        QEMU_CONFIGURE_MARKER.is_file()
+        and QEMU_CONFIGURE_MARKER.read_text() == configure_key
     )
-    if not have_build or not have_targets:
-        if have_build and not have_targets:
-            click.echo("Target list changed; re-configuring "
-                       "(was: %r, now: %r)..." % (
-                           QEMU_TARGETS_MARKER.read_text().strip()
-                           if QEMU_TARGETS_MARKER.is_file() else "<none>",
-                           QEMU_TARGETS))
+    if not have_build or not have_configure:
+        if have_build and not have_configure:
+            click.echo("Configure argv changed; re-configuring...")
         else:
             click.echo("Configuring QEMU (%s)..." % QEMU_TARGETS)
-        _run([
-            str(QEMU_SRC / "configure"),
-            "--target-list=%s" % QEMU_TARGETS,
-            "--prefix=%s" % (REMU_ROOT / "install"),
-            "--enable-debug",
-            "--disable-werror",
-            "--disable-docs",
-            "--disable-guest-agent",
-            "--extra-cflags=-I%s" % INCLUDE_SRC,
-        ], cwd=QEMU_BUILD)
+        _run(configure_cmd, cwd=QEMU_BUILD)
         QEMU_TARGETS_MARKER.write_text(QEMU_TARGETS + "\n")
+        QEMU_CONFIGURE_MARKER.write_text(configure_key)
 
     # Build
     nj = jobs if jobs > 0 else os.cpu_count()
