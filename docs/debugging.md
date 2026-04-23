@@ -44,8 +44,11 @@ QEMU + R100 device models:
 Firmware (CA73 boot set — `tf-a` + `cp0` + `cp1`, installed into `images/`):
 
 ```
-./remucli fw-build -p silicon
+./remucli fw-build                 # platform defaults to silicon (the only supported profile)
 ```
+
+`-p zebu` / `-p zebu_ci` / `-p zebu_vdk` still build via `q-sys/build.sh`
+but emit a deprecation warning and are not part of any REMU regression.
 
 Cross-reference the output with `./remucli status` — all six CA73
 binaries (`bl1.bin`, `bl2.bin`, `bl31_cp{0,1}.bin`,
@@ -127,8 +130,15 @@ output/
 
 Everything under `/dev/shm/remu-<name>/` is cleaned up on exit. If
 `./remucli run --host` is killed `SIGKILL`-style and leaves an orphan
-behind, `rm -rf /dev/shm/remu-<name>` plus `pkill -f qemu-system-` is
-the manual recovery.
+behind, `./remucli clean --name <name>` is the recovery — it SIGTERMs
+(then SIGKILLs) any `qemu-system-*` process whose cmdline mentions
+this run's `/dev/shm/remu-<name>/` or `output/<name>/`, wipes the
+tmpfs dir, and unlinks stale `*.sock` files so the next bind doesn't
+`EADDRINUSE`. The same sweep is invoked automatically at the top of
+every `./remucli run --name <name>` invocation, so re-running with
+the same name after a crash is safe without manual steps. `./remucli
+clean --all` is the "something is broken, nuke every REMU-shaped
+thing" escape hatch for multi-run messes.
 
 ## Recommended agent workflow
 
@@ -156,12 +166,15 @@ The standard loop when iterating on device models is:
 
 5. When you're done (or when the boot stalls and stops emitting new
    output), stop QEMU. From the same terminal: `Ctrl-A X`. From another
-   terminal / the agent: `pkill -f qemu-system-aarch64` (or kill the
-   specific PID).
+   terminal / the agent: `./remucli clean --name iter-N` (preferred —
+   kills just this run's QEMU children, wipes its tmpfs and sockets)
+   or `pkill -f qemu-system-aarch64` if you want to nuke every REMU
+   NPU QEMU at once.
 
-6. If you need a fresh run, pick a new `--name` or accept the default
-   timestamped directory — old runs stay around under `output/` for
-   comparison and are gitignored.
+6. If you need a fresh run, reuse the same `--name` (the auto-cleanup
+   at the top of every `./remucli run` call clears any prior state)
+   or accept the default timestamped directory. Old runs stay around
+   under `output/` for comparison and are gitignored.
 
 ## GDB workflow
 
@@ -316,7 +329,21 @@ On the x86 side, the container-BAR0 window is at physical
 offsets become `0xE000000000 + <shm offset>`. On the NPU side,
 chiplet-0 DRAM starts at physical `0x0`, so the same bytes live at
 `<shm offset>`. `tests/m5_dataflow_test.py` is the canonical
-end-to-end check.
+end-to-end check — invoke it directly, or via the packaged CLI
+runner:
+
+```
+./remucli test m5          # one bridge
+./remucli test m5 m6 m7 m8 # explicit list
+./remucli test all         # every bridge, with per-test auto-cleanup
+```
+
+`./remucli test` shells out to each `tests/mN_*.py` after calling
+`_cleanup_run_trash` on its per-test `--name` (`m5-flow`, `m6-doorbell`,
+`m7-msix`, `m8-issr`), so back-to-back invocations don't trip over
+stale shm / sockets / orphan QEMUs from a prior attempt. Use
+`--stop-on-fail` to abort at the first failure, `--skip-clean` if you
+want to inspect leftover state (not recommended).
 
 ### Doorbell + mailbox path (M6)
 
@@ -346,7 +373,7 @@ printf 'info qtree\nquit\n' \
   | rg 'r100-(doorbell|mailbox)'
 
 # Drive a synthetic frame end-to-end without the kmd
-python3 tests/m6_doorbell_test.py
+python3 tests/m6_doorbell_test.py   # or: ./remucli test m6
 ```
 
 `output/<name>/doorbell.log` is the ASCII trace of every
@@ -389,7 +416,7 @@ printf 'info mtree\nquit\n' \
   | rg 'msix-(table|pba)'
 
 # Drive a synthetic frame end-to-end without the FW
-python3 tests/m7_msix_test.py
+python3 tests/m7_msix_test.py       # or: ./remucli test m7
 ```
 
 `output/<name>/msix.log` is the ASCII trace of every frame the host
@@ -463,7 +490,7 @@ printf 'xp /1wx 0x1ff8160090\nquit\n' \
 # The two must agree at steady state.
 
 # Drive a synthetic bidirectional exchange without the kmd or FW
-python3 tests/m8_issr_test.py
+python3 tests/m8_issr_test.py       # or: ./remucli test m8
 ```
 
 `output/<name>/issr.log` is the ASCII trace of every ISSR frame the
@@ -681,7 +708,7 @@ the FW side or synthesise it in QEMU analogous to the CM7-stub.
 
 ## Interpreting a boot log
 
-Chiplet 0's `uart0.log` on a healthy `-p silicon` boot progresses
+Chiplet 0's `uart0.log` on a healthy `silicon` boot progresses
 through these markers in order. Missing markers pinpoint the stall:
 
 | Marker | Meaning / on failure look at |
@@ -703,7 +730,7 @@ through these markers in order. Missing markers pinpoint the stall:
 
 | Symptom | Likely cause | Where to look |
 |---|---|---|
-| No output at all | FW images not loaded | `./remucli status`, then re-run `./remucli fw-build -p silicon`. |
+| No output at all | FW images not loaded | `./remucli status`, then re-run `./remucli fw-build`. |
 | `cpu_on without RVBAR` in `qemu.log` | PMU read_rvbar path missing a cluster | `r100_pmu.c:r100_pmu_read_rvbar`. |
 | BL2 spins after `Set RVBAR ... cluster: 1` | `CP1_NONCPU_STATUS` / `CP1_L2_STATUS` not pre-seeded ON | `r100_pmu.c:r100_pmu_set_defaults`. |
 | BL31 secondary crashes into `plat_panic_handler` before banner | MPIDR encoding mismatch, or GIC distributor read hitting `cfg_mr` catch-all | `r100_soc.c:r100_build_chiplet_view` (GIC aliases) + MPIDR layout. |

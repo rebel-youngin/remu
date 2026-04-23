@@ -4,7 +4,7 @@
 
 **Goal**: TF-A BL1 → BL2 → BL31 → FreeRTOS boots on all 4 chiplets, with both CP0 and CP1 clusters online on every chiplet.
 
-**Status**: done. `./remucli fw-build -p silicon` + `./remucli run` boots every chiplet end-to-end:
+**Status**: done. `./remucli fw-build` + `./remucli run` boots every chiplet end-to-end (platform defaults to `silicon`; the `zebu*` profiles warn-and-build but no longer gate anything):
 
 - CP0 on every chiplet reaches `Hello world FreeRTOS_CP` / `hw_init: done` / `REBELLIONS$` on its own UART (`output/<run>/uart{0,1,2,3}.log`).
 - All 16 CP1 vCPUs run q-cp FreeRTOS steady-state: `CP1.cpu0` in `ipm_samsung_receive`, `CP1.cpu{1,2,3}` in `taskmgr_fetch_dnc_task_worker_cp1`. Verified via `aarch64-none-elf-gdb -ex 'target remote :1234' -x tests/scripts/gdb_inspect_cp1.gdb` (pure-GDB script — the bundled `aarch64-none-elf-gdb` has no Python).
@@ -42,7 +42,7 @@ Additional inline RAM stubs in `r100_soc.c`: PCIe sub-controller (`PHY{0..3}_SRA
 ### Infrastructure
 
 - `r100-soc` machine type registered with `-machine` suffix.
-- `./remucli` (thin wrapper around `cli/remu_cli.py`): `build` / `run` / `status` / `gdb` / `images` / `fw-build`.
+- `./remucli` (thin wrapper around `cli/remu_cli.py`): `build` / `run` / `status` / `gdb` / `images` / `fw-build` / `test` (M5..M8 bridge suite) / `clean` (per-run or global orphan sweeper). Every `run` invocation auto-calls the cleanup path first so re-using a `--name` after an abort is idempotent — no leftover tmpfs, sockets, or QEMU children.
 - q-sys FW source in `external/ssw-bundle` (TF-A with CA73 errata + Spectre v4 workarounds disabled in `platform.mk`).
 - `external/qemu` pinned at upstream `v9.2.0`, kept unmodified in git terms. `./remucli build` idempotently symlinks remu sources into `hw/arm/r100/`, injects `subdir('r100')` into `hw/arm/meson.build`, and re-applies `cli/qemu-patches/*.patch`. `./remucli fw-build` mirrors the same patch-idempotency dance on the firmware submodule via `cli/fw-patches/*.patch`. **Project policy: `cli/fw-patches/` is kept empty — the q-sys submodule stays byte-identical to upstream, and any unmodelled hardware block is modelled on the QEMU side rather than skipped with an `#ifdef` in firmware.** The apply plumbing is retained so developer-local debug patches dropped into the directory are still picked up; see `cli/fw-patches/README.md`. The QEMU-side patches are small, self-contained, and upstreamable as-is: `0001-arm-gicv3-first-cpu-index.patch` adds a `first-cpu-index` property so per-chiplet GIC instances bind to disjoint CPU ranges (default 0 preserves upstream behaviour); `0002-arm-gicv3-reset-cpuif-after-init.patch` makes `gicv3_init_cpuif()` call `icc_reset()` itself at the tail of each per-CPU setup, so the GIC CPU interface seeds its own reset state (ICC_BPR1_EL1, ICC_CTLR_EL1, …) independently of whether the surrounding machine flow resets the CPU again after the GIC realizes — fixes the M8b Stage 2c `assert(bpr > 0)` abort for bootstrap CPUs that would otherwise miss their ICC_* resetfn entirely. `.gitmodules` uses `ignore = dirty` so build-time mods stay off the superproject's `git status`.
 

@@ -18,14 +18,33 @@ wrapper around `cli/remu_cli.py`. **No install step** — just make sure
 
 ```
 ./remucli build                     # builds QEMU (aarch64 + x86_64) with R100 device models
-./remucli fw-build -p silicon       # builds q-sys FW (tf-a + cp0 + cp1) → images/
+./remucli fw-build                  # builds q-sys FW (tf-a + cp0 + cp1) → images/ (silicon, implicit)
 ./remucli status                    # sanity-check environment
-./remucli run --name my-test        # Phase 1: boot NPU only; logs land in output/my-test/
+./remucli run --name my-test        # Phase 1: boot NPU only; logs land in output/my-test/ (auto-cleans first)
 ./remucli run --name dbg --gdb      # Phase 1: boot paused, wait for GDB on :1234
 ./remucli run --host --name pair    # Phase 2: launch NPU + x86 host QEMUs with r100-npu-pci bridge
+./remucli test                      # run M5+M6+M7+M8 bridge tests (or `./remucli test m5 m7` for a subset)
+./remucli clean --name pair         # wipe orphan procs / shm / sockets left by a SIGKILL'd prior run
+./remucli clean --all               # nuke every /dev/shm/remu-* dir + associated QEMU processes
 ./guest/build-guest-image.sh        # M8b Stage 2: stage images/x86_guest/{bzImage,initramfs.cpio.gz}
 ./guest/build-kmd.sh                # M8b Stage 2: rebuild rebellions.ko + rblnfs.ko against host kernel
 ```
+
+`./remucli fw-build` defaults to `silicon` — the only FW profile REMU
+exercises end-to-end. The `zebu` / `zebu_ci` / `zebu_vdk` profiles are
+still accepted by `-p <name>` but emit a deprecation warning and are
+not part of any regression loop.
+
+`./remucli run` auto-invokes `./remucli clean --name <name>` at the
+very start of every invocation, so a SIGKILL-killed prior run with the
+same name (orphan QEMU processes still mmap'd over
+`/dev/shm/remu-<name>/`, stale `*.sock` files that would
+`EADDRINUSE`-block a fresh bind) gets wiped before anything new is
+launched. Concurrent runs with a *different* `--name` value are left
+strictly alone — the sweep only matches cmdlines referencing the
+current run's paths. `./remucli test` runs each M5..M8 end-to-end test
+with the same pre-cleanup and prints a concise PASS/FAIL summary (full
+per-test stdout spools to `output/test-<id>.log`).
 
 `./remucli build` produces two QEMU binaries from one pinned source
 tree: `build/qemu/qemu-system-aarch64` (NPU side, Phase 1 FW boot) and
@@ -108,7 +127,9 @@ instructions that trap `#UD` on the minimal `qemu64` CPU.
 
 Any check failing prints to the terminal — the NPU still boots for
 post-mortem poking. End-to-end sanity scripts, one per milestone
-bridge:
+bridge, driven together by `./remucli test` (pass `m5 m6 m7 m8` for a
+subset; `--stop-on-fail` aborts on first failure; pre-run cleanup is
+implicit per test so a SIGKILL'd prior attempt never poisons the next):
   - `tests/m5_dataflow_test.py` writes a magic pattern to
     `/dev/shm/.../remu-shm` at offset 0x07F00000 and asserts `xp /4wx`
     on both monitors returns the same bytes.
@@ -151,10 +172,12 @@ cd build/qemu && ninja -j$(nproc)
 
 `./remucli fw-build` wraps `external/ssw-bundle/.../q/sys/build.sh`. Components
 are repeatable (`-c tf-a -c cp0 -c cp1`, default covers the CA73 boot set);
-platform is `silicon` / `zebu` / `zebu_ci` / `zebu_vdk`; `--install` (default
-on) copies the 6 CA73 binaries into `images/`. Toolchains are taken from
-`COMPILER_PATH_ARM64` / `COMPILER_PATH_ARM32` env vars, with defaults under
-`/mnt/data/tools/...`.
+platform defaults to `silicon` (the only supported profile — explicit
+`-p zebu` / `-p zebu_ci` / `-p zebu_vdk` still build via `build.sh` but
+emit a deprecation warning and are not part of any REMU regression);
+`--install` (default on) copies the 6 CA73 binaries into `images/`.
+Toolchains are taken from `COMPILER_PATH_ARM64` / `COMPILER_PATH_ARM32`
+env vars, with defaults under `/mnt/data/tools/...`.
 
 Before invoking `build.sh`, `fw-build` idempotently applies every
 `cli/fw-patches/*.patch` to the q-sys submodule — same
@@ -207,7 +230,7 @@ output/               Per-run log directories (gitignored; see docs/debugging.md
 - **CPU**: 8x CA73 per chiplet (2 clusters x 4 cores) = 32 total
 - **CHIPLET_OFFSET**: `0x2000000000` between chiplets
 - **Boot**: TF-A BL1 → BL2 → BL31 → FreeRTOS (q-sys), then q-cp tasks
-- **FW build**: `./remucli fw-build -p silicon` (default). The zebu / zebu_ci / zebu_vdk profiles are still accepted by `-p <name>` but are deprecated — see `docs/roadmap.md` Phase 1 Status
+- **FW build**: `./remucli fw-build` — `silicon` is the implicit default and the only supported profile. `-p zebu` / `zebu_ci` / `zebu_vdk` are deprecated (still accepted, prints a warning) — see `docs/roadmap.md` Phase 1 Status
 - **UART**: PL011 at `0x1FF9040000` (PERI0_UART0), 250MHz clock
 - **GIC**: GICv3 distributor at `0x1FF3800000`, redistributor at `0x1FF3840000`
 - **Timer**: 500MHz generic timer (`CORE_TIMER_FREQ`)

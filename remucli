@@ -6,9 +6,12 @@
 #
 # Usage:
 #   ./remucli build
-#   ./remucli fw-build -p silicon
+#   ./remucli fw-build                       # platform defaults to silicon
 #   ./remucli run --name my-test
+#   ./remucli run --host --name pair
 #   ./remucli run --gdb --name dbg
+#   ./remucli test all                       # m5 .. m8 bridge suite
+#   ./remucli clean --name my-test           # kill stragglers, wipe shm
 #   ./remucli gdb -b <elf>
 #   ./remucli status
 #

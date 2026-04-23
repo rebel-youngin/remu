@@ -12,11 +12,13 @@ doubles on a fresh tree; incremental rebuilds only touch changed files.
 
 Usage:
     ./remucli build [--clean] [--jobs N]
-    ./remucli fw-build [-p silicon] [-c tf-a -c cp0 -c cp1] [--clean]
+    ./remucli fw-build [-c tf-a -c cp0 -c cp1] [--clean]   # -p silicon implicit
     ./remucli run [--name NAME] [--gdb] [--trace] [--chiplets N]
     ./remucli gdb [--port PORT] [-b ELF]
     ./remucli status
     ./remucli images [--check | --from-dir PATH]
+    ./remucli test [m5|m6|m7|m8|all]...
+    ./remucli clean [--name NAME | --all]
     ./remucli completion {bash,zsh,fish}
 """
 
@@ -365,6 +367,11 @@ def build(clean, jobs):
 # q-sys scripts/, so we don't expose it here.
 FW_COMPONENTS = ["all", "tf-a", "cp0", "cp1", "cm", "boot", "bootrom", "cmrt"]
 FW_PLATFORMS = ["silicon", "zebu", "zebu_ci", "zebu_vdk"]
+# `silicon` is the only profile REMU exercises end-to-end; the other
+# three are passed through to q-sys `build.sh` for developer sanity
+# checks but are no longer part of any REMU regression loop. `fw-build`
+# emits a deprecation warning whenever one is selected explicitly.
+FW_DEPRECATED_PLATFORMS = {"zebu", "zebu_ci", "zebu_vdk"}
 FW_MODES = ["debug", "release", "profile"]
 
 # Minimum component set for a CA73-only boot (no RoT/CMRT/PCIe-CM7).
@@ -431,7 +438,8 @@ def _install_fw():
                    "(minimum CA73 boot set).")
 @click.option("--platform", "-p", default="silicon",
               type=click.Choice(FW_PLATFORMS),
-              help="Target platform. Default 'silicon'.")
+              help="Target platform. Default 'silicon' (the only supported "
+                   "profile; zebu/zebu_ci/zebu_vdk are deprecated).")
 @click.option("--mode", "-m", default="debug",
               type=click.Choice(FW_MODES))
 @click.option("--chiplets", "-cl", type=int, default=4,
@@ -448,6 +456,13 @@ def fw_build(components, platform, mode, chiplets, clean, install):
 
     targets = list(components) if components else list(FW_CA73_SEQUENCE)
     env = _fw_env()
+
+    if platform in FW_DEPRECATED_PLATFORMS:
+        click.secho(
+            "Warning: platform '-p %s' is deprecated. REMU exercises only "
+            "'silicon' end-to-end; the zebu* profiles build but are not "
+            "part of any regression. Drop `-p` to use the implicit "
+            "'silicon' default." % platform, fg="yellow")
 
     click.echo("q-sys fw-build: targets=%s platform=%s mode=%s chiplets=%d" %
                (",".join(targets), platform, mode, chiplets))
@@ -700,6 +715,128 @@ def _setup_shm(run_name, size):
         with open(shm_file, "wb") as f:
             f.truncate(size)
     return shm_dir, shm_file
+
+
+# ── cleanup helpers ──────────────────────────────────────────────────────────
+#
+# The normal teardown path (atexit + SIGTERM/HUP/PIPE handlers in `run`) wipes
+# /dev/shm/remu-<name>/ and kills the child QEMU processes. Anything that
+# bypasses that path — SIGKILL on the python wrapper, a crashing test harness,
+# a machine reboot mid-run — leaves orphan QEMU processes mmap'd over the shm
+# file plus stale *.sock files that would EADDRINUSE-block the next bind.
+# `_cleanup_run_trash` is the belt-and-braces sweep: narrowly scoped to a
+# given run name so concurrent runs with different names stay untouched.
+
+def _pid_alive(pid):
+    """True iff pid currently exists and we can signal it."""
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+def _qemu_pids_referencing(needles):
+    """Return list of (pid, cmdline) for `qemu-system-*` processes whose
+    /proc/<pid>/cmdline contains ANY of the given string needles.
+    `needles` is a list of absolute paths (shm dir, output dir, ...);
+    passing run-specific paths keeps the sweep from touching unrelated
+    simulations."""
+    needles = [str(n) for n in needles if n]
+    hits = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            comm = (entry / "comm").read_text().strip()
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        if not comm.startswith("qemu-system"):
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_bytes().replace(
+                b"\0", b" ").decode("utf-8", "replace")
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        if any(n in cmdline for n in needles):
+            hits.append((int(entry.name), cmdline))
+    return hits
+
+
+def _kill_and_wait(pids, grace=3.0):
+    """SIGTERM all, wait up to `grace` seconds for each to exit, then
+    SIGKILL stragglers. Silent on lookup / permission races."""
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    deadline = time.time() + grace
+    remaining = list(pids)
+    while remaining and time.time() < deadline:
+        time.sleep(0.1)
+        remaining = [p for p in remaining if _pid_alive(p)]
+    for pid in remaining:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def _cleanup_run_trash(run_name, output_root=None, verbose=True):
+    """Best-effort teardown of anything a prior run with `run_name` may
+    have left behind. Matches are scoped by path so concurrent runs with
+    *different* names keep working untouched.
+
+      1. QEMU processes whose cmdline mentions /dev/shm/remu-<name>/ or
+         output/<name>/ — they're the workers of a prior invocation.
+      2. The /dev/shm/remu-<name>/ tmpfs directory (and anything inside).
+      3. Stale *.sock files under output/<name>/ — QEMU socket-chardev
+         servers refuse to bind an existing path.
+
+    Returns a dict with counts (`procs`, `shm`, `socks`) so callers can
+    summarize without re-walking /proc."""
+    root = Path(output_root).resolve() if output_root else OUTPUT_ROOT
+    out_dir = root / run_name
+    shm_dir = SHM_ROOT / ("remu-" + run_name)
+
+    needles = [str(shm_dir)]
+    if out_dir.exists():
+        needles.append(str(out_dir))
+    hits = _qemu_pids_referencing(needles)
+    if hits and verbose:
+        click.echo("  Cleaning %d orphan QEMU process(es) from prior '%s':"
+                   % (len(hits), run_name))
+        for pid, _cmd in hits:
+            click.echo("    pid %d" % pid)
+    _kill_and_wait([p for p, _ in hits])
+
+    shm_removed = False
+    if shm_dir.exists():
+        try:
+            shutil.rmtree(shm_dir)
+            shm_removed = True
+            if verbose:
+                click.echo("  Removed %s" % shm_dir)
+        except OSError as e:
+            if verbose:
+                click.secho("  Warning: could not remove %s: %s"
+                            % (shm_dir, e), fg="yellow")
+
+    socks_removed = 0
+    if out_dir.exists():
+        for p in out_dir.rglob("*.sock"):
+            try:
+                p.unlink()
+                socks_removed += 1
+            except OSError:
+                pass
+        if socks_removed and verbose:
+            click.echo("  Removed %d stale socket file(s) under %s"
+                       % (socks_removed, out_dir))
+
+    return {"procs": len(hits), "shm": 1 if shm_removed else 0,
+            "socks": socks_removed}
 
 
 def _build_host_cmd(host_dir, shm_file, shm_size, monitor_sock, mem,
@@ -1322,6 +1459,16 @@ def run(name, output_root, gdb, trace, chiplets, memory,
     if with_host:
         _check_qemu_bin("x86_64")
 
+    # Resolve the run name BEFORE creating the output dir so the cleanup
+    # sweep narrows to exactly this run's prior state (orphan QEMUs from
+    # a SIGKILL'd previous invocation, the stale /dev/shm backing file,
+    # and *.sock files that would block a fresh socket bind). Runs with
+    # different --name values stay untouched.
+    if not name:
+        name = "run-" + time.strftime("%Y%m%d-%H%M%S")
+    click.echo("Preparing run '%s' (clearing prior state)..." % name)
+    _cleanup_run_trash(name, output_root=output_root, verbose=True)
+
     run_dir, run_name = _make_run_dir(name, output_root)
     click.echo("Run directory: %s" % run_dir)
 
@@ -1753,7 +1900,7 @@ def status():
     if not any_found:
         click.echo()
         click.secho("  No firmware images found. Run: "
-                     "./remucli fw-build -p silicon", fg="yellow")
+                     "./remucli fw-build", fg="yellow")
 
     # Device models
     click.echo()
@@ -1823,6 +1970,200 @@ def images(check, from_dir):
                          (fname, addr), fg="red")
     click.echo()
     click.echo("Copy images manually or use: ./remucli images --from-dir <path>")
+
+
+# ── clean ────────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.option("--name", "-n", default=None,
+              help="Clean one named run's leftovers (procs, shm, sockets).")
+@click.option("--all", "all_", is_flag=True,
+              help="Clean every /dev/shm/remu-* directory and any QEMU "
+                   "process still mapping one of them.")
+@click.option("--output-root", type=click.Path(file_okay=False), default=None,
+              help="Parent directory for run outputs. Default: <repo>/output/.")
+def clean(name, all_, output_root):
+    """Tear down orphan state from a prior run.
+
+    Sweeps three things for the matching run name(s):
+
+    \b
+      - QEMU processes mentioning /dev/shm/remu-<name>/ or output/<name>/
+        in their cmdline (SIGTERM, then SIGKILL after 3 s).
+      - /dev/shm/remu-<name>/ (the tmpfs backing directory).
+      - *.sock files under output/<name>/ that would block a re-bind.
+
+    `./remucli run --name <n>` auto-invokes this at start, so manual
+    cleanup is only needed after SIGKILL-style crashes or before reusing
+    a run name across sessions. `--all` is the "something is broken,
+    nuke everything REMU-shaped" escape hatch.
+    """
+    if not name and not all_:
+        raise click.UsageError(
+            "Pass --name NAME to clean one run, or --all for a full sweep.")
+
+    root = Path(output_root).resolve() if output_root else OUTPUT_ROOT
+    totals = {"procs": 0, "shm": 0, "socks": 0}
+
+    if all_:
+        shm_dirs = sorted(SHM_ROOT.glob("remu-*"))
+        out_dirs = sorted([p for p in root.glob("*")
+                           if p.is_dir() and p.name != "latest"]) \
+            if root.exists() else []
+        names = set()
+        for d in shm_dirs:
+            names.add(d.name[len("remu-"):])
+        for d in out_dirs:
+            names.add(d.name)
+        if not names:
+            click.echo("Nothing to clean.")
+            return
+        for n in sorted(names):
+            click.echo("• %s" % n)
+            counts = _cleanup_run_trash(n, output_root=root, verbose=True)
+            for k in totals:
+                totals[k] += counts[k]
+    else:
+        counts = _cleanup_run_trash(name, output_root=root, verbose=True)
+        for k in totals:
+            totals[k] += counts[k]
+
+    click.secho(
+        "Cleanup complete: killed %d proc(s), removed %d shm dir(s), "
+        "%d socket(s)." % (totals["procs"], totals["shm"], totals["socks"]),
+        fg="green")
+
+
+# ── test ─────────────────────────────────────────────────────────────────────
+
+# Registry of end-to-end bridge tests. `run_name` must match the RUN_NAME
+# the test script hardcodes so pre-run cleanup narrows to the same paths
+# the test will touch on launch.
+TEST_REGISTRY = {
+    "m5": {
+        "script": "tests/m5_dataflow_test.py",
+        "run_name": "m5-flow",
+        "desc": "M5 data-flow: host x86 BAR0 ↔ NPU chiplet-0 DRAM coherency",
+        "needs": ("aarch64", "x86_64"),
+    },
+    "m6": {
+        "script": "tests/m6_doorbell_test.py",
+        "run_name": "m6-doorbell",
+        "desc": "M6 doorbell: guest → NPU INTGR + bogus frame rejection",
+        "needs": ("aarch64",),
+    },
+    "m7": {
+        "script": "tests/m7_msix_test.py",
+        "run_name": "m7-msix",
+        "desc": "M7 iMSIX: NPU → host MSI-X + oor/bad-offset rejection",
+        "needs": ("x86_64",),
+    },
+    "m8": {
+        "script": "tests/m8_issr_test.py",
+        "run_name": "m8-issr",
+        "desc": "M8 ISSR bridge: NPU↔host both-direction shadow",
+        "needs": ("aarch64", "x86_64"),
+    },
+}
+
+TEST_KEYS = list(TEST_REGISTRY.keys())
+
+
+@cli.command()
+@click.argument("tests", nargs=-1,
+                type=click.Choice(TEST_KEYS + ["all"]))
+@click.option("--skip-clean", is_flag=True,
+              help="Don't pre-clean each test's run dir (not recommended).")
+@click.option("--stop-on-fail", is_flag=True,
+              help="Abort the suite on the first failing test.")
+def test(tests, skip_clean, stop_on_fail):
+    """Run REMU bridge end-to-end tests with pre-run cleanup.
+
+    By default runs the full suite (m5..m8). Pass one or more test ids
+    to pick specific phases, e.g.:
+
+    \b
+        ./remucli test              # all four
+        ./remucli test m5 m6        # just M5 + M6
+        ./remucli test m8           # just M8
+
+    Each test is launched after `./remucli clean --name <its-run>` so
+    orphan QEMU processes / stale shm / stale sockets from a prior
+    invocation never contaminate the result. Per-test stdout is
+    captured under output/test-<id>.log; only a one-line PASS/FAIL
+    plus a short tail on failure is printed, so the suite's total
+    output stays small enough to paste into a bug report.
+    """
+    if not tests or "all" in tests:
+        selected = list(TEST_KEYS)
+    else:
+        seen = set()
+        selected = [t for t in tests if not (t in seen or seen.add(t))]
+
+    needs = set()
+    for t in selected:
+        needs.update(TEST_REGISTRY[t]["needs"])
+    for which in sorted(needs):
+        _check_qemu_bin(which)
+
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    results = []
+    for t in selected:
+        info = TEST_REGISTRY[t]
+        script = REMU_ROOT / info["script"]
+        log = OUTPUT_ROOT / ("test-%s.log" % t)
+
+        click.echo()
+        click.secho("[%s] %s" % (t, info["desc"]), fg="cyan")
+        if not skip_clean:
+            _cleanup_run_trash(info["run_name"], verbose=False)
+
+        if not script.is_file():
+            click.secho("  SKIP: %s not found" % script, fg="yellow")
+            results.append((t, None))
+            continue
+
+        start = time.time()
+        with open(log, "wb") as lf:
+            rc = subprocess.run(
+                [sys.executable, str(script)],
+                stdout=lf, stderr=subprocess.STDOUT,
+                cwd=REMU_ROOT,
+            ).returncode
+        dur = time.time() - start
+
+        if rc == 0:
+            click.secho("  PASS (%.1fs, log: %s)" % (dur, log), fg="green")
+        else:
+            click.secho("  FAIL rc=%d (%.1fs, log: %s)" %
+                        (rc, dur, log), fg="red")
+            tail = log.read_text(errors="replace").splitlines()[-30:]
+            for ln in tail:
+                click.echo("    " + ln)
+        results.append((t, rc))
+        if rc and stop_on_fail:
+            click.secho("Stopping on first failure (--stop-on-fail).",
+                        fg="red")
+            break
+
+    click.echo()
+    click.echo("Test summary:")
+    failed = 0
+    skipped = 0
+    for t, rc in results:
+        if rc is None:
+            click.secho("  SKIP  %s" % t, fg="yellow")
+            skipped += 1
+        elif rc == 0:
+            click.secho("  PASS  %s" % t, fg="green")
+        else:
+            click.secho("  FAIL  %s  (rc=%d)" % (t, rc), fg="red")
+            failed += 1
+    total = len(results)
+    click.echo("  %d/%d passed, %d failed, %d skipped"
+               % (total - failed - skipped, total, failed, skipped))
+    if failed:
+        raise SystemExit(1)
 
 
 # ── completion ───────────────────────────────────────────────────────────────
