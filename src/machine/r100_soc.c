@@ -898,8 +898,14 @@ static void r100_soc_init(MachineState *machine)
 
     /*
      * Per-chiplet 16550 UART (serial-mm, regshift=2). FW uses TI 16550
-     * driver (uart_helper.h), not PL011. Each chiplet N → SPI 33 of its
-     * own GIC, bound to serial_hd(N) so the streams demux.
+     * driver (uart_helper.h), not PL011. Each chiplet N → gpio_in[33]
+     * of its own GIC (= INTID 65 in QEMU's numbering; see
+     * R100_INTID_TO_GIC_SPI_GPIO), bound to serial_hd(N) so streams
+     * demux. console_uart_init() in q-sys main() doesn't register an
+     * RX ISR and TX is polled, so the exact INTID here is dead code
+     * today — revisit if terminal_task ever grows an IRQ-driven RX
+     * path (would need the same INTID↔gpio_in conversion as the
+     * mailbox above, lest it repeat the PERI0_M7 collision).
      */
     for (chiplet = 0; chiplet < R100_NUM_CHIPLETS; chiplet++) {
         SerialMM *smm = SERIAL_MM(qdev_new(TYPE_SERIAL_MM));
@@ -945,16 +951,17 @@ static void r100_soc_init(MachineState *machine)
      * Chiplet-0 PCIE mailbox cluster + optional doorbell ingress.
      *
      * Silicon: 17 Samsung IPM SFRs at MAILBOX_PCIE (VF0..VF15 @ 0x1000
-     * stride + PF at 0x1FF8170000). VF0 serves q-sys CA73 (SPI 185 on
-     * __TARGET_CP==0); PF serves PCIE_CM7 and hosts FW_BOOT_DONE /
-     * reset-counter ISSR egress. KMD BAR4 INTGR writes physically land
-     * on PF, PCIE_CM7 then relays to VF0.
+     * stride + PF at 0x1FF8170000). VF0 serves q-sys CA73 (INTID 185
+     * on __TARGET_CP==0; see mailbox_data[IDX_MAILBOX_PCIE_VF0]); PF
+     * serves PCIE_CM7 and hosts FW_BOOT_DONE / reset-counter ISSR
+     * egress. KMD BAR4 INTGR writes physically land on PF, PCIE_CM7
+     * then relays to VF0.
      *
      * REMU models two blocks (VF0, PF); share the `issr` chardev (host
-     * keys off BAR4 offset, not origin). INTMSR SPIs only wired for VF0
+     * keys off BAR4 offset, not origin). INTMSR IRQs only wired for VF0
      * (CM7 not modelled, so PF.INTGR is latched-but-unrouted). The
      * doorbell ingress is shortcut-wired to VF0 so KMD INTGR writes
-     * directly fire the SPI q-sys services — see r100_mailbox.c /
+     * directly fire the IRQ q-sys services — see r100_mailbox.c /
      * r100_doorbell.c, commit cd24aa9 (M8a) and a01d2b5 (CM7 stub).
      */
     {
@@ -973,7 +980,7 @@ static void r100_soc_init(MachineState *machine)
                                             "issr debug");
         }
 
-        /* VF0 — q-sys CA73 SPI 185 sink. No issr-chardev here: QEMU
+        /* VF0 — q-sys CA73 INTID 185 sink. No issr-chardev here: QEMU
          * CharBackend is single-frontend, so only PF (the auth egress
          * source for bootdone/reset-counter) owns the issr chardev. */
         mbx_vf0_dev = qdev_new(TYPE_R100_MAILBOX);
@@ -982,12 +989,15 @@ static void r100_soc_init(MachineState *machine)
         /* Prio 10 beats chiplet-0 cfg_mr catch-all. */
         sysbus_mmio_map_overlap(SYS_BUS_DEVICE(mbx_vf0_dev), 0,
                                 R100_PCIE_MAILBOX_BASE, 10);
+        /* gpio_in index = INTID - GIC_INTERNAL; see remu_addrmap.h. */
         sysbus_connect_irq(SYS_BUS_DEVICE(mbx_vf0_dev), 0,
                            qdev_get_gpio_in(gic_dev[0],
-                                            R100_PCIE_MBX_GROUP0_SPI));
+                                            R100_INTID_TO_GIC_SPI_GPIO(
+                                                R100_PCIE_MBX_GROUP0_INTID)));
         sysbus_connect_irq(SYS_BUS_DEVICE(mbx_vf0_dev), 1,
                            qdev_get_gpio_in(gic_dev[0],
-                                            R100_PCIE_MBX_GROUP1_SPI));
+                                            R100_INTID_TO_GIC_SPI_GPIO(
+                                                R100_PCIE_MBX_GROUP1_INTID)));
 
         /* PF — bootdone_notify_to_host(PCIE_PF) target; on silicon also
          * where KMD BAR4 TLPs decode. No SPI wire (PF's IRQ subscriber
@@ -1050,8 +1060,10 @@ static void r100_soc_init(MachineState *machine)
                     qdev_prop_set_chr(db, "hdma-debug-chardev", hdma_dbg);
                 }
                 /* mailbox=VF0 (shortcut PCIE_CM7 relay — INTGR bits raise
-                 * SPI 185 q-sys services). pf-mailbox=PF so SOFT_RESET can
-                 * synthesise FW_BOOT_DONE→PF.ISSR[4] (CM7 stub, a01d2b5). */
+                 * INTID 185 q-sys services). pf-mailbox=PF so SOFT_RESET
+                 * can re-synthesise FW_BOOT_DONE→PF.ISSR[4] (CM7 stub,
+                 * a01d2b5; narrowed post GIC wiring fix — cold boot is
+                 * real, see docs/debugging.md Post-mortems). */
                 object_property_set_link(OBJECT(db), "mailbox",
                                          OBJECT(mbx_vf0_dev), &error_fatal);
                 object_property_set_link(OBJECT(db), "pf-mailbox",

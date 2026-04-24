@@ -55,13 +55,15 @@ tree; `./remucli run --host` wires them up.
 │  Chiplet-0 peripherals wired to chardev bridges:           │
 │    r100-doorbell (in) — INTGR / ISSR ingress,              │
 │                         cfg_shadow[], HDMA egress, CM7-stub│
-│    r100-mailbox VF0   — SPI 184/185, INTGR                 │
+│    r100-mailbox VF0   — INTID 184/185 (gpio_in[152/153]),  │
+│                         INTGR                              │
 │    r100-mailbox PF    — bootdone, issr egress              │
 │    r100-imsix (out)   — MSI-X egress                       │
 │  Per-chiplet: CMU, PMU, HBM3, QSPI, RBC, SMMU,             │
 │   PVT, DNC cfg, SYSREG CP{0,1} triple-mount,               │
 │   arm-gicv3 (num-cpu=8, first-cpu-index=N*8),              │
-│   16550 UART (SPI 33), HILS ring tail (logbuf)             │
+│   16550 UART (gpio_in[33] = INTID 65, polled),             │
+│   HILS ring tail (logbuf)                                  │
 │  CPU gtimer→GIC PPI (CNTVIRQ = PPI 27 → tick)              │
 └────────────────────────────────────────────────────────────┘
 ```
@@ -254,7 +256,7 @@ src/bridge` without introducing a shared TU.
 | `r100_dnc.c` | DCL cluster + RBDMA | 2+1 / chiplet | Sparse stub for DNC slots, SHM banks, MGLUE (RDSN), RBDMA `IP_INFO`. |
 | `r100_logbuf.c` | HILS ring tail | 1 (chiplet 0) | 50 ms poll of `.logbuf` ring, drains to chardev. |
 | `r100_mailbox.{c,h}` | Samsung IPM SFR | 2 on chiplet 0 (VF0, PF) | Full register model (`INTGR/INTCR/INTMR/INTSR/INTMSR/ISSR0..63`) + two `qemu_irq` outs (INTMSR0/1). All ISSR writes funnel through `r100_mailbox_issr_store(src, ...)` with an `MbxIssrSrc` tag (`NPU_MMIO` / `CM7_STUB` / `HOST_RELAY`); NPU-sourced writes egress an `(bar4_off, val)` frame on `issr-chardev` (M8a), host-relayed writes deliberately skip the re-emit to avoid loopback. Public helpers exposed via `r100_mailbox.h`: `r100_mailbox_{raise_intgr,set_issr,cm7_stub_write_issr}` — everything else stays `static`. |
-| `r100_doorbell.c` | PCIe doorbell ingress + CM7 stub | 1 (chiplet 0; M6+M8a+3a+3b) | Reassembles 8-byte frames via `remu_frame_rx_feed`; dispatches each via `remu_doorbell_classify()` onto INTGR / ISSR / CM7-stub. INTGR0 bit 0 = SOFT_RESET synthesises `FW_BOOT_DONE` into PF.ISSR[4] (M8b 3a, `a01d2b5`). INTGR1 bit 7 = QUEUE_INIT runs `r100_doorbell_qinit_stub`: reads `DDH_BASE_{LO,HI}` from `cfg_shadow[1024]` (populated by incoming `cfg` chardev frames) and emits two `HDMA_OP_WRITE` frames on the `hdma` chardev — `fw_version = "3.remu-stub"` and `init_done = 1` (M8b 3b). Offsets classified as `OTHER` emit `GUEST_ERROR`. |
+| `r100_doorbell.c` | PCIe doorbell ingress + CM7 stub | 1 (chiplet 0; M6+M8a+3a+3b) | Reassembles 8-byte frames via `remu_frame_rx_feed`; dispatches each via `remu_doorbell_classify()` onto INTGR / ISSR / CM7-stub. INTGR0 bit 0 = SOFT_RESET re-synthesises `FW_BOOT_DONE` into PF.ISSR[4] (M8b 3a, `a01d2b5`) — **narrow scope**: cold-boot `0xFB0D` is emitted for real by q-sys `bootdone_task` (see 3a-fix in roadmap); this stub only covers the kmd's post-probe soft-reset re-handshake, pending a real CA73 reset model. INTGR1 bit 7 = QUEUE_INIT runs `r100_doorbell_qinit_stub`: reads `DDH_BASE_{LO,HI}` from `cfg_shadow[1024]` (populated by incoming `cfg` chardev frames) and emits two `HDMA_OP_WRITE` frames on the `hdma` chardev — `fw_version = "3.remu-stub"` and `init_done = 1` (M8b 3b). Offsets classified as `OTHER` emit `GUEST_ERROR`. |
 | `r100_imsix.c` | PCIe MSI-X trap | 1 (chiplet 0; M7) | 4 KB MMIO at `R100_PCIE_IMSIX_BASE`; 4-byte write @ `0xFFC` → `remu_frame_emit` of `(offset, db_data)` on `msix` chardev. |
 | `r100_npu_pci.c` (x86) | PCIe endpoint `0x1eff:0x2030` | 1 | Four BARs + five chardev bridges. Host → NPU BAR4 writes use `remu_doorbell_classify()` to decide whether to forward (and to which sub-protocol). BAR2 has a 4 KB prio-10 MMIO trap at `FW_LOGBUF_SIZE` that re-emits writes on the `cfg` chardev (M8b 3b). NPU → host MSI-X / ISSR ingress uses `RemuFrameRx`; NPU → host `hdma` ingress decodes `RemuHdmaHeader + payload` frames and runs `pci_dma_write` into the guest DMA address space. See commits `7b03328` / `e03b00f` / `cd24aa9` for per-milestone detail. |
 | `src/include/r100/remu_addrmap.h` | — | — | Address constants from `g_sys_addrmap.h` + M6/M7/M8a bridge offsets (BAR4 INTGR0/INTGR1/MAILBOX_BASE, BAR5 MSI-X, `R100_PCIE_IMSIX_*`). Included as `"r100/remu_addrmap.h"`. |

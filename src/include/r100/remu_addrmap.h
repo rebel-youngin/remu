@@ -369,14 +369,30 @@
 /* Host-side MMIO-trapped head of BAR4 (INTGR + MAILBOX_BASE body). */
 #define R100_BAR4_MMIO_SIZE         0x1000u
 
-/* Chiplet-0 PCIe mailbox (r100-mailbox) SPI wiring:
- *   SPI 185 (G1/INTMSR1) — matches mailbox_data[IDX_MAILBOX_PCIE_VF0]
- *                          on __TARGET_CP==0 (KMD INTGR1, idx<32 path).
- *   SPI 184 (G0/INTMSR0) — placeholder for PCIE_CM7 (not modelled);
- *                          diagnostic only, no FW ISR subscribes.
- * Both <256 (GIC num-irq cap), clear of SPI-33 UART. */
-#define R100_PCIE_MBX_GROUP0_SPI    184
-#define R100_PCIE_MBX_GROUP1_SPI    185
+/* Chiplet-0 PCIe mailbox (r100-mailbox) IRQ wiring.
+ *
+ * These are raw GICv3 INTIDs, matching FW mailbox_data[].irq_num_low
+ * (drivers/mailbox/mailbox.c) which is the value passed to
+ * gic_irq_enable()/ISENABLER. INTID 185 (G1/INTMSR1) is the VF0
+ * mailbox IRQ that ipm_samsung_isr handles as IDX_MAILBOX_PCIE_VF0
+ * on __TARGET_CP==0 (KMD INTGR1 path). INTID 184 (G0/INTMSR0) is a
+ * placeholder for the unmodelled PCIE_CM7 subscriber; no FW ISR
+ * binds to it, but we wire it for completeness.
+ *
+ * IMPORTANT: QEMU's arm_gicv3 exposes incoming SPI lines as
+ * gpio_in[0..num_spi-1], where gpio_in[N] maps to INTID (N +
+ * GIC_INTERNAL) with GIC_INTERNAL=32. So to wire an SPI to the GIC
+ * at a given INTID, the gpio_in index is (INTID - GIC_INTERNAL).
+ * Silicon-side docs and FW both speak "INTID"; use the macro below
+ * at call sites. An off-by-32 here silently routes mailbox IRQs to
+ * a *different* INTID — on REMU that collided with the PERI0_M7
+ * mailbox's ISR slot, caused an IRQ storm on CA73 CPU0, and froze
+ * bootdone_task — see docs/debugging.md for the full post-mortem. */
+#define R100_GIC_INTERNAL           32
+#define R100_INTID_TO_GIC_SPI_GPIO(intid)  ((intid) - R100_GIC_INTERNAL)
+
+#define R100_PCIE_MBX_GROUP0_INTID  184
+#define R100_PCIE_MBX_GROUP1_INTID  185
 
 /* Integrated MSI-X trigger (M7, FW→host). DW PCIe on silicon snoops
  * REBELH_PCIE_MSIX_ADDR = 0x1BFFFFFFFC; matching writes become MSI-X

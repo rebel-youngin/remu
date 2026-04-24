@@ -251,24 +251,46 @@ up and the `*.sock` files exist. Rejected frames (bad offset / vector
 prints pass/fail; failures are non-fatal (NPU still boots for
 post-mortem poking).
 
-### KMD soft-reset handshake (M8b Stage 3a, commit `a01d2b5`)
+### `FW_BOOT_DONE` path — cold boot (real) + soft reset (CM7 stub)
 
-kmd `rbln_init` rings `REBEL_DOORBELL_SOFT_RESET` on BAR4
-`MAILBOX_INTGR0` bit 0, then blocks in `rebel_reset_done` for 3 s
-waiting for PF.ISSR[4] to re-become `FW_BOOT_DONE` (`0xFB0D`). On
-silicon this is the PCIe CM7 subcontroller's job (catches SPI 184,
-runs `pcie_soft_reset_handler`, PMU cluster down/up, `bootdone_task`
-rerun). REMU models neither CM7 nor the PMU reset sequence, and the
-CA73 FreeRTOS build short-circuits the mailbox ISR to `default_cb`
-(CMake `FREERTOS_PORT != GCC_ARM_CA73` gate in
-`drivers/pcie/pcie_mailbox_callback.c`).
+There are **two** times the kmd reads `0xFB0D` out of BAR4+0x90, and
+they travel different paths in REMU:
 
-Fix lives entirely in QEMU as a CM7-stub in `r100_doorbell.c`: on an
-`INTGR0` frame with bit 0 set, call
-`r100_mailbox_cm7_stub_write_issr(pf_mailbox, 4, 0xFB0D)` (updates
-PF.ISSR[4] **and** emits the NPU→host issr frame so the host BAR4
-shadow converges). Other bits relay onto VF0.INTGR1 for CA73 ISR
-visibility. `pf-mailbox` link wired from `r100_soc.c`.
+**Cold boot (real, post GIC-wiring fix).** q-sys FreeRTOS runs
+`bootdone_task` pinned to chiplet-0 CPU 0. The task crosses its
+internal gates (`CL_BOOTDONE_MASK`, etc.) and calls
+`bootdone_notify_to_host(PCIE_PF)`, which writes `0xFB0D` to the
+chiplet-0 **PF** mailbox's `ISSR[4]` via the Samsung-IPM register
+path. `r100-mailbox` egresses that write as an 8-byte frame on the
+`issr` chardev, and the host-side `r100-npu-pci` lands it in the
+BAR4+0x90 shadow so the driver reads the real value. No stub in
+the loop. Ground truth:
+
+```
+rg 'Notify Host - PF FW_BOOT_DONE' output/<name>/uart0.log
+grep '0x90.*0xfb0d'                 output/<name>/issr.log
+```
+
+If `Notify Host - PF FW_BOOT_DONE` never prints in `--host` mode but
+does print in `--host --no-guest-boot`, suspect an IRQ-storm
+regression on CA73 CPU 0 — see "Post-mortems" below for the
+diagnostic recipe.
+
+**Soft reset (stubbed).** kmd `rebel_hw_init` always clears
+`ISSR[4]` and rings `INTGR0 bit 0` (`REBEL_DOORBELL_SOFT_RESET`)
+during probe — even when firmware is already up — then polls
+`ISSR[4]` for a fresh `0xFB0D` in `rebel_reset_done`. On silicon
+the PCIE_CM7 subcontroller physically resets the CA73 cluster,
+firmware reboots from BL1, and `bootdone_task` re-emits `0xFB0D`
+naturally. REMU models neither CM7 nor the PMU reset sequence, and
+the CA73 FreeRTOS build short-circuits the mailbox ISR to
+`default_cb` (CMake `FREERTOS_PORT != GCC_ARM_CA73` gate in
+`drivers/pcie/pcie_mailbox_callback.c`). The CM7 stub in
+`r100_doorbell.c` catches `INTGR0 bit 0` and calls
+`r100_mailbox_cm7_stub_write_issr(pf_mailbox, 4, 0xFB0D)` directly,
+which updates PF.ISSR[4] **and** emits the NPU→host issr frame so
+the BAR4 shadow converges. Other bits relay onto VF0.INTGR1 for
+CA73 ISR visibility. `pf-mailbox` link wired from `r100_soc.c`.
 
 Verification on a settled `./remucli run --host`:
 
@@ -285,8 +307,8 @@ If `rebel_soft_reset + 0` appears but `FW_BOOT_DONE` doesn't: walk
 host BAR4 `xp /1wx 0xfe000090` (shadow). Empty `qemu.stderr.log`
 means the run-directory redirect failed.
 
-The stub is silicon-agnostic and retires when REMU grows a real CM7
-model.
+The CM7 stub retires when REMU grows a real CA73 soft-reset model
+(`docs/roadmap.md` → Phase 2 pending components).
 
 ### x86 Linux guest boot (M8b Stage 2, commit `1ef7208`)
 
@@ -425,9 +447,107 @@ markers in order — missing marker pinpoints the stall:
 | BL2 ERETs to zero page on a secondary | `bl31_cp0.bin` / `freertos_cp0.bin` not at `chiplet_id * CHIPLET_OFFSET + {0x0, 0x200000}` | `cli/remu_cli.py:FW_PER_CHIPLET_IMAGES` |
 | HBM poll never clears | New "done" bit not whitelisted | `r100_hbm.c` PHY region defaults |
 | FreeRTOS banner prints then hangs; a CPU sits in `vApplicationPassiveIdleHook` | gtimer outputs not wired to GIC PPI inputs (CNTVIRQ never delivered, `vTaskDelay` never returns) | `r100_soc.c` — the `qdev_connect_gpio_out(cpudev, GTIMER_*, ... )` block per CPU with `intidbase = (num_irq - GIC_INTERNAL) + local*32` (commit `680f964`) |
+| `--host` hangs after `Start FreeRTOS scheduler` but `--host --no-guest-boot` finishes; host sees fake-looking `FW_BOOT_DONE` (via CM7 stub) while NPU uart0 is silent | SPI INTID mis-wiring — `qdev_get_gpio_in(gic, N)` raises INTID `N+32`, so passing the raw INTID (e.g. 185) collides with *another* INTID's handler and the level-triggered line re-fires forever. See "Post-mortems → PCIe mailbox INTID off-by-32" | `r100_soc.c` mailbox wiring + `remu_addrmap.h:R100_INTID_TO_GIC_SPI_GPIO` |
 
 FW ground truth lives in `external/ssw-bundle/products/rebel/q/sys/bootloader/cp/tf-a/`
 — cross-reference via `CLAUDE.md` ("Key external files").
+
+## Post-mortems
+
+### PCIe mailbox INTID off-by-32 (IRQ storm on CA73 CPU 0)
+
+**Symptom.** In `--host` (dual-QEMU with Linux guest), the NPU
+uart0.log halts on the "`Start FreeRTOS scheduler`" line. The host
+driver still prints `[rbln-rbl] FW_BOOT_DONE` in dmesg (because the
+CM7 stub forges it), and a casual observer concludes the system is
+working. Running `--host --no-guest-boot` makes the NPU finish boot
+cleanly and emit `Notify Host - PF FW_BOOT_DONE` — proving the
+freeze is triggered by guest doorbell traffic, not by firmware alone.
+
+**Diagnostic recipe.** While the `--host` run is stuck, live-sample
+NPU CPU 0 via HMP over the unix socket:
+
+```
+python3 <<'EOF' | head -60
+import socket, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect("output/<name>/npu/monitor.sock")
+s.settimeout(2.0)
+time.sleep(0.1)
+try: s.recv(65536)
+except: pass
+s.sendall(b"info registers\n")
+time.sleep(0.5)
+print(s.recv(65536).decode(errors='ignore'))
+EOF
+```
+
+Fingerprint of the storm:
+- `PC` lives inside `FreeRTOS_IRQ_Handler` (resolve via
+  `nm -n external/ssw-bundle/products/rebel/q/sys/binaries/FreeRTOS_CP/freertos_kernel.elf`).
+- `PSTATE` has `DAIF = 1111` (all interrupts masked — `EL1h`,
+  `-ZC-` or similar flag chars).
+- `x0` consistently equals **`0xd9`** across samples. `0xd9 = 217` —
+  the INTID being acknowledged in the ICC EOI register.
+- Multiple samples 500ms apart show the same PC: CPU 0 is not
+  advancing.
+
+**Root cause.** QEMU's `arm_gicv3` exposes incoming SPI lines as
+`gpio_in[0..num_spi-1]`; `gpio_in[N]` raises INTID `N +
+GIC_INTERNAL`, with `GIC_INTERNAL = 32`. So
+`qdev_get_gpio_in(gic, 185)` raises INTID **217**, not 185. FW's
+`mailbox_data[]` (`drivers/mailbox/mailbox.c`) registers the VF0
+mailbox handler for INTID 185 — *and* registers a **different**
+mailbox's handler (`IDX_MAILBOX_PERI0_M7_CPU0`) for INTID 217.
+
+When the host rings any VF0 doorbell the sequence is:
+
+1. `r100-mailbox` asserts VF0 group-1 IRQ line high.
+2. QEMU raises INTID 217 (the off-by-32 result).
+3. CA73 enters `FreeRTOS_IRQ_Handler` → `ipm_samsung_isr`.
+4. ISR looks up INTID 217 in `mailbox_data[]`, finds the PERI0-M7
+   entry, reads PERI0-M7's `INTSR` (= 0, because PERI0-M7 isn't
+   the caller), clears nothing, returns.
+5. VF0's group-1 pending bit is still set → line still high → GIC
+   immediately re-raises INTID 217. Goto step 3.
+
+CPU 0 is trapped with all IRQs masked. Every task pinned to CPU 0
+(`abort_task`, `bootdone_task`, per-CPU idle) starves. The FreeRTOS
+scheduler on CPU 0 never runs again. `bootdone_notify_to_host`
+never fires. The `issr.log` stays empty. The CM7 stub fills the gap
+from the driver's perspective and the freeze is silent.
+
+**Fix.** `src/include/r100/remu_addrmap.h` exposes the GIC
+convention via `R100_INTID_TO_GIC_SPI_GPIO(intid)` and names the
+constants for what they are (`_INTID`, not `_SPI`). `r100_soc.c`
+wires the VF0 mailbox through that macro. Rule for future
+device-to-GIC wiring in this repo: **always pass
+`R100_INTID_TO_GIC_SPI_GPIO(INTID)` to `qdev_get_gpio_in(gic, …)`,
+never a raw INTID**.
+
+**Latent cousins.** The per-chiplet 16550 UART is wired as
+`qdev_get_gpio_in(gic_dev[chiplet], 33)` (i.e. raw index 33 → INTID
+65). q-sys' `console_uart_init()` doesn't register an RX ISR and TX
+is polled, so this INTID is dead code today — but if anyone adds an
+IRQ-driven RX path to `terminal_task`, the same conversion must be
+applied or the PERI0_M7-style collision repeats. Callout comment
+lives adjacent to the UART block in `r100_soc.c`.
+
+**Verification after the fix:**
+
+```
+./remucli build
+./remucli run --host --name gic-fix-smoke
+# Wait ~45 s then:
+rg 'Notify Host - PF FW_BOOT_DONE' output/gic-fix-smoke/uart0.log
+#   → Notify Host - PF FW_BOOT_DONE
+grep '0x90.*0xfb0d' output/gic-fix-smoke/issr.log
+#   → issr off=0x90 val=0xfb0d status=ok count=1
+```
+
+`issr.log count=1` is the crisp witness: pre-fix that file is empty
+in `--host` mode; post-fix the real firmware emits one frame, then
+the CM7 stub covers any subsequent soft-reset re-handshakes.
 
 ## Cleanup
 

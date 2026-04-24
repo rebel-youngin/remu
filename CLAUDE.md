@@ -59,10 +59,16 @@ binds with no changes). BAR sizes match `rebel_check_pci_bars_size`:
 BAR4 details: `MAILBOX_INTGR{0,1}` / `MAILBOX_BASE` writes are
 serialised as 8-byte chardev frames on the `doorbell` socket; reads in
 `MAILBOX_BASE` range return the live shadow fed by `issr` chardev
-frames (NPU → host). `INTGR0` bit 0 (`SOFT_RESET`) triggers the
-QEMU-side CM7-stub that synthesises `FW_BOOT_DONE` into PF.ISSR[4] —
-see commit `a01d2b5` for the full shortcut design. `INTGR1` bit 7
-(`QUEUE_INIT`) triggers the Stage 3b QINIT stub (see below).
+frames (NPU → host). Cold-boot `FW_BOOT_DONE` is **real**: q-sys
+`bootdone_task` writes `0xFB0D` to PF.ISSR[4] which egresses over the
+`issr` chardev into the shadow (see `docs/debugging.md` →
+"Post-mortems" for the GIC wiring fix that enabled this). `INTGR0`
+bit 0 (`SOFT_RESET`) triggers a narrow QEMU-side CM7-stub that
+*re-synthesises* `0xFB0D` on the kmd's post-probe soft-reset
+handshake, because REMU does not yet model a real CA73 cluster reset
+(`docs/roadmap.md` → Phase 2 pending: "real CA73 soft-reset").
+`INTGR1` bit 7 (`QUEUE_INIT`) triggers the Stage 3b QINIT stub (see
+below).
 
 BAR2 details (M8b 3b): kmd writes `DDH_BASE_{LO,HI}` (at `FW_LOGBUF_SIZE
 + 0xC0/0xC4`) to publish the host-RAM `rbln_device_desc` to firmware.

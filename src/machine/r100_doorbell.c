@@ -281,14 +281,35 @@ static void r100_doorbell_deliver(R100DoorbellState *s,
     switch (kind) {
     case REMU_DB_KIND_INTGR0:
         /*
-         * REMU CM7-relay shortcut (M8b Stage 3a, commit a01d2b5).
-         * Silicon routes host INTGR0 through PCIE_CM7 →
-         * pcie_soft_reset_handler which re-emits FW_BOOT_DONE into
-         * PF.ISSR[4]. REMU doesn't model CM7 and q-sys IDX_MAILBOX_PCIE_VF0
-         * binds `default_cb` on CA73, so synthesise that effect here:
-         *   - bit 0 (SOFT_RESET): PF.ISSR[4] = 0xFB0D → egress → host BAR4+0x90
-         *   - other bits: relay to VF0.INTGR1 (visible IRQ; default_cb no-op)
-         * VF0.INTGR0 untouched — no q-sys subscriber, would just noise dumps.
+         * CA73 soft-reset stub — narrowly scoped to INTGR0 bit 0.
+         *
+         * Cold boot is now real: with the PCIe mailbox INTID wiring
+         * corrected (remu_addrmap.h post-mortem + docs/debugging.md),
+         * q-sys' bootdone_task completes and emits PF.ISSR[4] =
+         * 0xFB0D via r100-mailbox → `issr` chardev → host BAR4+0x90
+         * shadow end-to-end. So this handler is NOT a cold-boot fake.
+         *
+         * What it still stubs is the *post-soft-reset re-handshake*:
+         * kmd's rebel_hw_init(RBLN_RESET_FIRST) unconditionally clears
+         * ISSR[4] and rings REBEL_DOORBELL_SOFT_RESET (INTGR0 bit 0),
+         * then polls ISSR[4] for a fresh 0xFB0D. On silicon,
+         * INTGR0 bit 0 is routed through PCIE_CM7 →
+         * pcie_soft_reset_handler which *physically resets* the CA73s;
+         * firmware reboots from BL1 and re-runs bootdone_task, which
+         * naturally re-emits 0xFB0D. REMU does not model that reset
+         * (see docs/roadmap.md Phase 2: "real CA73 soft-reset" —
+         * future milestone), so we synthesise only the observable
+         * endpoint: PF.ISSR[4] = 0xFB0D. The running firmware is
+         * undisturbed.
+         *
+         * Other bits of INTGR0 are relayed into VF0.INTGR1 so that
+         * q-sys' IDX_MAILBOX_PCIE_VF0 default_cb sees them (no-op on
+         * CA73 today, kept for parity with silicon's path and to
+         * surface any future subscribers via info-qtree/TRACE).
+         *
+         * VF0.INTGR0 itself is left untouched — q-sys has no VF0
+         * INTGR0 subscriber, so forwarding there would just spam
+         * default_cb dumps.
          */
         if ((val & 0x1U) && s->pf_mailbox) {
             r100_mailbox_cm7_stub_write_issr(s->pf_mailbox, 4,

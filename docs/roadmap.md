@@ -46,7 +46,7 @@ device, handshakes with FW, umd opens the device.
 | M3 | `r100-npu-pci` skeleton (vendor 0x1eff / dev 0x2030, four BARs, MSI-X table) | done | `7b03328` |
 | M4 | BAR0 splices shared memdev at offset 0, lazy RAM on tail | done | `e03b00f` |
 | M5 | NPU chiplet-0 DRAM splices the same memdev; `tests/m5_dataflow_test.py` | done | `72c98f0` |
-| M6 | BAR4 INTGR → `doorbell` chardev → `r100-doorbell` → `r100-mailbox` → chiplet-0 GIC SPI 184/185 | done | `85b76bb`, `500856b` |
+| M6 | BAR4 INTGR → `doorbell` chardev → `r100-doorbell` → `r100-mailbox` → chiplet-0 GIC INTID 184/185 (`qdev_get_gpio_in` index via `R100_INTID_TO_GIC_SPI_GPIO`) | done | `85b76bb`, `500856b` |
 | M7 | `r100-imsix` MMIO trap at `0x1BFFFFF000 + 0xFFC` → `msix` chardev → `msix_notify()` | done | `db3d1df` |
 | M8a | ISSR bridge both dirs (NPU→host on new `issr` chardev, host→NPU on same `doorbell` wire, offset-disambiguated) | done | `cd24aa9` |
 | M8b | `FW_BOOT_DONE` + QINIT handshake on top of M8a | in progress (3a + 3b done, 3c active) | see sub-table |
@@ -64,7 +64,8 @@ auto-verifies its bridge via `info pci/mtree/qtree` — see the checklist in
 | 2a | `guest/` shared-folder payload (build-kmd.sh, build-guest-image.sh, setup.sh) | done | `1ef7208` |
 | 2b | `--host` auto-wires `-kernel/-initrd/-fsdev virtio-9p`, `-cpu max` for BMI2 in kmd | done | `1ef7208` |
 | 2c | GIC CPU-interface `bpr > 0` assertion fix (QEMU patch `0002-arm-gicv3-reset-cpuif-after-init.patch`) | done | `985fd58` |
-| 3a | KMD soft-reset handshake: `r100-doorbell` CM7-stub synthesises `FW_BOOT_DONE` → PF.ISSR[4] in QEMU, bypassing unmodelled PCIE_CM7 | done | `a01d2b5` |
+| 3a | KMD soft-reset handshake: `r100-doorbell` CM7-stub synthesises `FW_BOOT_DONE` → PF.ISSR[4] on `INTGR0 bit 0`, bypassing unmodelled PCIE_CM7 | done | `a01d2b5` |
+| 3a-fix | PCIe mailbox GIC wiring corrected (`qdev_get_gpio_in` takes a 0-based SPI index, not an INTID) — removes silent IRQ storm on CA73 CPU0 that froze `bootdone_task` during `--host` runs. Cold-boot `FW_BOOT_DONE` now travels the real path (q-sys `bootdone_task` → PF.ISSR[4] → `issr` chardev → host BAR4 shadow). Stage 3a's stub is retained but narrowed to the post-soft-reset re-handshake only (see Pending: "real CA73 soft-reset"); post-mortem in `docs/debugging.md` | done | — |
 | 3b | `rebel_hw_init` QINIT handshake: new `cfg` chardev (host → NPU BAR2 cfg-head mirror, incl. `DDH_BASE_{LO,HI}`) + `hdma` chardev (NPU → host DMA writes, 24 B header + payload) — NPU-side CM7 stub handles `INTGR1 bit 7 = QUEUE_INIT` by emitting HDMA writes for `fw_version = "3.remu-stub"` and `init_done = 1` | done | — |
 | 3c | `rbln_queue_test` MSI-X completion — FW BD-done path writes completion MSI-X; reuses same `cfg + hdma` plumbing | pending | — |
 
@@ -110,6 +111,20 @@ for the HMP sanity recipes.
 - DNC stub (accept task, generate completion MSI-X) — M9
 - HDMA scatter-gather (actual memcpy between DRAM regions, beyond the
   Stage-3b "write-one-descriptor" primitive) — M9
+- **Real CA73 soft-reset model** — today `r100-doorbell`'s `INTGR0 bit 0`
+  handler writes a synthetic `0xFB0D` into `PF.ISSR[4]` to satisfy kmd's
+  `rebel_hw_init → rebel_soft_reset → rebel_reset_done` loop, because
+  REMU leaves the CA73 firmware running instead of physically resetting
+  it the way silicon's PCIE_CM7 does. A faithful model would, on that
+  doorbell, reset the CP0 / CP1 cluster CPUs + their GIC redistributor
+  state + the PCIe mailbox regs (but preserve DRAM / SRAM / any kmd-
+  loaded firmware images and cfg-head), then restart execution from
+  `BL1` so `bootdone_task` naturally re-emits `0xFB0D` through the
+  existing `issr` chardev path. Blocks the path from Phase 2 "functional
+  enough for driver tests" → Phase 3 "truly end-to-end". Candidate
+  hooks: a custom `DeviceReset` on an aggregated "r100-ca73-cluster"
+  QOM wrapper, or `qemu_system_reset_request` with a fine-grained
+  `ShutdownCause` so the x86 host QEMU is unaffected.
 
 ### Success criteria
 
