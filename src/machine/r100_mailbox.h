@@ -67,4 +67,16 @@ void r100_mailbox_cm7_stub_write_issr(R100MailboxState *s, uint32_t idx,
  */
 uint32_t r100_mailbox_get_issr(R100MailboxState *s, uint32_t idx);
 
+/*
+ * In-process multi-slot ISSR write — copies `count` u32 values into
+ * ISSR[idx..idx+count). Used by r100-cm7 to push a 6-slot
+ * dnc_one_task entry plus update the producer index on a non-PCIe
+ * mailbox (PERI0_MAILBOX_M9_CPU1 task queue). Skips the host-relay
+ * counter and the egress-emit chardev — these mailboxes are
+ * NPU-internal (q-cp polls them directly, no host mirror).
+ * Out-of-range slots are dropped silently.
+ */
+void r100_mailbox_set_issr_words(R100MailboxState *s, uint32_t idx,
+                                 const uint32_t *vals, uint32_t count);
+
 #endif /* R100_MAILBOX_H */

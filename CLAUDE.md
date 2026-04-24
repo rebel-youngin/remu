@@ -100,6 +100,18 @@ so the kmd's `dma_fence` resolves. See
 `docs/debugging.md` → "Stage 3c — BD-done state machine" for the log
 signatures.
 
+In parallel with Stage 3c BD-done, every queue-doorbell also pushes a
+24 B `dnc_one_task` placeholder onto the q-cp DNC compute task queue
+(real `r100-mailbox` instance at `R100_PERI0_MAILBOX_M9_BASE`,
+chiplet 0). q-cp's `taskmgr_fetch_dnc_task_master_cp1` polls
+`MBTQ_PI_IDX` (ISSR[0]) on this mailbox; the push wakes that loop
+without IRQ wiring (poll-based protocol). PCIE_CM7 firmware does
+this on silicon — REMU has no Cortex-M7 vCPU so `r100-cm7` takes the
+role via `r100_mailbox_set_issr_words()` (in-process; no chardev).
+Push counters + cm7-debug `mbtq qid=N slot=M pi=P status=ok` traces
+for observability. The push is observed-but-unused until the DNC
+peripheral stub lands.
+
 Both QEMUs `mmap` the same 128 MB `/dev/shm/remu-<name>/remu-shm` with
 `share=on`. Splice points (same backend, two places):
 

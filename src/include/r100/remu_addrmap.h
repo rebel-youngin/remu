@@ -213,11 +213,28 @@
 #define R100_PERI0_UART0_BASE       0x1FF9040000ULL
 #define R100_PERI0_UART1_BASE       0x1FF9050000ULL
 #define R100_PERI0_GPIO_BASE        0x1FF90B0000ULL
+/* PERI0_MAILBOX_M9 — q-cp DNC compute task-queue Samsung-IPM SFR.
+ * q-cp CP1.cpu0 sits in taskmgr_fetch_dnc_task_master_cp1 polling
+ * MBTQ_PI_IDX (ISSR[0]) here (poll-based, no IRQ). On silicon
+ * PCIE_CM7 firmware writes 24 B dnc_one_task entries + bumps PI to
+ * dispatch work; REMU has no Cortex-M7 vCPU, so r100-cm7 takes that
+ * role via r100_mailbox_set_issr_words(). M10 / PERI1 instances are
+ * lazy-RAM until their consumers (udma / lpudma / studma queues)
+ * are exercised. */
+#define R100_PERI0_MAILBOX_M9_BASE  0x1FF9140000ULL
 
 /* --- PERI1 block --- */
 #define R100_PERI1_CMU_BASE         0x1FF9800000ULL
 #define R100_PERI1_SYSREG_BASE      0x1FF9810000ULL
 #define R100_PERI1_UART0_BASE       0x1FF9840000ULL
+
+/* mb_task_queue ring layout in ISSR (q-cp mb_task_queue.c:33-42).
+ * 64 ISSR slots: [0]=PI, [1]=CI, [2..3]=reserved, [4..51]=8 entries. */
+#define R100_MBTQ_PI_IDX            0u
+#define R100_MBTQ_CI_IDX            1u
+#define R100_MBTQ_QUEUE_IDX         4u
+#define R100_MBTQ_ENTRY_SIZE_WORD   6u    /* 24 B per dnc_one_task */
+#define R100_MBTQ_ENTRY_MAX         8u    /* power-of-2 */
 
 /* ========================================================================
  * CPU / Timer constants

@@ -50,7 +50,7 @@ device, handshakes with FW, umd opens the device.
 | M7 | `r100-imsix` MMIO trap at `0x1BFFFFF000 + 0xFFC` → `msix` chardev → `msix_notify()` | done | `db3d1df` |
 | M8a | ISSR bridge both dirs (NPU→host on new `issr` chardev, host→NPU on same `doorbell` wire, offset-disambiguated) | done | `cd24aa9` |
 | M8b | `FW_BOOT_DONE` + QINIT handshake on top of M8a | done (3a + 3b + 3c) | see sub-table |
-| M9  | DNC stub + trivial umd job | pending | — |
+| M9  | DNC stub + trivial umd job | in progress (1b done) | see sub-table |
 
 Each milestone boots end-to-end and the run-harness (`./remucli run --host`)
 auto-verifies its bridge via `info pci/mtree/qtree` — see the checklist in
@@ -86,6 +86,20 @@ every frame it emits — `OP_READ_REQ`, the follow-up `OP_CFG_WRITE`,
 and both bookkeeping `OP_WRITE`s — so logs for concurrent queues
 stay disentangled.
 
+#### M9 sub-milestones
+
+PCIE_CM7 walks BDs directly for simple packets (Stage 3c, unchanged)
+and forwards DNC tasks to q-cp via the `PERI0_MAILBOX_M9_CPU1`
+compute task queue (`mb_task_queue.c`). REMU has no Cortex-M7 vCPU,
+so `r100-cm7` emulates PCIE_CM7's effect on this path too.
+
+| Stage | What | Status | Commit |
+|---|---|---|---|
+| 1b | Real `r100-mailbox` instance at `R100_PERI0_MAILBOX_M9_BASE` (chiplet 0) — replaces lazy-RAM placeholder. `r100-cm7` pushes a 24 B placeholder `dnc_one_task` (`{cmd_id=qid+1, 0, 0}`) + bumps `MBTQ_PI_IDX` on every `INTGR1` queue-doorbell. New `r100_mailbox_set_issr_words` helper bypasses the issr_store funnel (no chardev egress, no host-relay accounting). cm7-debug emits `mbtq qid=N slot=M pi=P status=ok` for observability. Stage 3c BD-done unaffected — `rbln_queue_test` still passes. Push reaches storage at the right slots; q-cp consumption still under investigation (likely waits for DNC stub in 1c) | done | — |
+| 1c | `r100-dnc` register-block model (accept task, fire completion IRQ to q-cp); HDMA register-block model so q-cp can DMA-read host RAM | pending | — |
+| 2 | DNC task BD discrimination (decode packet type from BD payload, populate real `cmd_descr` pointer in NPU SRAM, replace placeholder push). q-cp completion → BD.DONE write-back + MSI-X | pending | — |
+| 3 | umd test binary in `guest/` (`rblnCreateContext` → submit → wait → exit 0) | pending | — |
+
 ### Components (current state)
 
 Device models + chardev bridges — see `docs/architecture.md`
@@ -99,22 +113,30 @@ for the HMP sanity recipes.
   (M8b 3c): `OP_WRITE` → `pci_dma_write`, `OP_READ_REQ` → `pci_dma_read` +
   `OP_READ_RESP`, `OP_CFG_WRITE` → updates host-local `cfg_mmio_regs`.
 - `src/machine/r100_soc.c` — machine. Splices memdev into chiplet-0 DRAM,
-  instantiates two PF/VF0 `r100-mailbox` blocks, optional `r100-cm7`
-  / `r100-imsix` gated on chardev machine-props. Wires `cfg` + `hdma` +
-  `cm7-debug` chardevs onto `r100-cm7`; links `r100-cm7` to `r100-imsix`
-  so the BD-done path can trigger MSI-X.
+  instantiates three `r100-mailbox` blocks (PF, VF0, and the M9-1b
+  compute task queue at `R100_PERI0_MAILBOX_M9_BASE`), optional
+  `r100-cm7` / `r100-imsix` gated on chardev machine-props. Wires
+  `cfg` + `hdma` + `cm7-debug` chardevs onto `r100-cm7`; links
+  `r100-cm7` to `r100-imsix` (BD-done MSI-X) and to the M9 mailbox
+  (M9-1b mbtq pushes). Skips lazy-RAM at the M9 slot to avoid overlap.
 - `src/machine/r100_mailbox.c` — Samsung IPM SFR (`INTGR/INTCR/INTMR/INTSR/INTMSR/ISSR0..63`),
   two `qemu_irq` outs tracking INTMSR. API: `r100_mailbox_raise_intgr`,
   `r100_mailbox_set_issr`, `r100_mailbox_get_issr`,
-  `r100_mailbox_cm7_stub_write_issr`.
+  `r100_mailbox_cm7_stub_write_issr`,
+  `r100_mailbox_set_issr_words` (M9-1b in-process multi-slot write
+  for q-cp task-queue pushes; bypasses the issr_store funnel).
 - `src/machine/r100_cm7.c` — reassembles 8-byte `(offset, value)` frames,
   routes by offset into mailbox INTGR / ISSR / CM7-stub. Hosts every
   CM7-firmware responsibility that silicon's PCIE_CM7 would own:
   (1) `INTGR0 bit 0` SOFT_RESET → synthetic `FW_BOOT_DONE` (Stage 3a);
   (2) `cfg_shadow[1024]` mirror of host BAR2 cfg-head and the QINIT
   stub on `INTGR1 bit 7` (Stage 3b); (3) the BD-done state machine on
-  `INTGR1 bits 0..N` that drives `rbln_queue_test` (Stage 3c). Optional
-  `cm7-debug` chardev emits ASCII phase-transition traces.
+  `INTGR1 bits 0..N` that drives `rbln_queue_test` (Stage 3c);
+  (4) `r100_cm7_mbtq_push` on the same INTGR1 queue-doorbell — pushes
+  a placeholder `dnc_one_task` to the M9 task-queue mailbox to wake
+  q-cp's `taskmgr_fetch_dnc_task_master_cp1` poll loop (M9-1b).
+  Optional `cm7-debug` chardev emits ASCII phase-transition + mbtq
+  push traces.
 - `src/machine/r100_imsix.c` — 4 KB MMIO trap at `R100_PCIE_IMSIX_BASE`,
   emits `(offset, db_data)` frames on write to `0xFFC`. Public API
   `r100_imsix_notify(vector)` called by `r100-cm7` BD-done completion.
@@ -131,9 +153,11 @@ for the HMP sanity recipes.
 
 ### Pending components
 
-- DNC stub (accept task, generate completion MSI-X) — M9
-- HDMA scatter-gather (actual memcpy between DRAM regions, beyond the
-  Stage-3b "write-one-descriptor" primitive) — M9
+- DNC stub (accept task, generate completion IRQ to q-cp; q-cp drives
+  BD.DONE + MSI-X) — M9-1c / M9-2
+- HDMA register-block model — M9-1c (q-cp side needs real DMA-read of
+  host RAM, complementing the cross-process `hdma` chardev shortcut
+  used by `r100-cm7` today)
 - NPU-local DRAM scratch write on BD-done (silicon mirrors `FUNC_SCRATCH`
   into chiplet DRAM too; kmd currently reads it via BAR2 cfg-head path
   only, so Stage 3c's `OP_CFG_WRITE` suffices) — future work

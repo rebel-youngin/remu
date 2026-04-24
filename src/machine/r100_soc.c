@@ -975,6 +975,7 @@ static void r100_soc_init(MachineState *machine)
         R100SoCMachineState *r100m = R100_SOC_MACHINE(machine);
         DeviceState *mbx_vf0_dev;
         DeviceState *mbx_pf_dev;
+        DeviceState *mbx_mbtq_dev;
         DeviceState *imsix_dev = NULL;
         Chardev *issr_chr = NULL;
         Chardev *issr_dbg = NULL;
@@ -1021,6 +1022,22 @@ static void r100_soc_init(MachineState *machine)
         sysbus_realize_and_unref(SYS_BUS_DEVICE(mbx_pf_dev), &error_fatal);
         sysbus_mmio_map_overlap(SYS_BUS_DEVICE(mbx_pf_dev), 0,
                                 R100_PCIE_MAILBOX_PF_BASE, 10);
+
+        /* Compute task-queue mailbox at PERI0_MAILBOX_M9_CPU1
+         * (chiplet 0). q-cp's CP1.cpu0 polls MBTQ_PI_IDX (ISSR[0])
+         * here from taskmgr_fetch_dnc_task_master_cp1; r100-cm7
+         * publishes dnc_one_task entries on each command-queue
+         * doorbell. Poll-based (no IRQ wiring); the mailbox is just
+         * the shared scratch ring. Replaces the lazy-RAM placeholder
+         * for this slot — the chiplet/mailbox loop below skips
+         * (cl=0,j=0). */
+        mbx_mbtq_dev = qdev_new(TYPE_R100_MAILBOX);
+        qdev_prop_set_string(mbx_mbtq_dev, "name",
+                             "peri0_m9_cpu1.chiplet0");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(mbx_mbtq_dev),
+                                 &error_fatal);
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(mbx_mbtq_dev), 0,
+                                R100_PERI0_MAILBOX_M9_BASE, 10);
 
         /*
          * Integrated MSI-X trigger (M7, commit db3d1df). Snoops FW
@@ -1122,6 +1139,9 @@ static void r100_soc_init(MachineState *machine)
                                              OBJECT(imsix_dev),
                                              &error_fatal);
                 }
+                object_property_set_link(OBJECT(cm7), "mbtq-mailbox",
+                                         OBJECT(mbx_mbtq_dev),
+                                         &error_fatal);
                 sysbus_realize_and_unref(SYS_BUS_DEVICE(cm7),
                                          &error_fatal);
             }
@@ -1175,9 +1195,16 @@ static void r100_soc_init(MachineState *machine)
             for (size_t j = 0;
                  j < ARRAY_SIZE(r100_per_chiplet_mbox_offsets);
                  j++) {
-                MemoryRegion *mr = g_new(MemoryRegion, 1);
+                MemoryRegion *mr;
                 char nm[64];
 
+                /* PERI0_MAILBOX_M9 chiplet-0 has a real r100-mailbox
+                 * (q-cp DNC compute task queue) — skip the lazy-RAM
+                 * placeholder so the two don't overlap. */
+                if (cl == 0 && j == 0) {
+                    continue;
+                }
+                mr = g_new(MemoryRegion, 1);
                 snprintf(nm, sizeof(nm), "r100.mbox_cl%d_%s",
                          cl, r100_per_chiplet_mbox_tags[j]);
                 memory_region_init_ram(mr, NULL, nm, 0x10000,

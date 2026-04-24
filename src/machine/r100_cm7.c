@@ -124,6 +124,7 @@ struct R100Cm7State {
     R100MailboxState *mailbox;      /* VF0: M6 INTGR sink + M8a ISSR sink */
     R100MailboxState *pf_mailbox;   /* PF: CM7-stub FW_BOOT_DONE + BD-done pi source */
     R100IMSIXState   *imsix;        /* M7: BD-done completion notifier (3c) */
+    R100MailboxState *mbtq_mailbox; /* PERI0_MAILBOX_M9_CPU1 — q-cp DNC task queue */
 
     /* Chardev byte stream may split a frame across callbacks. */
     RemuFrameRx rx;
@@ -157,6 +158,13 @@ struct R100Cm7State {
     uint64_t bd_doorbells;         /* INTGR1 bit <qid> fires accepted */
     uint64_t bd_doorbells_dropped; /* fires rejected (job busy, out-of-range) */
     uint64_t bds_completed;        /* BDs that reached imsix_notify */
+
+    /* dnc_one_task entries pushed to the q-cp task-queue mailbox.
+     * pi_next is the local cache of the producer index we publish
+     * into MBTQ_PI_IDX (ISSR[0]) so we ring-wrap correctly. */
+    uint64_t mbtq_pushes;
+    uint64_t mbtq_pushes_dropped;
+    uint32_t mbtq_pi_next;
 
     R100Cm7BdJob jobs[R100_CM7_MAX_QUEUES];
 };
@@ -253,6 +261,26 @@ static void r100_cm7_bd_emit_debug(R100Cm7State *s, uint32_t qid,
                  "bd-done qid=%u %s ci=%u pi=%u %s completed=%" PRIu64 "\n",
                  qid, transition, ci, pi,
                  detail ? detail : "", s->bds_completed);
+    if (n > 0) {
+        qemu_chr_fe_write(&s->cm7_debug_chr, (const uint8_t *)line, n);
+    }
+}
+
+static void r100_cm7_mbtq_emit_debug(R100Cm7State *s, uint32_t qid,
+                                     uint32_t slot, uint32_t pi,
+                                     const char *status)
+{
+    char line[128];
+    int n;
+
+    if (!qemu_chr_fe_backend_connected(&s->cm7_debug_chr)) {
+        return;
+    }
+    n = snprintf(line, sizeof(line),
+                 "mbtq qid=%u slot=%u pi=%u status=%s pushes=%" PRIu64
+                 " dropped=%" PRIu64 "\n",
+                 qid, slot, pi, status, s->mbtq_pushes,
+                 s->mbtq_pushes_dropped);
     if (n > 0) {
         qemu_chr_fe_write(&s->cm7_debug_chr, (const uint8_t *)line, n);
     }
@@ -670,6 +698,61 @@ static void r100_cm7_bd_on_pkt(R100Cm7State *s, R100Cm7BdJob *j,
 }
 
 /* ------------------------------------------------------------------ */
+/* MBTQ — push a dnc_one_task into q-cp's task-queue mailbox           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * q-cp's CP1.cpu0 sits in taskmgr_fetch_dnc_task_master_cp1
+ * (cp/.../fetch_task.c) polling MBTQ_PI_IDX (ISSR[0]) on
+ * PERI0_MAILBOX_M9_CPU1 (q-cp side mb_task_queue.c:33-42). On
+ * silicon the PCIE_CM7 firmware writes 24 B dnc_one_task entries
+ * + bumps PI to dispatch DNC work; REMU has no Cortex-M7 vCPU,
+ * so r100-cm7 takes that role.
+ *
+ * Wire format (mb_task_queue.c slot layout):
+ *   ISSR[QUEUE_IDX + (pi%MAX)*ENTRY_SIZE_WORD .. +ENTRY_SIZE_WORD-1] = entry
+ *   ISSR[PI_IDX] = pi+1
+ *
+ * The mailbox itself is the dumb scratch-store, so
+ * r100_mailbox_set_issr_words bypasses the issr_store funnel
+ * (no chardev egress, no host-relay accounting). Per-instance
+ * counters live on R100Cm7State.
+ *
+ * Current entry payload is a placeholder: id_info.cmd_id = qid+1,
+ * everything else zero. q-cp's master memcpy's the 24 B into its
+ * inner queue; the worker will eventually deref cmd_descr=NULL and
+ * hang on unmodelled DNC HW. Driving entries from real BD payload
+ * + adding a DNC peripheral stub are follow-ups.
+ */
+static void r100_cm7_mbtq_push(R100Cm7State *s, uint32_t qid)
+{
+    uint32_t entry[R100_MBTQ_ENTRY_SIZE_WORD];
+    uint32_t slot;
+    uint32_t pi_after;
+
+    if (!s->mbtq_mailbox) {
+        s->mbtq_pushes_dropped++;
+        r100_cm7_mbtq_emit_debug(s, qid, 0, 0, "no-mailbox");
+        return;
+    }
+
+    memset(entry, 0, sizeof(entry));
+    entry[0] = qid + 1u;
+
+    slot = R100_MBTQ_QUEUE_IDX +
+           (s->mbtq_pi_next & (R100_MBTQ_ENTRY_MAX - 1u)) *
+            R100_MBTQ_ENTRY_SIZE_WORD;
+    r100_mailbox_set_issr_words(s->mbtq_mailbox, slot, entry,
+                                R100_MBTQ_ENTRY_SIZE_WORD);
+    pi_after = ++s->mbtq_pi_next;
+    r100_mailbox_set_issr_words(s->mbtq_mailbox, R100_MBTQ_PI_IDX,
+                                &pi_after, 1);
+    s->mbtq_pushes++;
+
+    r100_cm7_mbtq_emit_debug(s, qid, slot, pi_after, "ok");
+}
+
+/* ------------------------------------------------------------------ */
 /* Doorbell (host→NPU) frame ingress                                   */
 /* ------------------------------------------------------------------ */
 
@@ -748,10 +831,17 @@ static void r100_cm7_deliver(R100Cm7State *s, uint32_t off, uint32_t val)
          * single BD; we walk the ring and synthesise BD.DONE + ci
          * advance + FUNC_SCRATCH update + MSI-X notify, mirroring
          * what PCIE_CM7 would orchestrate on silicon.
+         *
+         * In parallel, push a dnc_one_task entry into the q-cp task-
+         * queue mailbox so taskmgr_fetch_dnc_task_master_cp1 wakes.
+         * Stage 3c still owns the BD.DONE + MSI-X completion; the
+         * mbtq push is observed-but-unused until the DNC peripheral
+         * stub lands.
          */
         for (uint32_t qid = 0; qid < R100_CM7_MAX_QUEUES; qid++) {
             if (val & (1u << qid)) {
                 r100_cm7_bd_start(s, qid);
+                r100_cm7_mbtq_push(s, qid);
             }
         }
         break;
@@ -955,6 +1045,10 @@ static void r100_cm7_reset(DeviceState *dev)
         s->jobs[i].phase = CM7_BD_IDLE;
         s->jobs[i].ci = 0;
     }
+    /* MBTQ producer index is a local cache; reset with the device so
+     * a fresh boot starts the ring at 0. The mailbox itself holds the
+     * authoritative PI/CI; on a reset both sides are 0. */
+    s->mbtq_pi_next = 0;
 }
 
 static const VMStateDescription r100_cm7_vmstate = {
@@ -983,6 +1077,9 @@ static const VMStateDescription r100_cm7_vmstate = {
         VMSTATE_UINT64(bd_doorbells, R100Cm7State),
         VMSTATE_UINT64(bd_doorbells_dropped, R100Cm7State),
         VMSTATE_UINT64(bds_completed, R100Cm7State),
+        VMSTATE_UINT64(mbtq_pushes, R100Cm7State),
+        VMSTATE_UINT64(mbtq_pushes_dropped, R100Cm7State),
+        VMSTATE_UINT32(mbtq_pi_next, R100Cm7State),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -1001,6 +1098,8 @@ static Property r100_cm7_properties[] = {
                      TYPE_R100_MAILBOX, R100MailboxState *),
     DEFINE_PROP_LINK("imsix", R100Cm7State, imsix,
                      TYPE_R100_IMSIX, R100IMSIXState *),
+    DEFINE_PROP_LINK("mbtq-mailbox", R100Cm7State, mbtq_mailbox,
+                     TYPE_R100_MAILBOX, R100MailboxState *),
     DEFINE_PROP_END_OF_LIST(),
 };
 

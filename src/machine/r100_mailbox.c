@@ -238,6 +238,25 @@ uint32_t r100_mailbox_get_issr(R100MailboxState *s, uint32_t idx)
 }
 
 /*
+ * In-process multi-slot ISSR write. Bypasses the issr_store() funnel
+ * because this path has no host-visible side effects — the targets
+ * are NPU-internal mailboxes (PERI0_M9_CPU1 etc.) that q-cp polls
+ * directly from CA73, so there is no egress chardev to emit on and
+ * the host-relay/MMIO/CM7-stub bookkeeping doesn't apply. Caller
+ * (r100-cm7) owns its own counters for these pushes.
+ */
+void r100_mailbox_set_issr_words(R100MailboxState *s, uint32_t idx,
+                                 const uint32_t *vals, uint32_t count)
+{
+    if (!s || !vals) {
+        return;
+    }
+    for (uint32_t i = 0; i < count && idx + i < R100_MBX_ISSR_COUNT; i++) {
+        s->issr[idx + i] = vals[i];
+    }
+}
+
+/*
  * CM7-stub egress: mimic an ISSR write that would normally originate
  * from the PCIE_CM7 subcontroller's FW. Used by r100-cm7 to
  * implement the REMU CM7-relay shortcut — on silicon, a host SOFT_RESET
