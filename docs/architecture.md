@@ -45,7 +45,8 @@ tree; `./remucli run --host` wires them up.
 │    BAR2 4 KB cfg-head trap at FW_LOGBUF_SIZE (M8b 3b)      │
 │    BAR4 4 KB MMIO head: INTGR + MAILBOX_BASE (M6+M8a)      │
 │    BAR5 msix_init table + lazy RAM (M3)                    │
-│  chardevs: doorbell, cfg (out) / msix, issr, hdma (in)     │
+│  chardevs: doorbell, cfg (out) / msix, issr (in) /         │
+│            hdma (bidir)                                    │
 └──┬──────┬────────┬─────┬──────┬─────┬─────────────────────┘
    │ shm  │doorbell│ cfg │ msix │issr │ hdma
 ┌──┴──────┴────────┴─────┴──────┴─────┴─────────────────────┐
@@ -53,8 +54,9 @@ tree; `./remucli run --host` wires them up.
 │  32 × CA73 (cortex-a72 w/ MIDR=A73 r1p1)                   │
 │  TF-A BL1 → BL2 → BL31 → FreeRTOS                          │
 │  Chiplet-0 peripherals wired to chardev bridges:           │
-│    r100-doorbell (in) — INTGR / ISSR ingress,              │
-│                         cfg_shadow[], HDMA egress, CM7-stub│
+│    r100-cm7 (bidir)   — INTGR / ISSR ingress, cfg_shadow,  │
+│                         HDMA bidir, CM7 stubs (SOFT_RESET, │
+│                         QINIT, BD-done SM per queue)       │
 │    r100-mailbox VF0   — INTID 184/185 (gpio_in[152/153]),  │
 │                         INTGR                              │
 │    r100-mailbox PF    — bootdone, issr egress              │
@@ -215,22 +217,23 @@ src/
   bridge/           Cross-side shared headers added to -I (host + NPU TUs)
     remu_frame.h          8-byte (a, b) frame codec: RX accumulator + emit
     remu_doorbell_proto.h BAR4 offset classifier + BAR2 cfg-head layout + DDH desc offsets
-    remu_hdma_proto.h     24 B header + payload wire format for NPU → host DMA
+    remu_hdma_proto.h     24 B header + payload bidirectional HDMA protocol
+                          (OP_WRITE / READ_REQ / READ_RESP / CFG_WRITE)
 ```
 
 **Header discipline.** Each device's `struct R100XxxState`,
 `DECLARE_INSTANCE_CHECKER(...)`, and private register-count defines
 live in its own `.c` file. `r100_soc.h` only exposes the machine-state
 subclass, the `TYPE_R100_*` type names, and (via `#include
-"r100_mailbox.h"`) the mailbox helper prototypes that
-`r100_doorbell.c` needs to drive the mailbox from outside its own
-MMIO path. This keeps the state layout private, forces cross-device
-communication through either QOM properties (e.g. `link<>`) or
-purpose-specific helper headers, and means touching `R100MailboxState`
-fields no longer rebuilds every NPU-side device.
+"r100_mailbox.h"` / `#include "r100_imsix.h"`) the mailbox + imsix
+helper prototypes that `r100_cm7.c` needs to drive both devices from
+outside their own MMIO path. This keeps the state layout private,
+forces cross-device communication through either QOM properties (e.g.
+`link<>`) or purpose-specific helper headers, and means touching
+`R100MailboxState` fields no longer rebuilds every NPU-side device.
 
 **Cross-side shared code.** The host side (`r100_npu_pci.c`, compiled
-into `system_ss`) and the NPU side (`r100_doorbell.c` /
+into `system_ss`) and the NPU side (`r100_cm7.c` /
 `r100_imsix.c` / `r100_mailbox.c`, compiled into `arm_ss`) live in
 different meson subsystems, so a single `.c` would need to link twice.
 `src/bridge/*.h` sidesteps this: the wire format (`remu_frame.h`) and
@@ -242,7 +245,7 @@ src/bridge` without introducing a shared TU.
 
 | File | Device | Instances | Behaviour |
 |---|---|---|---|
-| `r100_soc.c` | Machine | 1 | Builds chiplet views + CPUs + per-chiplet GIC/UART + mailbox cluster. Installs MIDR spoof + two IMPDEF sysreg tables per CPU. Wires gtimer→GIC PPIs. Instantiates `r100-doorbell` / `r100-imsix` on demand; 11 `-machine r100-soc,<key>=<id>` string props — `memdev` plus 5 chardev slots (`doorbell`, `msix`, `issr`, `cfg`, `hdma`) each with a paired `*_debug` log target — registered via the `R100_SOC_DEF_STRPROP` macro-generated table. Inline stubs: PCIE sub-controller (PHY{0..3}_SRAM_INIT_DONE seed), CSS600 CNTGEN, inter-chiplet HBM mailbox RAM, cfg/private-window unimpl catch-alls. |
+| `r100_soc.c` | Machine | 1 | Builds chiplet views + CPUs + per-chiplet GIC/UART + mailbox cluster. Installs MIDR spoof + two IMPDEF sysreg tables per CPU. Wires gtimer→GIC PPIs. Instantiates `r100-cm7` / `r100-imsix` on demand (and wires the QOM `imsix` link on `r100-cm7` so the BD-done path can trigger MSI-X); 13 `-machine r100-soc,<key>=<id>` string props — `memdev` plus 6 chardev slots (`doorbell`, `msix`, `issr`, `cfg`, `hdma`, `cm7_debug`) each with a paired `*_debug` log target — registered via the `R100_SOC_DEF_STRPROP` macro-generated table. Inline stubs: PCIE sub-controller (PHY{0..3}_SRAM_INIT_DONE seed), CSS600 CNTGEN, inter-chiplet HBM mailbox RAM, cfg/private-window unimpl catch-alls. |
 | `r100_cmu.c` | CMU | 20 / chiplet | PLL-lock instant, `mux_busy=0`. |
 | `r100_pmu.c` | PMU | 1 / chiplet | Cold-reset, `CPU_CONFIGURATION` → `arm_set_cpu_on(mpidr, RVBAR, EL3)` covers BL1 cold, BL2 CP1, BL31 PSCI warm. `read_rvbar()` indexes `SYSREG_CP0_PRIVATE + cluster * PER_SYSREG_CP`. Dual-mapped (cfg + private alias). |
 | `r100_sysreg.c` | SYSREG | 1 / chiplet | Returns chiplet ID. CP0/CP1 RAM triple-mounted (private + cfg alias + CPU-view overlay). |
@@ -255,14 +258,14 @@ src/bridge` without introducing a shared TU.
 | `r100_dma.c` | PL330 DMA | 1 / chiplet | Fake-completion stub. |
 | `r100_dnc.c` | DCL cluster + RBDMA | 2+1 / chiplet | Sparse stub for DNC slots, SHM banks, MGLUE (RDSN), RBDMA `IP_INFO`. |
 | `r100_logbuf.c` | HILS ring tail | 1 (chiplet 0) | 50 ms poll of `.logbuf` ring, drains to chardev. |
-| `r100_mailbox.{c,h}` | Samsung IPM SFR | 2 on chiplet 0 (VF0, PF) | Full register model (`INTGR/INTCR/INTMR/INTSR/INTMSR/ISSR0..63`) + two `qemu_irq` outs (INTMSR0/1). All ISSR writes funnel through `r100_mailbox_issr_store(src, ...)` with an `MbxIssrSrc` tag (`NPU_MMIO` / `CM7_STUB` / `HOST_RELAY`); NPU-sourced writes egress an `(bar4_off, val)` frame on `issr-chardev` (M8a), host-relayed writes deliberately skip the re-emit to avoid loopback. Public helpers exposed via `r100_mailbox.h`: `r100_mailbox_{raise_intgr,set_issr,cm7_stub_write_issr}` — everything else stays `static`. |
-| `r100_doorbell.c` | PCIe doorbell ingress + CM7 stub | 1 (chiplet 0; M6+M8a+3a+3b) | Reassembles 8-byte frames via `remu_frame_rx_feed`; dispatches each via `remu_doorbell_classify()` onto INTGR / ISSR / CM7-stub. INTGR0 bit 0 = SOFT_RESET re-synthesises `FW_BOOT_DONE` into PF.ISSR[4] (M8b 3a, `a01d2b5`) — **narrow scope**: cold-boot `0xFB0D` is emitted for real by q-sys `bootdone_task` (see 3a-fix in roadmap); this stub only covers the kmd's post-probe soft-reset re-handshake, pending a real CA73 reset model. INTGR1 bit 7 = QUEUE_INIT runs `r100_doorbell_qinit_stub`: reads `DDH_BASE_{LO,HI}` from `cfg_shadow[1024]` (populated by incoming `cfg` chardev frames) and emits two `HDMA_OP_WRITE` frames on the `hdma` chardev — `fw_version = "3.remu-stub"` and `init_done = 1` (M8b 3b). Offsets classified as `OTHER` emit `GUEST_ERROR`. |
-| `r100_imsix.c` | PCIe MSI-X trap | 1 (chiplet 0; M7) | 4 KB MMIO at `R100_PCIE_IMSIX_BASE`; 4-byte write @ `0xFFC` → `remu_frame_emit` of `(offset, db_data)` on `msix` chardev. |
-| `r100_npu_pci.c` (x86) | PCIe endpoint `0x1eff:0x2030` | 1 | Four BARs + five chardev bridges. Host → NPU BAR4 writes use `remu_doorbell_classify()` to decide whether to forward (and to which sub-protocol). BAR2 has a 4 KB prio-10 MMIO trap at `FW_LOGBUF_SIZE` that re-emits writes on the `cfg` chardev (M8b 3b). NPU → host MSI-X / ISSR ingress uses `RemuFrameRx`; NPU → host `hdma` ingress decodes `RemuHdmaHeader + payload` frames and runs `pci_dma_write` into the guest DMA address space. See commits `7b03328` / `e03b00f` / `cd24aa9` for per-milestone detail. |
+| `r100_mailbox.{c,h}` | Samsung IPM SFR | 2 on chiplet 0 (VF0, PF) | Full register model (`INTGR/INTCR/INTMR/INTSR/INTMSR/ISSR0..63`) + two `qemu_irq` outs (INTMSR0/1). All ISSR writes funnel through `r100_mailbox_issr_store(src, ...)` with an `MbxIssrSrc` tag (`NPU_MMIO` / `CM7_STUB` / `HOST_RELAY`); NPU-sourced writes egress an `(bar4_off, val)` frame on `issr-chardev` (M8a), host-relayed writes deliberately skip the re-emit to avoid loopback. Public helpers exposed via `r100_mailbox.h`: `r100_mailbox_{raise_intgr,set_issr,get_issr,cm7_stub_write_issr}` — everything else stays `static`. |
+| `r100_cm7.c` | PCIe doorbell ingress + CM7 stubs | 1 (chiplet 0; M6+M8a+3a+3b+3c) | Reassembles 8-byte frames via `remu_frame_rx_feed`; dispatches each via `remu_doorbell_classify()` onto INTGR / ISSR / CM7-stub paths. Plays the PCIE_CM7 role across four stubs: **(1)** `INTGR0 bit 0 = SOFT_RESET` re-synthesises `FW_BOOT_DONE` into PF.ISSR[4] (M8b 3a, `a01d2b5`); **(2)** `cfg_shadow[1024]` mirror of host BAR2 cfg-head, populated by incoming `cfg` chardev frames (M8b 3b); **(3)** `INTGR1 bit 7 = QUEUE_INIT` runs `r100_cm7_qinit_stub` which emits two `HDMA_OP_WRITE` frames (`fw_version = "3.remu-stub"` + `init_done = 1`, M8b 3b); **(4)** `INTGR1 bits 0..N-1 = QUEUE_M_START` drive a per-queue `R100Cm7BdJob` async state machine (M8b 3c) — snapshots `ISSR[qid]` as `pi`, issues tagged `OP_READ_REQ` for queue descriptor, buffer descriptor, and packet payload (`req_id = qid + 1`), waits on matching `OP_READ_RESP` frames, commits via `OP_CFG_WRITE FUNC_SCRATCH` + `OP_WRITE bd.header |= DONE` + `OP_WRITE queue_desc.ci++`, then fires `r100_imsix_notify(vec = qid)`. Hosts two outgoing chardevs (`hdma`, optional `cm7-debug`) and two QOM links (`pf-mailbox`, `imsix`). Offsets classified as `OTHER` emit `GUEST_ERROR`. |
+| `r100_imsix.{c,h}` | PCIe MSI-X trap | 1 (chiplet 0; M7) | 4 KB MMIO at `R100_PCIE_IMSIX_BASE`; 4-byte write @ `0xFFC` → `remu_frame_emit` of `(offset, db_data)` on `msix` chardev. Exposes `r100_imsix_notify(vec)` via `r100_imsix.h` so `r100_cm7.c` can trigger MSI-X completions without dereferencing the private state. |
+| `r100_npu_pci.c` (x86) | PCIe endpoint `0x1eff:0x2030` | 1 | Four BARs + five chardev bridges. Host → NPU BAR4 writes use `remu_doorbell_classify()` to decide whether to forward (and to which sub-protocol). BAR2 has a 4 KB prio-10 MMIO trap at `FW_LOGBUF_SIZE` that re-emits writes on the `cfg` chardev (M8b 3b). NPU → host MSI-X / ISSR ingress uses `RemuFrameRx`; the `hdma` chardev is bidirectional (M8b 3b+3c) — `OP_WRITE` → `pci_dma_write`, `OP_READ_REQ` → `pci_dma_read` + `OP_READ_RESP`, `OP_CFG_WRITE` → updates host-local `cfg_mmio_regs`. See commits `7b03328` / `e03b00f` / `cd24aa9` for per-milestone detail. |
 | `src/include/r100/remu_addrmap.h` | — | — | Address constants from `g_sys_addrmap.h` + M6/M7/M8a bridge offsets (BAR4 INTGR0/INTGR1/MAILBOX_BASE, BAR5 MSI-X, `R100_PCIE_IMSIX_*`). Included as `"r100/remu_addrmap.h"`. |
 | `src/bridge/remu_frame.h` | — | — | Header-only: `RemuFrameRx` streaming decoder, `remu_frame_rx_feed` + `remu_frame_emit` helpers, `RemuFrameEmitResult` for emit status. Used by every 8-byte chardev endpoint (doorbell / msix / issr / cfg). |
 | `src/bridge/remu_doorbell_proto.h` | — | — | Header-only: `RemuDoorbellKind` + `remu_doorbell_classify(bar4_off, &issr_idx)` — single source of truth for the BAR4 wire protocol. Also carries the BAR2 cfg-head layout (`REMU_BAR2_CFG_HEAD_{OFF,SIZE}`), the DDH desc field offsets (`REMU_DDH_{DRIVER_VERSION,INIT_DONE,FW_VERSION}_OFF`), `REMU_HOST_PHYS_BASE` for host→chiplet address translation, and the `REMU_DB_QUEUE_INIT_INTGR1_BIT` constant used by the M8b 3b stub. |
-| `src/bridge/remu_hdma_proto.h` | — | — | Header-only: `RemuHdmaHeader` (24 B: magic `'HDMA'` LE, op, 64-bit dst, len, flags) + payload, `RemuHdmaRx` streaming decoder, `remu_hdma_emit_write` helper. Only op today is `REMU_HDMA_OP_WRITE` (max 4 KB payload); same wire will carry future BD-done writes. |
+| `src/bridge/remu_hdma_proto.h` | — | — | Header-only: `RemuHdmaHeader` (24 B: magic `'HDMA'` LE, op, 64-bit dst, len, `req_id`) + payload, `RemuHdmaRx` streaming decoder, per-opcode emit helpers (`remu_hdma_emit_write{,_tagged}`, `remu_hdma_emit_read_req`, `remu_hdma_emit_read_resp`, `remu_hdma_emit_cfg_write`). Four opcodes: `OP_WRITE` (NPU→host, QINIT + BD-done writes), `OP_READ_REQ/RESP` (bidirectional tagged read, Stage 3c BD walk), `OP_CFG_WRITE` (NPU→host cfg shadow update). `req_id = 0` reserved for the untagged QINIT `OP_WRITE` pair; BD-done tags every frame (REQ/RESP + the CFG_WRITE / WRITE side effects) with `req_id = qid + 1`. |
 
 ## FW Source References
 

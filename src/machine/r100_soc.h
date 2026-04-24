@@ -44,10 +44,15 @@ struct R100SoCMachineState {
     /* `-machine r100-soc,doorbell=<chardev-id>` : M6 cross-process
      * doorbell ingress from the x86 host guest's BAR4. Resolved to a
      * Chardev at machine-init time for the same reason memdev is
-     * deferred. When unset, the r100-doorbell device is not created
-     * (single-QEMU runs are unaffected). */
+     * deferred. When unset, the r100-cm7 device is not created
+     * (single-QEMU runs are unaffected). Named "doorbell" for
+     * historical reasons — it's the single ingress chardev the
+     * device's doorbell RX handler reads; the device itself was
+     * renamed from r100-doorbell to r100-cm7 in M8b Stage 3c when
+     * BD-done joined the other four CM7 responsibilities (SOFT_RESET
+     * stub, ISSR payload sink, cfg-shadow, QINIT). */
     char *doorbell_chardev_id;
-    /* Optional: debug tail chardev id that the r100-doorbell device
+    /* Optional: debug tail chardev id that the r100-cm7 device
      * echoes each received frame to as an ASCII line. Used by the
      * M6 verification test and humans; does not affect signalling. */
     char *doorbell_debug_chardev_id;
@@ -77,7 +82,7 @@ struct R100SoCMachineState {
      * without knowing which mailbox instance the frame came from.
      * This is the NPU→host half of the FW_BOOT_DONE handshake;
      * the reverse host→NPU half flows over the existing `doorbell`
-     * chardev, since M8 extends r100-doorbell to recognise
+     * chardev, since M8 extends r100-cm7 to recognise
      * MAILBOX_BASE-range offsets and write them through to the
      * mailbox's ISSR register file (no interrupt). Resolved to a
      * Chardev at machine-init time (same late-binding reason as
@@ -91,7 +96,7 @@ struct R100SoCMachineState {
      * cfg-head mirror. When set, host-side r100-npu-pci installs a
      * 4 KB MMIO trap at BAR2 offset FW_LOGBUF_SIZE and forwards every
      * write to this chardev as an 8-byte (cfg_off, val) frame; NPU-side
-     * r100-doorbell consumes them into cfg_shadow[] so the CM7 stub
+     * r100-cm7 consumes them into cfg_shadow[] so the CM7 stub
      * can read DDH_BASE_{LO,HI} when synthesising HDMA writes. Same
      * late-binding rule as memdev / doorbell / msix / issr. */
     char *cfg_chardev_id;
@@ -99,18 +104,27 @@ struct R100SoCMachineState {
      * received frame). Mirror of doorbell_debug_chardev_id. */
     char *cfg_debug_chardev_id;
 
-    /* `-machine r100-soc,hdma=<chardev-id>` : M8b Stage 3b NPU→host HDMA
-     * executor. When set, r100-doorbell emits variable-length
-     * HDMA_OP_WRITE frames (remu_hdma_proto.h) on this chardev; the
-     * host-side r100-npu-pci decodes and executes them as
-     * pci_dma_write into the kmd's dma_alloc_coherent pages. Used
-     * today by the QINIT CM7 stub (fw_version + init_done writes);
-     * M9 will reuse it for BD-done completions. Same late-binding
-     * rule as memdev / doorbell / msix / issr / cfg. */
+    /* `-machine r100-soc,hdma=<chardev-id>` : M8b Stage 3b/3c NPU<->host
+     * HDMA executor. Bidirectional channel: r100-cm7 emits variable-
+     * length frames (remu_hdma_proto.h) — OP_WRITE (QINIT + BD-done
+     * writebacks), OP_READ_REQ (3c, queue_desc/BD/packet fetches),
+     * OP_CFG_WRITE (3c, FUNC_SCRATCH update). Host-side r100-npu-pci
+     * decodes and executes them as pci_dma_{read,write} plus local
+     * cfg-head shadow stores, and emits OP_READ_RESP back. Same
+     * late-binding rule as memdev / doorbell / msix / issr / cfg. */
     char *hdma_chardev_id;
-    /* Optional debug tail for hdma egress (one ASCII line per
-     * sent frame). Mirror of doorbell_debug_chardev_id. */
+    /* Optional debug tail for hdma (one ASCII line per frame sent or
+     * received). Mirror of doorbell_debug_chardev_id. */
     char *hdma_debug_chardev_id;
+
+    /* `-machine r100-soc,cm7-debug=<chardev-id>` : M8b Stage 3c CM7
+     * BD-done state machine ASCII tail. When set, the r100-cm7
+     * device writes one line per BD-job phase transition to this
+     * chardev so tests can assert the IDLE -> WAIT_QDESC -> WAIT_BD
+     * -> WAIT_PKT -> IDLE walk end-to-end. Independent from the
+     * doorbell/cfg/hdma debug tails (those trace wire-level frames;
+     * this one traces the higher-level state machine). */
+    char *cm7_debug_chardev_id;
 };
 
 typedef struct R100SoCMachineState R100SoCMachineState;
@@ -123,19 +137,20 @@ DECLARE_INSTANCE_CHECKER(R100SoCMachineState, R100_SOC_MACHINE,
  *
  * Only the type names live here; each device's state struct and the
  * R100_<dev>() cast macro stay private to its src/machine/r100_<dev>.c
- * file. Other files (e.g., the machine itself, r100-doorbell holding
+ * file. Other files (e.g., the machine itself, r100-cm7 holding
  * links to the mailbox) access these devices only via opaque Object*
  * / DeviceState* pointers, so they only need the type *name* to
  * resolve links and push instances onto the sysbus.
  *
- * The mailbox is a partial exception: r100-doorbell calls three
- * helpers on it from outside the MMIO path. Those prototypes and the
- * typedef-forward-decl live in r100_mailbox.h (included below) so
- * everyone sees the same API without exposing the internal struct
- * layout.
+ * The mailbox + imsix are partial exceptions: r100-cm7 calls helpers
+ * on both from outside the MMIO path. Those prototypes and the
+ * typedef-forward-decls live in r100_mailbox.h / r100_imsix.h
+ * (included below) so everyone sees the same API without exposing
+ * the internal struct layout.
  * ======================================================================== */
 
 #include "r100_mailbox.h"               /* TYPE_R100_MAILBOX + helpers */
+#include "r100_imsix.h"                 /* TYPE_R100_IMSIX + notify helper */
 
 #define TYPE_R100_CMU           "r100-cmu"
 #define TYPE_R100_PMU           "r100-pmu"
@@ -150,7 +165,7 @@ DECLARE_INSTANCE_CHECKER(R100SoCMachineState, R100_SOC_MACHINE,
 #define TYPE_R100_LOGBUF        "r100-logbuf-tail"
 #define TYPE_R100_DNC_CLUSTER   "r100-dnc-cluster"
 #define TYPE_R100_RBDMA         "r100-rbdma"
-#define TYPE_R100_DOORBELL      "r100-doorbell"
+#define TYPE_R100_CM7           "r100-cm7"
 #define TYPE_R100_IMSIX         "r100-imsix"
 
 #define R100_RBC_BLOCK_SIZE     0x80000ULL  /* 512KB per RBC block */

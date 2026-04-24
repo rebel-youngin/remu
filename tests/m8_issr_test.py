@@ -20,7 +20,7 @@ downstream q-cp message-ring paths:
                    existing 8-byte (offset, value) doorbell frame
                    (offset now disambiguates INTGR trigger vs. ISSR
                    payload on the NPU side)
-                 → src/machine/r100_doorbell.c sees off in
+                 → src/machine/r100_cm7.c sees off in
                    [0x80, 0x180) and calls r100_mailbox_set_issr()
                  → FW read of ISSR[idx] returns `value`
 
@@ -40,7 +40,7 @@ Phase 2 (host→NPU): NPU-only aarch64 QEMU. Test binds `doorbell.sock`
 and the host side; QEMU connects as client. Test sends synthetic
 doorbell frames with MAILBOX_BASE-range offsets and reads the
 mailbox's ISSR registers via HMP `xp` at R100_PCIE_MAILBOX_BASE +
-ISSR0 + idx*4 = 0x1FF8160080 + idx*4. Proves r100-doorbell's new
+ISSR0 + idx*4 = 0x1FF8160080 + idx*4. Proves r100-cm7's new
 MAILBOX_BASE branch writes through without raising any SPI.
 
 Success criteria:

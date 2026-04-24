@@ -35,7 +35,7 @@ void r100_mailbox_raise_intgr(R100MailboxState *s, int group, uint32_t val);
 
 /*
  * Inject an ISSR register write from outside the MMIO path. Used by
- * the M8 extension to r100-doorbell: frames arriving from the x86
+ * the M8 extension to r100-cm7: frames arriving from the x86
  * host-side BAR4 writes into the MAILBOX_BASE payload range update
  * the backing scratch register but must NOT re-emit on the ISSR
  * egress chardev (that would loop the host's own write back at
@@ -45,7 +45,7 @@ void r100_mailbox_set_issr(R100MailboxState *s, uint32_t idx, uint32_t val);
 
 /*
  * CM7-stub egress write. Used by the REMU CM7-relay shortcut in
- * r100-doorbell: on silicon, certain host doorbells (notably
+ * r100-cm7: on silicon, certain host doorbells (notably
  * SOFT_RESET) get handled by the PCIE_CM7 subcontroller's firmware,
  * which then writes scratch values like FW_BOOT_DONE (0xFB0D) into
  * PF.ISSR[4] via MMIO. REMU doesn't model CM7; this helper updates
@@ -56,5 +56,15 @@ void r100_mailbox_set_issr(R100MailboxState *s, uint32_t idx, uint32_t val);
  */
 void r100_mailbox_cm7_stub_write_issr(R100MailboxState *s, uint32_t idx,
                                       uint32_t val);
+
+/*
+ * Read the current ISSR[idx] value without going through the MMIO
+ * path. Used by the M8b Stage 3c r100-cm7 BD-done state machine to
+ * snapshot the queue-N producer index (kmd publishes `pi` at
+ * PF.ISSR[qid] via a BAR4 MAILBOX_BASE write; that host→NPU relay
+ * lands here via r100_mailbox_set_issr). Returns 0 for out-of-range
+ * `idx` — a safe no-op because `pi == 0` means "nothing to consume".
+ */
+uint32_t r100_mailbox_get_issr(R100MailboxState *s, uint32_t idx);
 
 #endif /* R100_MAILBOX_H */

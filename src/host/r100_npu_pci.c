@@ -17,16 +17,21 @@
  *   BAR5 1 MB   MSI-X table+PBA head; rest lazy RAM.
  *
  * The INTGR1-bit-7 (REBEL_DOORBELL_QUEUE_INIT) CM7 stub that used to
- * live on this side now sits NPU-side in src/machine/r100_doorbell.c;
- * this device only provides the two wires the stub needs:
+ * live on this side now sits NPU-side in src/machine/r100_cm7.c;
+ * this device only provides the two wires the stub needs, plus a
+ * bidirectional hdma executor (Stage 3c):
  *
  *   cfg  chardev (server): host→NPU — receives cfg-head writes, so the
  *                          NPU-side stub can look up DDH_BASE_{LO,HI}
  *                          without round-tripping to host RAM.
- *   hdma chardev (server): NPU→host — receives HDMA_OP_WRITE frames
- *                          (see remu_hdma_proto.h) and executes them
- *                          as pci_dma_write into the kmd's
- *                          dma_alloc_coherent pages.
+ *   hdma chardev (server): NPU<->host — dispatches on the op field of
+ *                          each incoming frame (remu_hdma_proto.h):
+ *                            OP_WRITE     : pci_dma_write(payload)
+ *                            OP_READ_REQ  : pci_dma_read + emit
+ *                                           OP_READ_RESP tagged by req_id
+ *                            OP_CFG_WRITE : store into local cfg_mmio_regs
+ *                                           so kmd's rebel_cfg_read sees
+ *                                           the NPU-published value
  *
  * Wire formats:
  *   doorbell / cfg / issr / msix : 8-byte (off, val) LE frames (remu_frame.h)
@@ -115,15 +120,19 @@ struct R100NpuPciState {
     uint64_t cfg_frames_sent;
     uint64_t cfg_frames_dropped;
 
-    /* hdma (M8b Stage 3b NPU→host): variable-length frames decoded by
-     * remu_hdma_proto.h; payload executed via pci_dma_write. */
+    /* hdma (M8b Stage 3b/3c NPU<->host): variable-length frames decoded
+     * by remu_hdma_proto.h. OP_WRITE executed as pci_dma_write,
+     * OP_READ_REQ answered with OP_READ_RESP (frames sent counter
+     * tracks the responses), OP_CFG_WRITE stored into cfg_mmio_regs. */
     CharBackend hdma_chr;
     CharBackend hdma_debug_chr;
     RemuHdmaRx  hdma_rx;
     uint64_t hdma_frames_received;
     uint64_t hdma_frames_dropped;
+    uint64_t hdma_frames_sent;   /* OP_READ_RESP egress */
     uint64_t hdma_last_dst;
     uint32_t hdma_last_len;
+    uint32_t hdma_last_op;
 
     MemoryRegion bar0_ddr;
     MemoryRegion bar0_tail;
@@ -450,23 +459,137 @@ static int r100_hdma_can_receive(void *opaque)
 }
 
 static void r100_hdma_emit_debug(R100NpuPciState *s,
+                                 const char *dir,
                                  const RemuHdmaHeader *hdr,
                                  const char *status)
 {
-    char line[160];
+    char line[192];
     int n;
 
     if (!qemu_chr_fe_backend_connected(&s->hdma_debug_chr)) {
         return;
     }
     n = snprintf(line, sizeof(line),
-                 "hdma op=%u dst=0x%" PRIx64 " len=%u status=%s "
-                 "count=%" PRIu64 "\n",
-                 hdr->op, hdr->dst, hdr->len, status,
-                 s->hdma_frames_received);
+                 "hdma %s op=%s req_id=%u dst=0x%" PRIx64 " len=%u "
+                 "status=%s recv=%" PRIu64 " sent=%" PRIu64 "\n",
+                 dir, remu_hdma_op_str(hdr->op), hdr->req_id,
+                 hdr->dst, hdr->len, status,
+                 s->hdma_frames_received, s->hdma_frames_sent);
     if (n > 0) {
         qemu_chr_fe_write(&s->hdma_debug_chr, (const uint8_t *)line, n);
     }
+}
+
+/*
+ * OP_READ_REQ handler — pull `hdr->len` bytes out of the x86 guest's
+ * DMA space via pci_dma_read and emit a matching OP_READ_RESP frame
+ * (same req_id echoed, src = original hdr->dst). Bounded by
+ * REMU_HDMA_MAX_PAYLOAD so the stack buffer stays small; a request
+ * that wants more than 4 KB is a protocol violation from the
+ * NPU-side stub, not something the kmd can steer, so we drop it
+ * rather than chunk the reply.
+ */
+static void r100_hdma_handle_read_req(R100NpuPciState *s,
+                                      const RemuHdmaHeader *hdr)
+{
+    PCIDevice *pdev = PCI_DEVICE(s);
+    uint8_t buf[REMU_HDMA_MAX_PAYLOAD];
+    MemTxResult res;
+    RemuHdmaEmitResult erc;
+
+    if (hdr->len == 0 || hdr->len > sizeof(buf)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "r100-npu-pci: hdma READ_REQ len=%u out of range "
+                      "(max %zu) req_id=%u\n",
+                      hdr->len, sizeof(buf), hdr->req_id);
+        s->hdma_frames_dropped++;
+        r100_hdma_emit_debug(s, "rx", hdr, "len-range");
+        return;
+    }
+    res = pci_dma_read(pdev, hdr->dst, buf, hdr->len);
+    if (res != MEMTX_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "r100-npu-pci: hdma pci_dma_read src=0x%" PRIx64
+                      " len=%u failed (res=%d) req_id=%u\n",
+                      hdr->dst, hdr->len, res, hdr->req_id);
+        s->hdma_frames_dropped++;
+        r100_hdma_emit_debug(s, "rx", hdr, "dma-fail");
+        return;
+    }
+    s->hdma_frames_received++;
+    r100_hdma_emit_debug(s, "rx", hdr, "ok");
+
+    erc = remu_hdma_emit_read_resp(&s->hdma_chr, "r100-npu-pci hdma",
+                                   hdr->req_id, hdr->dst, buf, hdr->len);
+    if (erc != REMU_HDMA_EMIT_OK) {
+        qemu_log_mask(LOG_UNIMP,
+                      "r100-npu-pci: hdma READ_RESP emit failed "
+                      "src=0x%" PRIx64 " len=%u req_id=%u rc=%d\n",
+                      hdr->dst, hdr->len, hdr->req_id, (int)erc);
+        /* Don't bump hdma_frames_dropped — we already counted the
+         * successful ingress. Tests should notice by observing no
+         * matching READ_RESP in hdma.log. */
+        return;
+    }
+    s->hdma_frames_sent++;
+    {
+        /* Log the response separately so the hdma.log pairing is
+         * unambiguous; reuse the header with op overridden to RESP. */
+        RemuHdmaHeader resp = {
+            .magic  = REMU_HDMA_MAGIC,
+            .op     = REMU_HDMA_OP_READ_RESP,
+            .dst    = hdr->dst,
+            .len    = hdr->len,
+            .req_id = hdr->req_id,
+        };
+        r100_hdma_emit_debug(s, "tx", &resp, "ok");
+    }
+    qemu_log_mask(LOG_TRACE,
+                  "r100-npu-pci: hdma READ_REQ->RESP src=0x%" PRIx64
+                  " len=%u req_id=%u\n",
+                  hdr->dst, hdr->len, hdr->req_id);
+}
+
+/*
+ * OP_CFG_WRITE handler — the NPU-side CM7 stub publishes a u32 into
+ * our BAR2 cfg-head shadow at offset `dst`. The kmd reads the same
+ * location via rebel_cfg_read() (FUNC_SCRATCH = 0xFFC for rbln_queue_test).
+ * No chardev echo — this is the reverse direction of the Stage-3b
+ * host->NPU cfg forwarding; spraying another frame back would loop.
+ */
+static void r100_hdma_handle_cfg_write(R100NpuPciState *s,
+                                       const RemuHdmaHeader *hdr,
+                                       const uint8_t *payload)
+{
+    uint32_t cfg_off = (uint32_t)hdr->dst;
+    uint32_t idx = cfg_off >> 2;
+    uint32_t v32;
+
+    if (hdr->len != sizeof(uint32_t)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "r100-npu-pci: hdma CFG_WRITE len=%u (expected 4) "
+                      "off=0x%x req_id=%u\n",
+                      hdr->len, cfg_off, hdr->req_id);
+        s->hdma_frames_dropped++;
+        r100_hdma_emit_debug(s, "rx", hdr, "len-range");
+        return;
+    }
+    if (cfg_off >= REMU_BAR2_CFG_HEAD_SIZE || (cfg_off & 0x3u)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "r100-npu-pci: hdma CFG_WRITE off=0x%x out of "
+                      "cfg head / unaligned req_id=%u\n",
+                      cfg_off, hdr->req_id);
+        s->hdma_frames_dropped++;
+        r100_hdma_emit_debug(s, "rx", hdr, "bad-offset");
+        return;
+    }
+    v32 = ldl_le_p(payload);
+    s->cfg_mmio_regs[idx] = v32;
+    s->hdma_frames_received++;
+    r100_hdma_emit_debug(s, "rx", hdr, "ok");
+    qemu_log_mask(LOG_TRACE,
+                  "r100-npu-pci: hdma CFG_WRITE off=0x%x val=0x%x "
+                  "req_id=%u\n", cfg_off, v32, hdr->req_id);
 }
 
 static void r100_hdma_deliver(R100NpuPciState *s,
@@ -478,31 +601,55 @@ static void r100_hdma_deliver(R100NpuPciState *s,
 
     s->hdma_last_dst = hdr->dst;
     s->hdma_last_len = hdr->len;
+    s->hdma_last_op  = hdr->op;
 
-    if (hdr->op != REMU_HDMA_OP_WRITE) {
+    switch (hdr->op) {
+    case REMU_HDMA_OP_WRITE:
+        res = pci_dma_write(pdev, hdr->dst, payload, hdr->len);
+        if (res != MEMTX_OK) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "r100-npu-pci: hdma pci_dma_write dst=0x%"
+                          PRIx64 " len=%u failed (res=%d) req_id=%u\n",
+                          hdr->dst, hdr->len, res, hdr->req_id);
+            s->hdma_frames_dropped++;
+            r100_hdma_emit_debug(s, "rx", hdr, "dma-fail");
+            return;
+        }
+        s->hdma_frames_received++;
+        r100_hdma_emit_debug(s, "rx", hdr, "ok");
+        qemu_log_mask(LOG_TRACE,
+                      "r100-npu-pci: hdma WRITE dst=0x%" PRIx64 " len=%u "
+                      "req_id=%u received=%" PRIu64 "\n",
+                      hdr->dst, hdr->len, hdr->req_id,
+                      s->hdma_frames_received);
+        break;
+    case REMU_HDMA_OP_READ_REQ:
+        r100_hdma_handle_read_req(s, hdr);
+        break;
+    case REMU_HDMA_OP_CFG_WRITE:
+        r100_hdma_handle_cfg_write(s, hdr, payload);
+        break;
+    case REMU_HDMA_OP_READ_RESP:
+        /* READ_RESP is host->NPU only; the NPU side should never send
+         * one to us. Treat as protocol violation rather than silently
+         * dropping so a future refactor doesn't mask real bugs. */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "r100-npu-pci: hdma unexpected READ_RESP "
+                      "dst=0x%" PRIx64 " len=%u req_id=%u "
+                      "(host-side only sends, never receives)\n",
+                      hdr->dst, hdr->len, hdr->req_id);
+        s->hdma_frames_dropped++;
+        r100_hdma_emit_debug(s, "rx", hdr, "unexpected-op");
+        break;
+    default:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "r100-npu-pci: hdma unknown op=%u dst=0x%" PRIx64
-                      " len=%u\n", hdr->op, hdr->dst, hdr->len);
+                      " len=%u req_id=%u\n", hdr->op, hdr->dst, hdr->len,
+                      hdr->req_id);
         s->hdma_frames_dropped++;
-        r100_hdma_emit_debug(s, hdr, "bad-op");
-        return;
+        r100_hdma_emit_debug(s, "rx", hdr, "bad-op");
+        break;
     }
-    res = pci_dma_write(pdev, hdr->dst, payload, hdr->len);
-    if (res != MEMTX_OK) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "r100-npu-pci: hdma pci_dma_write dst=0x%" PRIx64
-                      " len=%u failed (res=%d)\n",
-                      hdr->dst, hdr->len, res);
-        s->hdma_frames_dropped++;
-        r100_hdma_emit_debug(s, hdr, "dma-fail");
-        return;
-    }
-    s->hdma_frames_received++;
-    r100_hdma_emit_debug(s, hdr, "ok");
-    qemu_log_mask(LOG_TRACE,
-                  "r100-npu-pci: hdma write dst=0x%" PRIx64 " len=%u "
-                  "received=%" PRIu64 "\n",
-                  hdr->dst, hdr->len, s->hdma_frames_received);
 }
 
 static void r100_hdma_receive(void *opaque, const uint8_t *buf, int size)

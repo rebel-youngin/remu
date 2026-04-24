@@ -539,7 +539,8 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
                    doorbell_log=None, msix_sock=None, msix_log=None,
                    issr_sock=None, issr_log=None,
                    cfg_sock=None, cfg_log=None,
-                   hdma_sock=None, hdma_log=None):
+                   hdma_sock=None, hdma_log=None,
+                   cm7_log=None):
     """Assemble the aarch64 QEMU cmdline for the R100 NPU side.
     Matches the previous in-line flow exactly; extracted so that
     --host can extend it (Phase 2) without duplicating boot-image
@@ -588,21 +589,29 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
     mirror. The host side traps a 4 KB MMIO window at BAR2 offset
     FW_LOGBUF_SIZE (where the kmd programs DDH_BASE_{LO,HI}) and
     forwards every write as an 8-byte (cfg-head-offset, value) frame;
-    the NPU-side r100-doorbell consumes them into cfg_shadow[] so the
-    CM7 QINIT stub can read DDH_BASE without round-tripping to host
-    RAM. Optional `cfg_log` file chardev echoes one ASCII line per
+    the NPU-side r100-cm7 consumes them into cfg_shadow[] so the CM7
+    QINIT stub can read DDH_BASE without round-tripping to host RAM.
+    Optional `cfg_log` file chardev echoes one ASCII line per
     received frame.
 
-    hdma_sock / hdma_log: M8b Stage 3b plumbing — NPU→host HDMA
-    executor. The NPU-side r100-doorbell emits variable-length
-    HDMA_OP_WRITE frames (24-byte header + payload, remu_hdma_proto.h)
-    on this chardev whenever the CM7 stub decides to touch host RAM;
-    the host-side r100-npu-pci decodes each frame and performs the
-    underlying pci_dma_write on the x86 guest's memory. Today only
-    the QINIT stub uses it (fw_version + init_done = 1 into the
-    rbln_device_desc); M9 BD-done completions reuse the same wire.
-    Optional `hdma_log` file chardev echoes one ASCII line per
-    emitted frame."""
+    hdma_sock / hdma_log: M8b Stage 3b/3c plumbing — NPU<->host HDMA
+    executor. The NPU-side r100-cm7 emits variable-length frames
+    (24-byte header + payload, remu_hdma_proto.h) on this chardev:
+    OP_WRITE for bulk writes into host RAM (QINIT + 3c BD-done commits),
+    OP_READ_REQ for queue_desc/BD/packet fetches, OP_CFG_WRITE for
+    FUNC_SCRATCH publish. The host-side r100-npu-pci decodes each
+    frame, performs the matching pci_dma_{read,write} against the x86
+    guest, and for OP_READ_REQ emits OP_READ_RESP back to the NPU.
+    Optional `hdma_log` file chardev echoes one ASCII line per frame
+    (either direction) — `dir=tx` is NPU→host, `dir=rx` is the host
+    seeing NPU egress (the NPU-side tail logs both directions too).
+
+    cm7_log: M8b Stage 3c CM7 state-machine tail. When set, the
+    NPU-side r100-cm7 device writes one ASCII line per BD-done
+    phase transition (IDLE / WAIT_QDESC / WAIT_BD / WAIT_PKT /
+    LOOP / imsix_notify) to this file. Independent from hdma_log
+    (which is wire-level); cm7.log is the higher-level walk and is
+    the first thing to grep when rbln_queue_test hangs."""
     uart0_log = run_dir / "uart0.log"
     hils_log = run_dir / "hils.log"
 
@@ -629,6 +638,8 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
         machine_opt += ",hdma=hdma"
         if hdma_log is not None:
             machine_opt += ",hdma-debug=hdma_dbg"
+    if cm7_log is not None:
+        machine_opt += ",cm7-debug=cm7_dbg"
 
     cmd = [
         str(QEMU_BIN),
@@ -687,7 +698,7 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
     if cfg_sock is not None:
         # M8b 3b: host→NPU cfg-head mirror. Same host-as-server pattern
         # — host-side r100-npu-pci listens and egresses frames, NPU
-        # r100-doorbell connects as client and populates cfg_shadow.
+        # r100-cm7 connects as client and populates cfg_shadow.
         cmd += [
             "-chardev",
             "socket,id=cfg,path=%s,reconnect=1" % cfg_sock,
@@ -698,9 +709,11 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
                 "file,id=cfg_dbg,path=%s,mux=off" % cfg_log,
             ]
     if hdma_sock is not None:
-        # M8b 3b: NPU→host HDMA executor. Host listens; NPU connects
-        # and emits HDMA_OP_WRITE frames (variable-length) on the
-        # CM7-stub dispatch.
+        # M8b 3b/3c: NPU<->host HDMA executor. Host listens; NPU connects
+        # and emits variable-length frames. 3c makes the channel
+        # bidirectional (OP_READ_RESP flows host→NPU), so the same
+        # chardev carries both directions — the `reconnect=1` setting
+        # is fine either way, QEMU socket chardevs are full-duplex.
         cmd += [
             "-chardev",
             "socket,id=hdma,path=%s,reconnect=1" % hdma_sock,
@@ -710,6 +723,14 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
                 "-chardev",
                 "file,id=hdma_dbg,path=%s,mux=off" % hdma_log,
             ]
+    if cm7_log is not None:
+        # M8b 3c: BD-done state-machine ASCII tail. No socket peer —
+        # this is a file-only chardev just for human + test
+        # consumption (similar to hils.log).
+        cmd += [
+            "-chardev",
+            "file,id=cm7_dbg,path=%s,mux=off" % cm7_log,
+        ]
     click.echo("  Chiplet 0 UART -> stdio (log: %s)" % uart0_log)
 
     for n in range(1, 4):
@@ -931,7 +952,7 @@ def _build_host_cmd(host_dir, shm_file, shm_size, monitor_sock, mem,
     when set, is a file chardev wired to the device's `issr-debug`
     option so every ingressed frame leaves an ASCII trail. Host-side
     BAR4 MAILBOX_BASE writes flow OUT over the existing `doorbell`
-    chardev (offset disambiguation is done by the NPU r100-doorbell),
+    chardev (offset disambiguation is done by the NPU r100-cm7),
     so M8 only needs one new chardev, not two.
 
     SeaBIOS IS allowed to run (no `-S`) so the BAR addresses get
@@ -983,8 +1004,8 @@ def _build_host_cmd(host_dir, shm_file, shm_size, monitor_sock, mem,
             device_arg += ",issr-debug=issr_dbg"
     if cfg_sock is not None:
         # M8b 3b cfg: host owns the listener, egresses (cfg_off, val)
-        # frames on kmd BAR2 cfg-head writes. NPU r100-doorbell joins
-        # as client and updates cfg_shadow[].
+        # frames on kmd BAR2 cfg-head writes. NPU r100-cm7 joins as
+        # client and updates cfg_shadow[].
         chardevs += [
             "-chardev",
             "socket,id=cfg,path=%s,server=on,wait=off" % cfg_sock,
@@ -1252,11 +1273,13 @@ def _verify_doorbell_wired(host_monitor_sock, npu_monitor_sock,
     on the r100-npu-pci BAR4 container, which only exists when the
     `doorbell` chardev property was wired.
 
-    NPU side: `info qtree` must list both a `r100-doorbell` (conditional
-    on our `-machine r100-soc,doorbell=<chardev>` option) and a
-    `r100-mailbox` instance (unconditional; the doorbell links to it
+    NPU side: `info qtree` must list both a `r100-cm7` (conditional
+    on our `-machine r100-soc,doorbell=<chardev>` option — the
+    machine option kept its historical name; the device was renamed
+    from r100-doorbell to r100-cm7 in M8b Stage 3c) and a
+    `r100-mailbox` instance (unconditional; the CM7 stub links to it
     to deliver INTGR writes). Presence of both + a realized `chardev`
-    property on the doorbell is the server-coming-up ack. The socket
+    property on the CM7 device is the server-coming-up ack. The socket
     connect itself is async (host is server, NPU is reconnect=1
     client), but the device being realized means the machine chose
     to instantiate it from our machine option.
@@ -1287,12 +1310,12 @@ def _verify_doorbell_wired(host_monitor_sock, npu_monitor_sock,
             if "r100.bar4" in ln
         )
 
-    # NPU side: confirm both r100-doorbell (chardev ingress) and
-    # r100-mailbox (the PCIE_PRIVATE SFR the doorbell now targets)
+    # NPU side: confirm both r100-cm7 (chardev ingress + CM7 stubs)
+    # and r100-mailbox (the PCIE_PRIVATE SFR the CM7 now targets)
     # are in the device tree.
     qtree = _hmp_query(npu_monitor_sock, "info qtree", timeout=10.0)
     npu_qtree_log.write_text(qtree + "\n")
-    for dev in ("r100-doorbell", "r100-mailbox"):
+    for dev in ("r100-cm7", "r100-mailbox"):
         if dev not in qtree:
             raise RuntimeError(
                 "NPU-side %s device not found in info qtree; see %s"
@@ -1439,15 +1462,17 @@ def _verify_issr_wired(host_monitor_sock, npu_monitor_sock,
 def _verify_cfg_hdma_wired(host_monitor_sock, npu_monitor_sock,
                            host_qtree_log, npu_qtree_log,
                            poll_timeout=10.0):
-    """Prove the M8b 3b cfg + hdma chardev plumbing is alive on both sides.
+    """Prove the M8b 3b/3c cfg + hdma + cm7-debug plumbing is alive on
+    both sides.
 
-    Same pattern as `_verify_issr_wired` — both new chardevs are
+    Same pattern as `_verify_issr_wired` — the new chardevs are
     CharBackend properties on existing devices (no new MemoryRegion
     overlay to look for), so we inspect `info qtree` on both sides:
 
-    NPU side (r100-doorbell):
-      `cfg-chardev`  = "cfg"   (non-empty CharBackend value)
-      `hdma-chardev` = "hdma"  (non-empty CharBackend value)
+    NPU side (r100-cm7):
+      `cfg-chardev`        = "cfg"      (non-empty CharBackend value)
+      `hdma-chardev`       = "hdma"     (non-empty CharBackend value)
+      `cm7-debug-chardev`  = "cm7_dbg"  (non-empty; 3c BD-done tail)
 
     Host side (r100-npu-pci):
       `cfg`  = "cfg"
@@ -1474,24 +1499,33 @@ def _verify_cfg_hdma_wired(host_monitor_sock, npu_monitor_sock,
         if ("cfg-chardev" in qtree_npu and
                 'cfg-chardev ""' not in qtree_npu and
                 "hdma-chardev" in qtree_npu and
-                'hdma-chardev ""' not in qtree_npu):
+                'hdma-chardev ""' not in qtree_npu and
+                "cm7-debug-chardev" in qtree_npu and
+                'cm7-debug-chardev ""' not in qtree_npu):
             break
         time.sleep(0.3)
     npu_qtree_log.write_text(qtree_npu + "\n")
 
     npu_lines = [ln.rstrip() for ln in qtree_npu.splitlines()
-                 if "cfg-chardev" in ln or "hdma-chardev" in ln]
+                 if "cfg-chardev" in ln
+                 or "hdma-chardev" in ln
+                 or "cm7-debug-chardev" in ln]
     if not _has_nonempty(npu_lines, "cfg-chardev"):
         raise RuntimeError(
-            "NPU-side r100-doorbell 'cfg-chardev' property is unset; "
+            "NPU-side r100-cm7 'cfg-chardev' property is unset; "
             "the -machine r100-soc,cfg=<id> option didn't latch. "
             "See %s" % npu_qtree_log)
     if not _has_nonempty(npu_lines, "hdma-chardev"):
         raise RuntimeError(
-            "NPU-side r100-doorbell 'hdma-chardev' property is unset; "
+            "NPU-side r100-cm7 'hdma-chardev' property is unset; "
             "the -machine r100-soc,hdma=<id> option didn't latch. "
             "See %s" % npu_qtree_log)
-    npu_snippet = "\n".join(npu_lines) or "(no cfg/hdma-chardev lines)"
+    if not _has_nonempty(npu_lines, "cm7-debug-chardev"):
+        raise RuntimeError(
+            "NPU-side r100-cm7 'cm7-debug-chardev' property is unset; "
+            "the -machine r100-soc,cm7-debug=<id> option didn't latch. "
+            "See %s" % npu_qtree_log)
+    npu_snippet = "\n".join(npu_lines) or "(no cfg/hdma/cm7-debug lines)"
 
     qtree_host = ""
     deadline = time.time() + poll_timeout
@@ -1632,7 +1666,8 @@ def run(name, output_root, gdb, trace, chiplets, memory,
       msix.log           ASCII tail of MSI-X frames emitted by NPU (M7)
       issr.log           ASCII tail of ISSR frames emitted by NPU (M8)
       cfg.log            ASCII tail of cfg frames received by NPU (M8b 3b)
-      hdma.log           ASCII tail of hdma frames emitted by NPU (M8b 3b)
+      hdma.log           ASCII tail of hdma frames (both directions, M8b 3b/3c)
+      cm7.log            ASCII tail of r100-cm7 BD-done state transitions (M8b 3c)
 
     `<output-root>/latest` is updated to point at the most recent run.
     """
@@ -1666,6 +1701,7 @@ def run(name, output_root, gdb, trace, chiplets, memory,
     cfg_log = None
     hdma_sock = None
     hdma_log = None
+    cm7_log = None
     if with_host:
         npu_dir = run_dir / "npu"
         npu_dir.mkdir(exist_ok=True)
@@ -1695,6 +1731,7 @@ def run(name, output_root, gdb, trace, chiplets, memory,
         issr_log = run_dir / "issr.log"
         cfg_log = run_dir / "cfg.log"
         hdma_log = run_dir / "hdma.log"
+        cm7_log = run_dir / "cm7.log"
 
     npu_cmd, found = _build_npu_cmd(run_dir, gdb, trace,
                                     with_host=with_host,
@@ -1708,7 +1745,8 @@ def run(name, output_root, gdb, trace, chiplets, memory,
                                     cfg_sock=cfg_sock,
                                     cfg_log=cfg_log,
                                     hdma_sock=hdma_sock,
-                                    hdma_log=hdma_log)
+                                    hdma_log=hdma_log,
+                                    cm7_log=cm7_log)
 
     if found == 0:
         click.secho("Warning: no firmware images in %s/" % IMAGES_DIR,
@@ -1804,6 +1842,7 @@ def run(name, output_root, gdb, trace, chiplets, memory,
                    % (cfg_sock, cfg_log))
         click.echo("  HDMA        -> %s (debug tail: %s)"
                    % (hdma_sock, hdma_log))
+        click.echo("  CM7 BD-done -> %s" % cm7_log)
 
     (run_dir / "cmdline.txt").write_text(" \\\n  ".join(npu_cmd) + "\n")
 
@@ -1991,7 +2030,7 @@ def run(name, output_root, gdb, trace, chiplets, memory,
             )
             click.secho(
                 "  doorbell chardev wired: BAR4 MMIO overlay on host + "
-                "r100-doorbell → r100-mailbox on NPU", fg="green")
+                "r100-cm7 → r100-mailbox on NPU", fg="green")
             for ln in db_snip.splitlines():
                 click.echo("    " + ln)
             click.echo()
@@ -2033,9 +2072,9 @@ def run(name, output_root, gdb, trace, chiplets, memory,
         except Exception as e:
             click.secho("  %s" % e, fg="red")
 
-        # M8b 3b: Verify the cfg (host→NPU) + hdma (NPU→host) pair so
-        # CM7 QINIT stub has the two wires it needs. Same non-fatal
-        # policy as issr.
+        # M8b 3b/3c: Verify the cfg (host→NPU) + hdma (NPU<->host)
+        # pair + cm7-debug (3c BD-done tail) so the full CM7 stub has
+        # every wire it needs. Same non-fatal policy as issr.
         try:
             ch_snip = _verify_cfg_hdma_wired(
                 host_dir / "monitor.sock", npu_monitor_sock,
@@ -2043,8 +2082,9 @@ def run(name, output_root, gdb, trace, chiplets, memory,
                 npu_dir / "info-qtree-cfg-hdma.log",
             )
             click.secho(
-                "  cfg+hdma chardevs wired: r100-doorbell cfg/hdma on NPU + "
-                "r100-npu-pci cfg/hdma on host", fg="green")
+                "  cfg+hdma+cm7-debug chardevs wired: r100-cm7 cfg/hdma/"
+                "cm7-debug on NPU + r100-npu-pci cfg/hdma on host",
+                fg="green")
             for ln in ch_snip.splitlines():
                 click.echo("    " + ln)
             click.echo()

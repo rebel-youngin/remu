@@ -359,7 +359,7 @@
 
 /* BAR4 doorbell: INTGR triggers + MAILBOX_BASE shadow of NPU
  * ISSR0..63 (rebel_regs.h MAILBOX_BASE/SIZE; ipm_samsung +0x80).
- * M6/M8a chardev bridge details in src/machine/r100_doorbell.c. */
+ * M6/M8a chardev bridge details in src/machine/r100_cm7.c. */
 #define R100_BAR4_MAILBOX_INTGR0    0x00000008u  /* db_idx >= 32 */
 #define R100_BAR4_MAILBOX_INTGR1    0x0000001cu  /* db_idx <  32 */
 #define R100_BAR4_MAILBOX_BASE      0x00000080u

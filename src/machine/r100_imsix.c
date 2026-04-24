@@ -1,6 +1,6 @@
 /*
  * R100 integrated MSI-X trigger (M7, commit db3d1df). Reverse of
- * r100_doorbell.c: snoops FW stores to REBELH_PCIE_MSIX_ADDR
+ * r100_cm7.c's doorbell ingress: snoops FW stores to REBELH_PCIE_MSIX_ADDR
  * (0x1BFFFFFFFC) and emits 8-byte (off, db_data) frame on the host
  * `msix` chardev. Matches pcie_msix_trigger in FreeRTOS/rbln/msix.c.
  * db_data layout: [28:24]PF [23:16]VF [15]VF-Act [14:12]TC [10:0]Vector.
@@ -20,9 +20,10 @@
 #include "chardev/char-fe.h"
 #include "migration/vmstate.h"
 #include "r100_soc.h"
+#include "r100_imsix.h"
 #include "remu_frame.h"
 
-OBJECT_DECLARE_SIMPLE_TYPE(R100IMSIXState, R100_IMSIX)
+DECLARE_INSTANCE_CHECKER(R100IMSIXState, R100_IMSIX, TYPE_R100_IMSIX)
 
 struct R100IMSIXState {
     SysBusDevice parent_obj;
@@ -74,6 +75,22 @@ static void r100_imsix_emit(R100IMSIXState *s, uint32_t off, uint32_t db_data)
     }
     s->frames_sent++;
     r100_imsix_emit_debug(s, off, db_data);
+}
+
+/*
+ * Public: invoked by the r100-cm7 BD-done state machine (M8b 3c) when
+ * a command-queue completes. Wraps r100_imsix_emit so the chardev
+ * stays single-owner — the wire format the host sees is the same
+ * "off=R100_PCIE_IMSIX_DB_OFFSET, db_data=<vector>" an FW store would
+ * have produced. Vector goes through R100_PCIE_IMSIX_VECTOR_MASK to
+ * stay within the 11-bit field the silicon format allows (CR03 tops
+ * out at 32 vectors == 5 bits, but we mask defensively anyway).
+ */
+void r100_imsix_notify(R100IMSIXState *s, uint32_t vector)
+{
+    uint32_t db_data = vector & R100_PCIE_IMSIX_VECTOR_MASK;
+
+    r100_imsix_emit(s, R100_PCIE_IMSIX_DB_OFFSET, db_data);
 }
 
 static uint64_t r100_imsix_read(void *opaque, hwaddr addr, unsigned size)

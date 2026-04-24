@@ -1,7 +1,7 @@
 /*
  * REMU — shared 8-byte (u32 a, u32 b) cross-QEMU frame codec.
  *
- * The host-side `r100-npu-pci` and NPU-side `r100-doorbell` /
+ * The host-side `r100-npu-pci` and NPU-side `r100-cm7` /
  * `r100-imsix` / `r100-mailbox` all speak the same wire format on
  * their Unix-socket chardev bridges:
  *

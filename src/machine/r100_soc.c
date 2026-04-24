@@ -948,7 +948,8 @@ static void r100_soc_init(MachineState *machine)
     }
 
     /*
-     * Chiplet-0 PCIE mailbox cluster + optional doorbell ingress.
+     * Chiplet-0 PCIE mailbox cluster + optional r100-cm7 ingress +
+     * optional r100-imsix egress.
      *
      * Silicon: 17 Samsung IPM SFRs at MAILBOX_PCIE (VF0..VF15 @ 0x1000
      * stride + PF at 0x1FF8170000). VF0 serves q-sys CA73 (INTID 185
@@ -962,12 +963,19 @@ static void r100_soc_init(MachineState *machine)
      * (CM7 not modelled, so PF.INTGR is latched-but-unrouted). The
      * doorbell ingress is shortcut-wired to VF0 so KMD INTGR writes
      * directly fire the IRQ q-sys services — see r100_mailbox.c /
-     * r100_doorbell.c, commit cd24aa9 (M8a) and a01d2b5 (CM7 stub).
+     * r100_cm7.c, commit cd24aa9 (M8a) and a01d2b5 (CM7 stub).
+     *
+     * r100-imsix is instantiated *before* r100-cm7 so the 3c BD-done
+     * state machine can DEFINE_PROP_LINK("imsix", ...) against it;
+     * both live optional (each respective chardev), so missing either
+     * cleanly degrades — single-QEMU Phase 1 runs don't wire any of
+     * the cross-process chardevs and see none of the devices.
      */
     {
         R100SoCMachineState *r100m = R100_SOC_MACHINE(machine);
         DeviceState *mbx_vf0_dev;
         DeviceState *mbx_pf_dev;
+        DeviceState *imsix_dev = NULL;
         Chardev *issr_chr = NULL;
         Chardev *issr_dbg = NULL;
 
@@ -1014,6 +1022,35 @@ static void r100_soc_init(MachineState *machine)
         sysbus_mmio_map_overlap(SYS_BUS_DEVICE(mbx_pf_dev), 0,
                                 R100_PCIE_MAILBOX_PF_BASE, 10);
 
+        /*
+         * Integrated MSI-X trigger (M7, commit db3d1df). Snoops FW
+         * stores at REBELH_PCIE_MSIX_ADDR (0x1BFFFFFFFC), forwards
+         * (offset, db_data) frames on `msix` chardev → host-side
+         * msix_notify(). M8b 3c: also directly driven by r100-cm7's
+         * BD-done state machine via r100_imsix_notify().
+         * Optional: only when -machine r100-soc,msix=<id>.
+         */
+        {
+            Chardev *chr = r100_soc_resolve_chr(r100m->msix_chardev_id,
+                                                "msix");
+
+            if (chr) {
+                Chardev *dbg = r100_soc_resolve_chr(
+                                   r100m->msix_debug_chardev_id,
+                                   "msix debug");
+
+                imsix_dev = qdev_new(TYPE_R100_IMSIX);
+                qdev_prop_set_chr(imsix_dev, "chardev", chr);
+                if (dbg) {
+                    qdev_prop_set_chr(imsix_dev, "debug-chardev", dbg);
+                }
+                sysbus_realize_and_unref(SYS_BUS_DEVICE(imsix_dev),
+                                         &error_fatal);
+                sysbus_mmio_map_overlap(SYS_BUS_DEVICE(imsix_dev), 0,
+                                        R100_PCIE_IMSIX_BASE, 10);
+            }
+        }
+
         {
             Chardev *chr = r100_soc_resolve_chr(r100m->doorbell_chardev_id,
                                                 "doorbell");
@@ -1021,16 +1058,21 @@ static void r100_soc_init(MachineState *machine)
                 Chardev *dbg = r100_soc_resolve_chr(
                                    r100m->doorbell_debug_chardev_id,
                                    "doorbell debug");
-                /* M8b 3b: cfg (host→NPU) + hdma (NPU→host). Both are
-                 * optional — missing either demotes the QINIT CM7 stub
-                 * to a no-op but doesn't break the M6/M8a paths. */
+                /* M8b 3b: cfg (host→NPU) + hdma (NPU<->host). All
+                 * optional — missing any demotes the corresponding
+                 * CM7 behaviour to a no-op but doesn't break the
+                 * M6/M8a paths. 3c adds cm7-debug for BD-job phase
+                 * tracing; also opt-in. */
                 Chardev *cfg_chr = r100_soc_resolve_chr(
                                        r100m->cfg_chardev_id, "cfg");
                 Chardev *cfg_dbg = NULL;
                 Chardev *hdma_chr = r100_soc_resolve_chr(
                                        r100m->hdma_chardev_id, "hdma");
                 Chardev *hdma_dbg = NULL;
-                DeviceState *db = qdev_new(TYPE_R100_DOORBELL);
+                Chardev *cm7_dbg = r100_soc_resolve_chr(
+                                       r100m->cm7_debug_chardev_id,
+                                       "cm7 debug");
+                DeviceState *cm7 = qdev_new(TYPE_R100_CM7);
 
                 if (cfg_chr) {
                     cfg_dbg = r100_soc_resolve_chr(
@@ -1043,56 +1085,46 @@ static void r100_soc_init(MachineState *machine)
                                   "hdma debug");
                 }
 
-                qdev_prop_set_chr(db, "chardev", chr);
+                qdev_prop_set_chr(cm7, "chardev", chr);
                 if (dbg) {
-                    qdev_prop_set_chr(db, "debug-chardev", dbg);
+                    qdev_prop_set_chr(cm7, "debug-chardev", dbg);
                 }
                 if (cfg_chr) {
-                    qdev_prop_set_chr(db, "cfg-chardev", cfg_chr);
+                    qdev_prop_set_chr(cm7, "cfg-chardev", cfg_chr);
                 }
                 if (cfg_dbg) {
-                    qdev_prop_set_chr(db, "cfg-debug-chardev", cfg_dbg);
+                    qdev_prop_set_chr(cm7, "cfg-debug-chardev", cfg_dbg);
                 }
                 if (hdma_chr) {
-                    qdev_prop_set_chr(db, "hdma-chardev", hdma_chr);
+                    qdev_prop_set_chr(cm7, "hdma-chardev", hdma_chr);
                 }
                 if (hdma_dbg) {
-                    qdev_prop_set_chr(db, "hdma-debug-chardev", hdma_dbg);
+                    qdev_prop_set_chr(cm7, "hdma-debug-chardev", hdma_dbg);
                 }
-                /* mailbox=VF0 (shortcut PCIE_CM7 relay — INTGR bits raise
-                 * INTID 185 q-sys services). pf-mailbox=PF so SOFT_RESET
-                 * can re-synthesise FW_BOOT_DONE→PF.ISSR[4] (CM7 stub,
-                 * a01d2b5; narrowed post GIC wiring fix — cold boot is
-                 * real, see docs/debugging.md Post-mortems). */
-                object_property_set_link(OBJECT(db), "mailbox",
-                                         OBJECT(mbx_vf0_dev), &error_fatal);
-                object_property_set_link(OBJECT(db), "pf-mailbox",
-                                         OBJECT(mbx_pf_dev), &error_fatal);
-                sysbus_realize_and_unref(SYS_BUS_DEVICE(db), &error_fatal);
+                if (cm7_dbg) {
+                    qdev_prop_set_chr(cm7, "cm7-debug-chardev", cm7_dbg);
+                }
+                /* mailbox=VF0 (shortcut PCIE_CM7 relay — INTGR bits
+                 * raise INTID 185 q-sys services). pf-mailbox=PF so
+                 * SOFT_RESET can re-synthesise FW_BOOT_DONE→PF.ISSR[4]
+                 * (CM7 stub, a01d2b5; narrowed post GIC wiring fix —
+                 * cold boot is real, see docs/debugging.md
+                 * Post-mortems) AND so the 3c BD-done state machine
+                 * can read kmd-published `pi` from PF.ISSR[qid]. */
+                object_property_set_link(OBJECT(cm7), "mailbox",
+                                         OBJECT(mbx_vf0_dev),
+                                         &error_fatal);
+                object_property_set_link(OBJECT(cm7), "pf-mailbox",
+                                         OBJECT(mbx_pf_dev),
+                                         &error_fatal);
+                if (imsix_dev) {
+                    object_property_set_link(OBJECT(cm7), "imsix",
+                                             OBJECT(imsix_dev),
+                                             &error_fatal);
+                }
+                sysbus_realize_and_unref(SYS_BUS_DEVICE(cm7),
+                                         &error_fatal);
             }
-        }
-    }
-
-    /* Integrated MSI-X trigger (M7, commit db3d1df). Snoops FW stores
-     * at REBELH_PCIE_MSIX_ADDR (0x1BFFFFFFFC), forwards (offset,
-     * db_data) frames on `msix` chardev → host-side msix_notify().
-     * Optional: only when -machine r100-soc,msix=<id>. */
-    {
-        R100SoCMachineState *r100m = R100_SOC_MACHINE(machine);
-        Chardev *chr = r100_soc_resolve_chr(r100m->msix_chardev_id, "msix");
-
-        if (chr) {
-            Chardev *dbg = r100_soc_resolve_chr(r100m->msix_debug_chardev_id,
-                                                "msix debug");
-            DeviceState *imsix = qdev_new(TYPE_R100_IMSIX);
-
-            qdev_prop_set_chr(imsix, "chardev", chr);
-            if (dbg) {
-                qdev_prop_set_chr(imsix, "debug-chardev", dbg);
-            }
-            sysbus_realize_and_unref(SYS_BUS_DEVICE(imsix), &error_fatal);
-            sysbus_mmio_map_overlap(SYS_BUS_DEVICE(imsix), 0,
-                                    R100_PCIE_IMSIX_BASE, 10);
         }
     }
 
@@ -1196,6 +1228,7 @@ R100_SOC_DEF_STRPROP(cfg,            cfg_chardev_id)
 R100_SOC_DEF_STRPROP(cfg_debug,      cfg_debug_chardev_id)
 R100_SOC_DEF_STRPROP(hdma,           hdma_chardev_id)
 R100_SOC_DEF_STRPROP(hdma_debug,     hdma_debug_chardev_id)
+R100_SOC_DEF_STRPROP(cm7_debug,      cm7_debug_chardev_id)
 
 #undef R100_SOC_DEF_STRPROP
 
@@ -1244,6 +1277,9 @@ static const R100SoCStrProp r100_soc_str_props[] = {
         "that the host executes as pci_dma_write (M8b 3b, M9 BD-done)."),
     R100_SOC_STR_PROP("hdma-debug", hdma_debug, hdma_debug_chardev_id,
         "chardev id for an ASCII trace of every hdma frame emitted."),
+    R100_SOC_STR_PROP("cm7-debug", cm7_debug, cm7_debug_chardev_id,
+        "chardev id for an ASCII trace of r100-cm7 BD-done state "
+        "machine transitions and imsix notifies (M8b 3c)."),
 };
 
 #undef R100_SOC_STR_PROP

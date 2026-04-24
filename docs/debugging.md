@@ -65,7 +65,8 @@ output/my-test/
   msix.log      # M7        — NPU → host MSI-X frames
   issr.log      # M8a       — NPU → host ISSR frames
   cfg.log       # M8b 3b    — host → NPU BAR2 cfg-head writes (DDH_BASE_{LO,HI}, …)
-  hdma.log      # M8b 3b    — NPU → host DMA writes (HDMA_OP_WRITE frames)
+  hdma.log      # M8b 3b+3c — bidirectional HDMA (OP_WRITE / OP_READ_REQ / OP_READ_RESP / OP_CFG_WRITE)
+  cm7.log       # M8b 3c    — NPU r100-cm7 BD-done state-machine ASCII trace
   shm -> /dev/shm/remu-my-test/
   npu/
     monitor.sock       # HMP over unix socket
@@ -221,9 +222,9 @@ messages (`7b03328` M1-M4, `72c98f0` M5, `85b76bb`/`500856b` M6,
 `db3d1df` M7, `cd24aa9` M8a). Quick on-line checks:
 
 ```
-# M6: host BAR4 MMIO overlay + NPU doorbell/mailbox in qtree
+# M6: host BAR4 MMIO overlay + NPU cm7/mailbox in qtree
 printf 'info mtree\nquit\n' | socat - UNIX-CONNECT:output/<name>/host/monitor.sock | rg 'r100.bar4'
-printf 'info qtree\nquit\n' | socat - UNIX-CONNECT:output/<name>/npu/monitor.sock  | rg 'r100-(doorbell|mailbox)'
+printf 'info qtree\nquit\n' | socat - UNIX-CONNECT:output/<name>/npu/monitor.sock  | rg 'r100-(cm7|mailbox)'
 
 # M7: NPU r100-imsix at 0x1BFFFFF000, host BAR5 msix-{table,pba}
 printf 'info mtree\nquit\n' | socat - UNIX-CONNECT:output/<name>/npu/monitor.sock  | rg 'r100-imsix'
@@ -234,14 +235,18 @@ printf 'info mtree\nquit\n' | socat - UNIX-CONNECT:output/<name>/host/monitor.so
 printf 'xp /1wx 0xfe000090\nquit\n'    | socat - UNIX-CONNECT:output/<name>/host/monitor.sock
 printf 'xp /1wx 0x1ff8160090\nquit\n'  | socat - UNIX-CONNECT:output/<name>/npu/monitor.sock
 
-# M8b 3b: both ends of cfg + hdma must be bound in qtree
+# M8b 3b/3c: both ends of cfg + hdma + cm7-debug must be bound in qtree
 printf 'info qtree\nquit\n' | socat - UNIX-CONNECT:output/<name>/host/monitor.sock | rg '(cfg|hdma) *='
-printf 'info qtree\nquit\n' | socat - UNIX-CONNECT:output/<name>/npu/monitor.sock  | rg '(cfg|hdma)-chardev'
+printf 'info qtree\nquit\n' | socat - UNIX-CONNECT:output/<name>/npu/monitor.sock  | rg '(cfg|hdma|cm7-debug)-chardev'
 ```
 
 `{doorbell,msix,issr,cfg,hdma}.log` are per-bridge ASCII traces
 (format `<bus> off=0x... val=0x... [status=...] count=N`, or for
-hdma: `hdma op=1 dst=0x... len=... status=... count=N`).
+hdma: `hdma <dir> op=<mnemonic> dst=0x... len=... req_id=N status=... count=N`
+where `<dir>` is `tx` / `rx` and mnemonics are
+`WRITE`/`READ_REQ`/`READ_RESP`/`CFG_WRITE`). `cm7.log` is the
+NPU-side `r100-cm7` BD-done state-machine ASCII trace (phase
+transitions + `imsix_notify vec=N`).
 Empty-after-traffic means the chardev is down — check both QEMUs are
 up and the `*.sock` files exist. Rejected frames (bad offset / vector
 ≥ 32 / bad HDMA magic) only surface as `GUEST_ERROR` lines in
@@ -264,7 +269,8 @@ chiplet-0 **PF** mailbox's `ISSR[4]` via the Samsung-IPM register
 path. `r100-mailbox` egresses that write as an 8-byte frame on the
 `issr` chardev, and the host-side `r100-npu-pci` lands it in the
 BAR4+0x90 shadow so the driver reads the real value. No stub in
-the loop. Ground truth:
+the loop (i.e. `r100-cm7`'s SOFT_RESET synthesiser is not involved
+on cold boot). Ground truth:
 
 ```
 rg 'Notify Host - PF FW_BOOT_DONE' output/<name>/uart0.log
@@ -286,7 +292,7 @@ naturally. REMU models neither CM7 nor the PMU reset sequence, and
 the CA73 FreeRTOS build short-circuits the mailbox ISR to
 `default_cb` (CMake `FREERTOS_PORT != GCC_ARM_CA73` gate in
 `drivers/pcie/pcie_mailbox_callback.c`). The CM7 stub in
-`r100_doorbell.c` catches `INTGR0 bit 0` and calls
+`r100_cm7.c` catches `INTGR0 bit 0` and calls
 `r100_mailbox_cm7_stub_write_issr(pf_mailbox, 4, 0xFB0D)` directly,
 which updates PF.ISSR[4] **and** emits the NPU→host issr frame so
 the BAR4 shadow converges. Other bits relay onto VF0.INTGR1 for
@@ -368,11 +374,11 @@ cleanly across both QEMUs via two new chardevs:
 
 | chardev | dir | frame | role |
 |---------|-----|-------|------|
-| `cfg` | host→NPU | 8-byte `(cfg_off, val)` | BAR2 cfg-head mirror. Host-side `r100-npu-pci` traps the 4 KB MMIO window at BAR2 offset `FW_LOGBUF_SIZE` and forwards every write (notably `DDH_BASE_{LO,HI}` at +0xC0/+0xC4) to the NPU's `r100-doorbell`, which maintains `cfg_shadow[1024]`. |
-| `hdma` | NPU→host | 24 B header + payload | Write executor. NPU-side `r100-doorbell` emits `HDMA_OP_WRITE` frames (`remu_hdma_proto.h`); host-side `r100-npu-pci` decodes them and runs `pci_dma_write` against the x86 guest's DMA address space. |
+| `cfg` | host→NPU | 8-byte `(cfg_off, val)` | BAR2 cfg-head mirror. Host-side `r100-npu-pci` traps the 4 KB MMIO window at BAR2 offset `FW_LOGBUF_SIZE` and forwards every write (notably `DDH_BASE_{LO,HI}` at +0xC0/+0xC4) to the NPU's `r100-cm7`, which maintains `cfg_shadow[1024]`. Stage 3c adds the reverse flow too: `OP_CFG_WRITE` HDMA frames from the NPU update the host-side `cfg_mmio_regs[]` directly (used by BD-done to publish `FUNC_SCRATCH`). |
+| `hdma` | NPU↔host | 24 B header + payload | Bidirectional DMA. NPU→host: `OP_WRITE` (write descriptor into guest RAM, Stage 3b QINIT + Stage 3c `bd.header |= DONE` / `queue_desc.ci++`), `OP_READ_REQ` (Stage 3c — ask host to `pci_dma_read` a region tagged by `req_id`), `OP_CFG_WRITE` (Stage 3c — push a scalar into host-local `cfg_mmio_regs`). Host→NPU: `OP_READ_RESP` (paired response to a pending `OP_READ_REQ`). See `src/bridge/remu_hdma_proto.h`. |
 
-On `INTGR1 bit 7`, the NPU-side CM7 stub in `src/machine/r100_doorbell.c`
-(function `r100_doorbell_qinit_stub`) reads `DDH_BASE_{LO,HI}` from
+On `INTGR1 bit 7`, the NPU-side CM7 stub in `src/machine/r100_cm7.c`
+(function `r100_cm7_qinit_stub`) reads `DDH_BASE_{LO,HI}` from
 `cfg_shadow`, recovers `desc_dma = (hi:lo) - HOST_PHYS_BASE`, and
 emits two HDMA writes:
 
@@ -392,30 +398,125 @@ $ tail output/<name>/doorbell.log
 doorbell off=0x1c val=0x80 count=…                # INTGR1 bit 7 = QUEUE_INIT
 
 $ tail output/<name>/hdma.log
-hdma op=1 dst=0x2b8005c len=52 status=ok count=1  # fw_version
-hdma op=1 dst=0x2b80058 len=4  status=ok count=2  # init_done=1
+hdma tx op=WRITE dst=0x2b8005c len=52 req_id=0 status=ok count=1  # fw_version
+hdma tx op=WRITE dst=0x2b80058 len=4  req_id=0 status=ok count=2  # init_done=1
 ```
 
 The major-version prefix compared by `rbln_device_version_check` is
 `"3"` against `"3.remu-stub"` — passes cleanly. When the kmd bumps
-past major 3, update `REMU_FW_VERSION_STR` in `r100_doorbell.c` (or
-add `HDMA_OP_READ` + async response and do a proper driver→fw
-mirror).
+past major 3, update `REMU_FW_VERSION_STR` in `r100_cm7.c` (or
+replace the stub with a real `OP_READ_REQ` + `OP_READ_RESP` pair
+now that the protocol supports it).
 
-After Stage 3b the kmd boots past `hw_init` into `rbln_queue_test`,
-which currently fails waiting for an MSI-X interrupt — that's the
-next unmodelled FW path (BD completion), tracked under M9.
+After Stage 3b the kmd boots past `hw_init` into `rbln_queue_test`.
+Stage 3c closes that loop — see next section.
+
+### Stage 3c — BD-done state machine (r100-cm7)
+
+`rbln_queue_test` in `rebellions.ko` submits a BD that writes a
+scalar via `packet_write_data`, then waits on a `dma_fence` for
+completion. On silicon, PCIE_CM7 firmware handles the `INTGR1 bit 0`
+= `REBEL_DOORBELL_QUEUE_0_START` doorbell: it walks the queue
+descriptor, reads each BD, reads the packet payload, applies the
+side-effect (here: write into `FUNC_SCRATCH`), marks the BD done,
+advances `queue_desc.ci`, and fires an MSI-X on the completion
+vector. REMU models this as a file called `r100_cm7.c` that is
+finally allowed to live up to its name — no more "doorbell"
+misnomer.
+
+**State machine per-queue** (`R100Cm7BdJob`, slot per qid):
+
+```
+IDLE
+  │ INTGR1 bit <qid>: snapshot pi = ISSR[qid]
+  ▼
+WAIT_QDESC ── OP_READ_REQ queue_desc[qid] (req_id=qid+1)
+  │  OP_READ_RESP: remember ci, ring_dma
+  ▼
+WAIT_BD ───── OP_READ_REQ bd[wrap(ci)]
+  │  OP_READ_RESP: decode
+  ▼
+WAIT_PKT ──── OP_READ_REQ pkt[bd.addr]
+  │  OP_READ_RESP: decode value
+  ▼
+(commit) OP_CFG_WRITE FUNC_SCRATCH := pkt.value
+         OP_WRITE     bd.header |= BD_FLAGS_DONE_MASK
+         OP_WRITE     queue_desc[qid].ci = ci + 1
+         r100_imsix_notify(vec = qid)
+  │ ci + 1 < pi ? loop into WAIT_BD : IDLE
+```
+
+`req_id = qid + 1` tags every frame of an in-flight BD job —
+`OP_READ_REQ`, the matching `OP_READ_RESP`, and the side-effect
+writes (`OP_CFG_WRITE` + both `OP_WRITE`s) — so logs for
+concurrent queues stay disentangled. `req_id = 0` is reserved
+for the untagged QINIT pair (`OP_WRITE fw_version` and
+`OP_WRITE init_done`) emitted once at Stage 3b.
+
+Watch a successful `rbln_queue_test` (from an actual
+`--host cm7-smoke` run):
+
+```
+$ cat output/<name>/cm7.log
+bd-done qid=0 WAIT_QDESC ci=0 pi=1 READ_REQ queue_desc completed=0
+bd-done qid=0 WAIT_BD    ci=0 pi=1 READ_REQ bd        completed=0
+bd-done qid=0 WAIT_PKT   ci=0 pi=1 READ_REQ pkt       completed=0
+bd-done qid=0 IDLE       ci=1 pi=1 imsix_notify       completed=1
+
+$ cat output/<name>/hdma.log   # BD-done slice, req_id=qid+1=1
+hdma rx op=READ_REQ  req_id=1 dst=0x...ec len=32 status=ok recv=3 sent=0
+hdma tx op=READ_RESP req_id=1 dst=0x...ec len=32 status=ok recv=3 sent=1
+hdma rx op=READ_REQ  req_id=1 dst=0x...00 len=24 status=ok recv=4 sent=1
+hdma tx op=READ_RESP req_id=1 dst=0x...00 len=24 status=ok recv=4 sent=2
+hdma rx op=READ_REQ  req_id=1 dst=0x...00 len=16 status=ok recv=5 sent=2
+hdma tx op=READ_RESP req_id=1 dst=0x...00 len=16 status=ok recv=5 sent=3
+hdma rx op=CFG_WRITE req_id=1 dst=0xffc   len=4  status=ok recv=6 sent=3
+hdma rx op=WRITE     req_id=1 dst=0x...00 len=4  status=ok recv=7 sent=3
+hdma rx op=WRITE     req_id=1 dst=0x...00 len=4  status=ok recv=8 sent=3
+
+$ cat output/<name>/msix.log
+msix off=0xffc db_data=0x0 vector=0 status=ok count=1
+
+# rbln_queue_test is silent on success — only dev_err's on fail.
+$ grep -E 'failed to test queue|fence error|failed to get done flag' \
+       output/<name>/host/serial.log
+# (no output → PASS)
+```
+
+The `recv` / `sent` counter fields on each line are cumulative
+across the entire run; the pre-BD QINIT `OP_WRITE` pair (at
+`req_id=0`) accounts for `recv={1,2}` before BD-done kicks in.
+
+If the state machine wedges mid-flight, `cm7.log` stops at the
+failing phase. Common fixes:
+
+- `WAIT_QDESC` with no RESP: `queue_desc` DMA address mangled.
+  Check `DDH_BASE_{LO,HI}` in `cfg.log` and kmd's
+  `rbln_dma_host_convert` — `cm7_host_dma()` in `r100_cm7.c` strips
+  `REMU_HOST_PHYS_BASE` only when present, so raw `bd->addr` from
+  `rbln_queue_test` is passed through unchanged.
+- `WAIT_BD` loops but driver still waits: verify `BD_FLAGS_DONE_MASK`
+  position — kmd reads the header word via `BD_FLAGS_DONE_MASK`
+  bit-field, not a byte flag.
+- No `imsix_notify` line: check `r100-cm7`'s `imsix` QOM link is
+  populated (auto-verified by `./remucli run --host` startup).
+- `qdesc ring_log2 range` in `cm7.log`: kmd is ringing bit 1 of
+  INTGR1 for the fwi **message ring** (qid=1), not a command queue.
+  Expected — the ring queue's `queue_desc[1].size` field stores
+  `ring->max_dw` (absolute count) rather than log2, so the guard
+  trips and BD-done exits cleanly. Not in Stage 3c scope.
 
 #### Sanity-checking the stub
 
-The host-side `info qtree` must show both `cfg` and `hdma`
-CharBackends bound on `r100-npu-pci`, and the NPU-side must show
-the matching `cfg-chardev` / `hdma-chardev` on `r100-doorbell`.
-`./remucli run --host` auto-verifies both ends and logs the
-snippets to `host/info-qtree-cfg-hdma.log` and
+The host-side `info qtree` must show `cfg` and `hdma` CharBackends
+bound on `r100-npu-pci`; the NPU-side must show `cfg-chardev`,
+`hdma-chardev`, and (if `cm7_log` is wired) `cm7-debug-chardev` all
+non-empty on `r100-cm7`. `./remucli run --host` auto-verifies both
+ends and logs snippets to `host/info-qtree-cfg-hdma.log` and
 `npu/info-qtree-cfg-hdma.log`. A missing property means the
-`-machine r100-soc,cfg=/hdma=…` or `-device r100-npu-pci,cfg=/hdma=…`
-option didn't latch — check `cli/remu_cli.py` chardev id literals.
+`-machine r100-soc,cfg=/hdma=/cm7-debug=…` or
+`-device r100-npu-pci,cfg=/hdma=…` option didn't latch — check
+`cli/remu_cli.py` chardev id literals.
 
 ## Interpreting a boot log
 

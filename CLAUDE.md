@@ -53,8 +53,8 @@ binds with no changes). BAR sizes match `rebel_check_pci_bars_size`:
 |-----|-------|------|
 | 0   | 64 GB | DDR — first 128 MB = shm file, tail = lazy RAM |
 | 2   | 64 MB | ACP / SRAM / logbuf; 4 KB prio-10 trap @ `FW_LOGBUF_SIZE` (M8b 3b cfg-head) forwards writes on `cfg` chardev, rest lazy RAM |
-| 4   | 8 MB  | 4 KB MMIO head (INTGR M6 + MAILBOX_BASE M8a bidir + CM7-stub Stage 3a); rest lazy RAM |
-| 5   | 1 MB  | MSI-X table (32 vectors) + PBA (`msix_notify()` target for M7) |
+| 4   | 8 MB  | 4 KB MMIO head (INTGR M6 + MAILBOX_BASE M8a bidir + CM7-stub Stage 3a + BD-done queue-start doorbell Stage 3c); rest lazy RAM |
+| 5   | 1 MB  | MSI-X table (32 vectors) + PBA (`msix_notify()` target for M7; Stage 3c BD-done completions) |
 
 BAR4 details: `MAILBOX_INTGR{0,1}` / `MAILBOX_BASE` writes are
 serialised as 8-byte chardev frames on the `doorbell` socket; reads in
@@ -75,15 +75,30 @@ BAR2 details (M8b 3b): kmd writes `DDH_BASE_{LO,HI}` (at `FW_LOGBUF_SIZE
 Stage 3b widens this into a reusable **host → NPU configuration
 mirror**: the host-side `r100-npu-pci` traps the 4 KB window and emits
 8-byte `(cfg_off, val)` frames on the `cfg` chardev; the NPU-side
-`r100-doorbell` consumes them into a 1024-entry `cfg_shadow[]`. The
-paired **NPU → host DMA executor** is the `hdma` chardev with a 24 B
+`r100-cm7` consumes them into a 1024-entry `cfg_shadow[]`. The
+paired **NPU ↔ host DMA executor** is the `hdma` chardev with a 24 B
 header + payload protocol (`src/bridge/remu_hdma_proto.h`). On `INTGR1`
-bit 7 the NPU CM7 stub (`r100_doorbell_qinit_stub`) reads `DDH_BASE`
+bit 7 the NPU CM7 stub (`r100_cm7_qinit_stub`) reads `DDH_BASE`
 from `cfg_shadow[]`, then emits two `HDMA_OP_WRITE` frames — one
 for `fw_version = "3.remu-stub"`, one for `init_done = 1`. The host
-decodes and runs `pci_dma_write` against the x86 guest DMA space. Same
-`cfg + hdma` plumbing will back M9 BD-completion writes and any future
-NPU-initiated host RAM update.
+decodes and runs `pci_dma_write` against the x86 guest DMA space.
+
+Stage 3c turns the single-opcode `hdma` pipe into a bidirectional
+protocol so the NPU can drive BD completion without a second chardev.
+New opcodes: `OP_READ_REQ` (NPU → host: "please `pci_dma_read`
+`len` bytes at `dst`, tag with `req_id`"), `OP_READ_RESP` (host →
+NPU: payload for a pending `req_id`), and `OP_CFG_WRITE` (NPU → host:
+"update host-local `cfg_mmio_regs[dst>>2]`"). The `flags` header byte
+is renamed `req_id` — same wire layout, new semantics. `INTGR1` bits
+`0..N-1` are the per-queue BD-done doorbells: the NPU-side `r100-cm7`
+snapshots `ISSR[qid]` as `pi`, drives a per-queue `R100Cm7BdJob` state
+machine (`IDLE → WAIT_QDESC → WAIT_BD → WAIT_PKT → IDLE` using
+`OP_READ_REQ` / `OP_READ_RESP` pairs), commits via
+`OP_CFG_WRITE FUNC_SCRATCH`, `OP_WRITE bd.header |= DONE`, and
+`OP_WRITE queue_desc.ci++`, then fires `r100_imsix_notify(vec=qid)`
+so the kmd's `dma_fence` resolves. See
+`docs/debugging.md` → "Stage 3c — BD-done state machine" for the log
+signatures.
 
 Both QEMUs `mmap` the same 128 MB `/dev/shm/remu-<name>/remu-shm` with
 `share=on`. Splice points (same backend, two places):
@@ -119,14 +134,15 @@ Every `--host` run captures and checks:
   at offset 0 of both `r100.bar0.ddr` (host) and `r100.chiplet0.dram`
   (NPU); host `info pci` lists `1eff:2030`.
 - **M6**: host shows `r100.bar4.mmio` prio-10 overlay; NPU `info qtree`
-  lists `r100-doorbell` + `r100-mailbox`.
+  lists `r100-cm7` + `r100-mailbox`.
 - **M7**: NPU lists `r100-imsix` @ `0x1BFFFFF000`; host shows
   `msix-{table,pba}` overlaying `r100.bar5.msix`.
 - **M8a**: NPU `r100-mailbox` has `issr-chardev = "issr"`; host
   `r100-npu-pci` has `issr = "issr"`.
-- **M8b 3b**: NPU `r100-doorbell` has `cfg-chardev = "cfg"` +
-  `hdma-chardev = "hdma"`; host `r100-npu-pci` has `cfg = "cfg"` +
-  `hdma = "hdma"` (logged to `{host,npu}/info-qtree-cfg-hdma.log`).
+- **M8b 3b/3c**: NPU `r100-cm7` has `cfg-chardev = "cfg"` +
+  `hdma-chardev = "hdma"` + `cm7-debug-chardev = "cm7_dbg"`; host
+  `r100-npu-pci` has `cfg = "cfg"` + `hdma = "hdma"` (logged to
+  `{host,npu}/info-qtree-cfg-hdma.log`).
 
 All results go to `host/info-*.log` + `npu/info-*.log`. Failures print
 to stdout (non-fatal — NPU still boots for post-mortem poking).
@@ -187,7 +203,7 @@ that would hang or `-EBUSY` boot gets a `src/machine/` or `src/host/`
 QEMU stub (however minimal), never an `#ifdef` in firmware. The
 plumbing stays so developers can drop a **local, uncommitted** debug
 patch while bisecting — see `cli/fw-patches/README.md`. Runtime-side
-example of this policy: the CM7-stub in `src/machine/r100_doorbell.c`
+example of this policy: the CM7-stub in `src/machine/r100_cm7.c`
 (commit `a01d2b5`) — see BAR4 row above.
 
 ## Project layout
@@ -204,7 +220,8 @@ src/include/          Added to -I during QEMU configure
 src/bridge/           Added to -I during QEMU configure — cross-side shared headers
                         remu_frame.h          8-byte frame codec (RX accumulator + emit)
                         remu_doorbell_proto.h BAR4 offset classifier + BAR2 cfg-head layout
-                        remu_hdma_proto.h     NPU → host DMA protocol (24 B header + payload)
+                        remu_hdma_proto.h     bidirectional HDMA protocol (24 B header + payload,
+                                              OP_WRITE / READ_REQ / READ_RESP / CFG_WRITE)
                       Header-only `static inline`, so both host-side (system_ss)
                       and NPU-side (arm_ss) TUs pick up the same definitions
                       without introducing a shared object.

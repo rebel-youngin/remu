@@ -3,8 +3,11 @@
 
 Stands up a minimal NPU-only QEMU configured to receive doorbell frames
 over a Unix socket, pretends to be the host-side r100-npu-pci BAR4, and
-asserts the NPU's r100-doorbell device actually parses the frames and
-pulses its GIC SPI line.
+asserts the NPU's r100-cm7 device actually parses the frames and
+pulses its GIC SPI line. (The QOM type was renamed from r100-doorbell
+to r100-cm7 in M8b Stage 3c when BD-done joined the other CM7
+responsibilities; the -machine option and socket name kept "doorbell"
+for backward compat with prior wiring.)
 
 Why not use `./remucli run --host`? That path has the host QEMU as the
 chardev server and the NPU QEMU as the client (see _build_host_cmd in
@@ -18,7 +21,7 @@ at the cost of not exercising the x86-side BAR4 intercept path (that
 half is covered by the BAR4 MMIO-overlay mtree check already done
 by `remucli run --host` at every invocation).
 
-Wire protocol (must match src/machine/r100_doorbell.c and
+Wire protocol (must match src/machine/r100_cm7.c and
 src/host/r100_npu_pci.c):
 
     struct frame {
@@ -29,7 +32,7 @@ src/host/r100_npu_pci.c):
 Success criteria:
   1. The NPU-side debug chardev ("doorbell.log") logs one line per
      frame we send, with matching offset and value.
-  2. `info qtree` on the NPU lists a r100-doorbell device.
+  2. `info qtree` on the NPU lists a r100-cm7 device.
   3. Sending a frame with an unrecognised offset produces a
      GUEST_ERROR log entry (proves the parser rejects malformed
      input instead of silently firing the IRQ).
@@ -62,7 +65,7 @@ INTGR1 = 0x0000001C
 # AND the M8-extended MAILBOX_BASE payload range (0x80..0x180, 64 u32
 # ISSR scratch slots). 0x200 lands in the 4 KB BAR4 MMIO window but
 # matches no real register on either silicon or our device model, so
-# r100_doorbell_deliver must drop it with a GUEST_ERROR entry.
+# r100_cm7_deliver must drop it with a GUEST_ERROR entry.
 BOGUS  = 0x00000200
 
 
@@ -136,7 +139,7 @@ def main():
     srv.listen(1)
     srv.settimeout(10.0)
 
-    # Minimal NPU QEMU invocation: machine init wires r100-doorbell
+    # Minimal NPU QEMU invocation: machine init wires r100-cm7
     # regardless of whether FW loads, but we still load BL1 / BL31 /
     # FreeRTOS if they exist so info qtree and the log-mask filter
     # behave like a normal run. All serials redirect to the run dir so
@@ -164,8 +167,8 @@ def main():
         "-D", str(QEMU_LOG),
     ]
     # Optional FW images — if present let the machine proceed past
-    # reset into BL1. Missing images are fine; r100-doorbell is wired
-    # in machine-init and does not depend on guest code running.
+    # reset into BL1. Missing images are fine; r100-cm7 is wired in
+    # machine-init and does not depend on guest code running.
     fw_set = [
         ("bl1.bin",          0x14000000),
         ("bl31_cp0.bin",     0x14040000),
@@ -196,11 +199,11 @@ def main():
         # Monitor-socket wait: makes the HMP checks race-free.
         wait_for(NPU_MON.exists, timeout=10.0, desc="NPU monitor socket")
 
-        # Smoke: r100-doorbell is in the device tree.
+        # Smoke: r100-cm7 is in the device tree.
         qtree = hmp(NPU_MON, "info qtree")
         (RUN_DIR / "info-qtree.log").write_text(qtree + "\n")
-        if "r100-doorbell" not in qtree:
-            print("FAIL: r100-doorbell not listed in info qtree")
+        if "r100-cm7" not in qtree:
+            print("FAIL: r100-cm7 not listed in info qtree")
             print(qtree)
             return 2
 
@@ -238,7 +241,7 @@ def main():
         def _qemu_log_has_reject():
             if not QEMU_LOG.exists():
                 return False
-            return "r100-doorbell: unexpected frame" in QEMU_LOG.read_text()
+            return "r100-cm7: unexpected frame" in QEMU_LOG.read_text()
         try:
             wait_for(_qemu_log_has_reject, timeout=3.0,
                      desc="guest-error entry for bogus frame")

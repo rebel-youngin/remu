@@ -15,7 +15,7 @@ This is the reverse-direction mirror of tests/m6_doorbell_test.py:
     M6 flow:  x86 guest BAR4 write
               -> host QEMU r100-npu-pci doorbell intercept
               -> 8-byte frame on doorbell socket
-              -> NPU QEMU r100-doorbell device
+              -> NPU QEMU r100-cm7 device
               -> GIC SPI on r100-mailbox
 
     M7 flow:  NPU CPU store to REBELH_PCIE_MSIX_ADDR (0x1BFFFFFFFC)

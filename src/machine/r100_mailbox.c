@@ -75,7 +75,7 @@ struct R100MailboxState {
      * an 8-byte (BAR4-offset, value) frame on this chardev so the
      * host-side r100-npu-pci can mirror the write into its BAR4
      * MMIO register file. Writes driven by r100_mailbox_set_issr()
-     * (the host→NPU ingress path via r100-doorbell) deliberately
+     * (the host→NPU ingress path via r100-cm7) deliberately
      * skip the emit to avoid echoing frames back at the host. */
     CharBackend issr_chr;
     CharBackend issr_debug_chr;
@@ -222,8 +222,24 @@ void r100_mailbox_set_issr(R100MailboxState *s, uint32_t idx, uint32_t val)
 }
 
 /*
+ * Peek at ISSR[idx] without the MMIO traversal (and without any of
+ * the egress-emit plumbing). Callers are NPU-side devices that need
+ * the current scratch value — in practice the r100-cm7 BD-done state
+ * machine reading the kmd-published producer index on an INTGR1
+ * doorbell fire. Keep this strictly read-only so the three-way source
+ * bookkeeping in r100_mailbox_issr_store() stays authoritative.
+ */
+uint32_t r100_mailbox_get_issr(R100MailboxState *s, uint32_t idx)
+{
+    if (!s || idx >= R100_MBX_ISSR_COUNT) {
+        return 0;
+    }
+    return s->issr[idx];
+}
+
+/*
  * CM7-stub egress: mimic an ISSR write that would normally originate
- * from the PCIE_CM7 subcontroller's FW. Used by r100-doorbell to
+ * from the PCIE_CM7 subcontroller's FW. Used by r100-cm7 to
  * implement the REMU CM7-relay shortcut — on silicon, a host SOFT_RESET
  * doorbell ends in pcie_soft_reset_handler on CM7, which writes
  * FW_BOOT_DONE back into PF.ISSR[4] via MMIO; that MMIO write is what
