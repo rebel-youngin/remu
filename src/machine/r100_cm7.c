@@ -143,7 +143,7 @@ struct R100Cm7State {
 
     R100MailboxState *mailbox;      /* VF0: M6 INTGR sink + M8a ISSR sink */
     R100MailboxState *pf_mailbox;   /* PF: CM7-stub FW_BOOT_DONE + BD-done pi source */
-    R100IMSIXState   *imsix;        /* M7: BD-done completion notifier (3c) */
+    R100IMSIXState   *imsix;        /* M7 link, dead since P2 — kept for P7 cleanup */
     R100MailboxState *mbtq_mailbox; /* PERI0_MAILBOX_M9_CPU1 — q-cp DNC task queue */
     R100HDMAState    *hdma;         /* M9-1c: shared chardev owner */
 
@@ -177,7 +177,7 @@ struct R100Cm7State {
     /* BD-done counters. */
     uint64_t bd_doorbells;         /* INTGR1 bit <qid> fires accepted */
     uint64_t bd_doorbells_dropped; /* fires rejected (job busy, out-of-range) */
-    uint64_t bds_completed;        /* BDs that reached imsix_notify */
+    uint64_t bds_completed;        /* BDs that reached the FSM's IDLE complete */
 
     /* dnc_one_task entries pushed to the q-cp task-queue mailbox.
      * pi_next is the local cache of the producer index we publish
@@ -719,18 +719,21 @@ static void r100_cm7_bd_on_pkt(R100Cm7State *s, R100Cm7BdJob *j,
         return;
     }
 
-    /* Fire MSI-X to wake the kmd's rbln_irq_handler, then return to
-     * idle. Vector == qid (rbln_init_irq in irq.c hands each queue
-     * a consecutive vector, starting at 0). */
-    if (s->imsix) {
-        r100_imsix_notify(s->imsix, j->qid);
-    } else {
-        qemu_log_mask(LOG_UNIMP,
-                      "r100-cm7: BD-done qid=%u complete but no imsix "
-                      "link — kmd fence will time out\n", j->qid);
-    }
+    /*
+     * P2: this used to call r100_imsix_notify(s->imsix, j->qid) to fire
+     * MSI-X straight from the FSM. After P1c the FSM is gated off by
+     * default (bd-done-stub=false) and q-cp on CP0's
+     * `cb_complete → pcie_msix_trigger` is the natural MSI-X source via
+     * the r100-imsix MMIO trap. With bd-done-stub=on (used for
+     * bisecting q-cp regressions) the FSM still walks the BD and writes
+     * DONE / advances ci, but it must NOT also fire MSI-X — duplicate
+     * fires desync `host/msix.log` and make bisect logs ambiguous.
+     * Single source of truth: cb_complete. The `imsix` QOM link + state
+     * field stay wired so P7 can delete them alongside the rest of the
+     * Stage 3c FSM in one cleanup pass.
+     */
     r100_cm7_bd_emit_debug(s, j->qid, "IDLE", j->ci, j->pi_snap,
-                           "imsix_notify");
+                           "complete");
     j->phase = CM7_BD_IDLE;
 }
 

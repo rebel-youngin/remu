@@ -609,9 +609,12 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
     cm7_log: M8b Stage 3c CM7 state-machine tail. When set, the
     NPU-side r100-cm7 device writes one ASCII line per BD-done
     phase transition (IDLE / WAIT_QDESC / WAIT_BD / WAIT_PKT /
-    LOOP / imsix_notify) to this file. Independent from hdma_log
+    LOOP / IDLE complete) to this file. Independent from hdma_log
     (which is wire-level); cm7.log is the higher-level walk and is
-    the first thing to grep when rbln_queue_test hangs."""
+    the first thing to grep when rbln_queue_test hangs. Note: P2
+    deleted the FSM's `r100_imsix_notify(j->qid)` so this trace
+    never represents a MSI-X fire any more — MSI-X comes from
+    q-cp's cb_complete via the r100-imsix MMIO trap (msix.log)."""
     uart0_log = run_dir / "uart0.log"
     hils_log = run_dir / "hils.log"
 

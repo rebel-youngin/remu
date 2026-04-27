@@ -102,14 +102,18 @@ a pending `req_id`), and `OP_CFG_WRITE` (NPU → host: "update host-local
 P1c retired the `r100-cm7`-side BD-done state machine: `INTGR1` bits
 `0..N-1` still relay as SPI 185 to wake q-cp's `hq_task` on CP0, but the
 QEMU-side per-queue `R100Cm7BdJob` walk (`IDLE → WAIT_QDESC → WAIT_BD →
-WAIT_PKT → IDLE` issuing `OP_READ_REQ` pairs and committing
+WAIT_PKT → IDLE complete` issuing `OP_READ_REQ` pairs and committing
 `OP_CFG_WRITE FUNC_SCRATCH` / `OP_WRITE bd.header |= DONE` /
-`OP_WRITE queue_desc.ci++` / `r100_imsix_notify(vec=qid)`) is off by
-default — q-cp's native `hq_task → cb_task → cb_complete` does the same
-walk over the P1a outbound iATU + the P1b cfg-mirror trap, with
-`pcie_msix_trigger` (q-sys `osl/FreeRTOS/.../msix.c`) firing MSI-X
-through the existing `r100-imsix` MMIO. To re-enable the QEMU-side
-state machine for bisecting, pass `-global r100-cm7.bd-done-stub=on`
+`OP_WRITE queue_desc.ci++`) is off by default — q-cp's native
+`hq_task → cb_task → cb_complete` does the same walk over the P1a
+outbound iATU + the P1b cfg-mirror trap, with `pcie_msix_trigger`
+(q-sys `osl/FreeRTOS/.../msix.c`) firing MSI-X through the existing
+`r100-imsix` MMIO. P2 made `cb_complete` the structural single
+source of truth for MSI-X by deleting the FSM's trailing
+`r100_imsix_notify(vec=qid)` call — turning bisect mode on no longer
+double-fires MSI-X (just walks the BD silently and lets `cb_complete`
+do the notify). To re-enable the QEMU-side state machine for
+bisecting, pass `-global r100-cm7.bd-done-stub=on`
 (or the matching `mbtq-stub` / `qinit-stub` knob); see
 `docs/debugging.md` → "Stage 3c — BD-done state machine" for the log
 signatures.

@@ -1081,8 +1081,12 @@ static void r100_soc_init(MachineState *machine)
          * Integrated MSI-X trigger (M7, commit db3d1df). Snoops FW
          * stores at REBELH_PCIE_MSIX_ADDR (0x1BFFFFFFFC), forwards
          * (offset, db_data) frames on `msix` chardev → host-side
-         * msix_notify(). M8b 3c: also directly driven by r100-cm7's
-         * BD-done state machine via r100_imsix_notify().
+         * msix_notify(). Driven by q-cp's `pcie_msix_trigger` on
+         * CA73 CP0 (`q/sys/osl/FreeRTOS/.../msix.c`) — `cb_complete`
+         * naturally stores into this trap. P2 made cb_complete the
+         * sole MSI-X source by deleting the M8b 3c r100-cm7 FSM call
+         * to r100_imsix_notify(); the public helper stays as a
+         * no-current-caller hook (P8 may revive for soft-reset).
          * Optional: only when -machine r100-soc,msix=<id>.
          */
         {

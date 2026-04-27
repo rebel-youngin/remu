@@ -246,7 +246,10 @@ hdma: `hdma <dir> op=<mnemonic> dst=0x... len=... req_id=N status=... count=N`
 where `<dir>` is `tx` / `rx` and mnemonics are
 `WRITE`/`READ_REQ`/`READ_RESP`/`CFG_WRITE`). `cm7.log` is the
 NPU-side `r100-cm7` BD-done state-machine ASCII trace (phase
-transitions + `imsix_notify vec=N`).
+transitions ending in `IDLE complete`). MSI-X is **not** fired
+from the FSM since P2 — `msix.log` is sourced exclusively by
+q-cp's `cb_complete → pcie_msix_trigger` via the `r100-imsix`
+MMIO trap.
 Empty-after-traffic means the chardev is down — check both QEMUs are
 up and the `*.sock` files exist. Rejected frames (bad offset / vector
 ≥ 32 / bad HDMA magic) only surface as `GUEST_ERROR` lines in
@@ -451,8 +454,8 @@ WAIT_PKT ──── OP_READ_REQ pkt[bd.addr]
 (commit) OP_CFG_WRITE FUNC_SCRATCH := pkt.value
          OP_WRITE     bd.header |= BD_FLAGS_DONE_MASK
          OP_WRITE     queue_desc[qid].ci = ci + 1
-         r100_imsix_notify(vec = qid)
   │ ci + 1 < pi ? loop into WAIT_BD : IDLE
+  │ (P2: MSI-X is NOT fired here — q-cp's cb_complete owns it)
 ```
 
 `req_id = qid + 1` tags every frame of an in-flight BD job —
@@ -470,7 +473,7 @@ $ cat output/<name>/cm7.log
 bd-done qid=0 WAIT_QDESC ci=0 pi=1 READ_REQ queue_desc completed=0
 bd-done qid=0 WAIT_BD    ci=0 pi=1 READ_REQ bd        completed=0
 bd-done qid=0 WAIT_PKT   ci=0 pi=1 READ_REQ pkt       completed=0
-bd-done qid=0 IDLE       ci=1 pi=1 imsix_notify       completed=1
+bd-done qid=0 IDLE       ci=1 pi=1 complete           completed=1
 
 $ cat output/<name>/hdma.log   # BD-done slice, req_id=qid+1=1
 hdma rx op=READ_REQ  req_id=1 dst=0x...ec len=32 status=ok recv=3 sent=0
@@ -507,8 +510,14 @@ failing phase. Common fixes:
 - `WAIT_BD` loops but driver still waits: verify `BD_FLAGS_DONE_MASK`
   position — kmd reads the header word via `BD_FLAGS_DONE_MASK`
   bit-field, not a byte flag.
-- No `imsix_notify` line: check `r100-cm7`'s `imsix` QOM link is
-  populated (auto-verified by `./remucli run --host` startup).
+- No MSI-X frame in `msix.log` while `cm7.log` shows `IDLE … complete`:
+  P2 made the FSM stop firing MSI-X — `cb_complete` on q-cp/CP0 is
+  the sole source. If `msix.log` is empty even on a stock run, the
+  stall is in q-cp, not the FSM. Check `hils.log` for
+  `cb_complete: send MSIx interrupt to host`; if missing, q-cp's BD
+  walk didn't reach completion — see "P1b/P1c" below for the honest
+  path. (Pre-P2 this bullet read "check the `imsix` QOM link" — the
+  link is now dead until P7 deletes it.)
 - `qdesc ring_log2 range` in `cm7.log`: kmd is ringing bit 1 of
   INTGR1 for the fwi **message ring** (qid=1), not a command queue.
   Expected — the ring queue's `queue_desc[1].size` field stores
@@ -686,8 +695,10 @@ working DDH publish path. P1b and P1c finish the loop:
   ```
 
   Use these for bisecting q-cp regressions: turn `bd-done-stub=on`
-  if you suspect q-cp's BD walk before MSI-X, `qinit-stub=on` if
-  `init_done` polling hangs, and so on.
+  if you suspect q-cp's BD walk (the FSM will write DONE / advance
+  ci out of band — but P2 ensures it does NOT also fire MSI-X, so
+  `msix.log` still tells you exactly whether `cb_complete` ran),
+  `qinit-stub=on` if `init_done` polling hangs, and so on.
 
 Verifying the loop on a `--host` run:
 
