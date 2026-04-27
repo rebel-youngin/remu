@@ -41,7 +41,9 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/main-loop.h"
 #include "hw/sysbus.h"
+#include "hw/irq.h"
 #include "hw/qdev-properties.h"
 #include "r100_soc.h"
 
@@ -67,6 +69,59 @@
 #define DNC_IP_INFO1_OFF        (DNC_CFG_BASE_OFF + 0x004)
 #define DNC_IP_INFO3_OFF        (DNC_CFG_BASE_OFF + 0x00C)
 #define DNC_SP_STATUS01_OFF     (DNC_STATUS_BASE_OFF + 0x204)
+
+/* M9-1c — TASK_32B passage page (slot+0x800..+0x81F) holds the 32 B
+ * dnc_reg_task_passage q-cp populates per dnc_send_task. The struct
+ * is `__attribute__((packed, aligned(4)))` so AArch64 emits ascending
+ * 4 B stores — the final word lands at TASK_DESC_CFG1 (+0x01C inside
+ * TASK_32B = slot+0x81C) with desc_cfg1.itdone=1. We use that store
+ * as the kickoff trigger. The earlier `DNC_TASK_DESC_CONFIG_WRITE_NORECORD`
+ * turq-prologue calls also touch the same address as a 64-bit writeq
+ * (CFG0+CFG1 pair) carrying itdone=1 — they're distinguished by
+ * access_size 8 vs 4. */
+#define DNC_TASK_32B_BASE_OFF       0x800
+#define DNC_TASK_32B_END_OFF        0x820     /* exclusive */
+#define DNC_TASK_DESC_ID_OFF        (DNC_TASK_32B_BASE_OFF + 0x000)
+#define DNC_TASK_DESC_CFG0_OFF      (DNC_TASK_32B_BASE_OFF + 0x018)
+#define DNC_TASK_DESC_CFG1_OFF      (DNC_TASK_32B_BASE_OFF + 0x01C)
+
+/* desc_cfg1 layout (g_dnc_task_32b.h union dnc_task_desc_cfg1):
+ *     data:12 addr:13 auto_fetch_pfix:1 mode:2 queue:2 sole:1 itdone:1
+ * itdone is bit 31. queue is bits 28..29 (cmd_type from
+ * cp1/dnc_if.c:dnc_send_task copies COMMON_CMD_TYPE_* there). */
+#define DNC_DESC_CFG1_ITDONE_BIT    (1U << 31)
+#define DNC_DESC_CFG1_QUEUE_SHIFT   28
+#define DNC_DESC_CFG1_QUEUE_MASK    0x3U
+#define DNC_DESC_CFG1_MODE_SHIFT    26
+#define DNC_DESC_CFG1_MODE_MASK     0x3U
+#define DNC_DESC_CFG1_SOLE_BIT      (1U << 30)
+
+/* TASK_DONE page (slot+0xA00..+0xBFF). q-cp's dnc_X_done_handler reads
+ * a 64-bit readq at slot+0xA00 = (done_rpt0 [bits 0..31] | done_rpt1
+ * [bits 32..63]). r100-dnc latches the synthesised 8 bytes here so
+ * the read returns a valid completion record on the IRQ-handler's
+ * first poll — see r100_dnc_complete_done_passage(). */
+#define DNC_TASK_DONE_BASE_OFF      0xA00
+#define DNC_TASK_DONE_RPT0_OFF      (DNC_TASK_DONE_BASE_OFF + 0x000)
+#define DNC_TASK_DONE_RPT1_OFF      (DNC_TASK_DONE_BASE_OFF + 0x004)
+
+/* dnc_task_done_done_rpt1 (evt1/g_dnc_task_done.h) bitfield positions:
+ *     dnc_id:4 chiplet_id:2 rsvd6:2 sole_cnt:8 local_tstamp:8
+ *     discard_rpt:1 event_type:3 cmd_type:3 sender:1
+ * event_type=2 is DONE; cmd_type 0..3 mirrors COMMON_CMD_TYPE_*. */
+#define DNC_RPT1_DNC_ID_SHIFT           0
+#define DNC_RPT1_CHIPLET_ID_SHIFT       4
+#define DNC_RPT1_DISCARD_RPT_SHIFT      24
+#define DNC_RPT1_EVENT_TYPE_SHIFT       25
+#define DNC_RPT1_EVENT_TYPE_DONE        2u
+#define DNC_RPT1_CMD_TYPE_SHIFT         28
+#define DNC_RPT1_CMD_TYPE_MASK          0x7u
+
+/* Cap on per-cluster outstanding completions awaiting BH delivery. q-cp
+ * dispatches one task per DNC at a time, so 32 (= 8 slots × 4 cmd_types
+ * worst-case) is generous head-room — we drop with LOG_GUEST_ERROR
+ * before silently coalescing. */
+#define DNC_DONE_FIFO_DEPTH         32u
 
 /*
  * dnc_config_ip_info1: {min_ver:8, maj_ver:8, ip_ver:8, ip_id:8}.
@@ -191,6 +246,14 @@ static void regstore_store(R100RegStore *rs, hwaddr addr, uint32_t val)
  * r100-dnc-cluster device (DCL0 / DCL1 CFG window, 1 MB)
  * ======================================================================== */
 
+/* M9-1c FIFO entry: one pending DNC kickoff awaiting BH-delivered
+ * completion IRQ. */
+typedef struct R100DNCDoneEntry {
+    uint32_t slot_id;       /* 0..7 — DNC index within this DCL */
+    uint32_t cmd_type;      /* COMMON_CMD_TYPE_* (0..3) */
+    uint32_t desc_id_bits;  /* desc_cfg1 / desc_id captured for done_rpt0 */
+} R100DNCDoneEntry;
+
 struct R100DNCClusterState {
     SysBusDevice parent_obj;
 
@@ -198,6 +261,21 @@ struct R100DNCClusterState {
     R100RegStore store;
     uint32_t chiplet_id;
     uint32_t dcl_id;        /* 0 = DCL0, 1 = DCL1 — used for log prefix */
+
+    /* M9-1c active path. One GPIO out per (slot, cmd_type) — q-cp
+     * binds dnc_X_done_handler to all six DNC SPIs but the hardware
+     * pulses the one matching cfg1.queue, so we mirror that. The
+     * EXCEPTION line (cmd_type slot 0 in interrupt.h) stays unwired:
+     * REMU never synthesises faults, only completions. */
+    qemu_irq slot_done_irq[DCL_DNC_COUNT][R100_HW_SPEC_DNC_CMD_TYPE_NUM];
+
+    QEMUBH *done_bh;
+    R100DNCDoneEntry done_fifo[DNC_DONE_FIFO_DEPTH];
+    uint32_t done_fifo_head;       /* next slot to read */
+    uint32_t done_fifo_tail;       /* next slot to write */
+    uint64_t done_pulses_fired;    /* observability */
+    uint64_t done_drops_fifo;      /* FIFO full */
+    uint64_t done_drops_intid;     /* r100_dnc_intid returned 0 */
 };
 typedef struct R100DNCClusterState R100DNCClusterState;
 
@@ -265,6 +343,166 @@ static uint32_t dnc_slot_default(hwaddr slot_off, uint32_t slot_id)
     }
 }
 
+/* ========================================================================
+ * M9-1c — active task-completion path
+ *
+ * Detect q-cp's `dnc_send_task -> put_urq_task` final passage write at
+ * slot+0x81C (DESC_CFG1) with itdone=1 and access_size 4, latch a
+ * synthetic dnc_reg_done_passage at slot+0xA00..+0xA04 so a 64-bit
+ * readq(TASK_DONE) returns a coherent completion record, and pulse the
+ * matching DNC GIC SPI from a bottom-half so q-cp's
+ * dnc_X_done_handler runs on the next CPU schedule.
+ *
+ * The earlier turq prologue calls (DNC_TASK_DESC_CONFIG_WRITE_NORECORD,
+ * 64-bit writeq landing at 0x818) also carry itdone=1, so we strictly
+ * gate on access_size 4 to avoid spurious IRQs per turq iteration. The
+ * tlb-invalidate path (sole=1, mode=2) writes CFG1 alone but with
+ * itdone=1 too — q-cp serialises it before dnc_send_task's actual
+ * passage, so a stray pulse is harmless (the worker already runs the
+ * handler). Keep the gate permissive for now; revisit if we observe
+ * IRQ-storm symptoms during bring-up.
+ * ======================================================================== */
+
+static uint32_t r100_dnc_synth_done_rpt1(uint32_t global_dnc_id,
+                                         uint32_t chiplet_id,
+                                         uint32_t cmd_type)
+{
+    uint32_t rpt1 = 0;
+
+    rpt1 |= (global_dnc_id & 0xFu) << DNC_RPT1_DNC_ID_SHIFT;
+    rpt1 |= (chiplet_id & 0x3u)    << DNC_RPT1_CHIPLET_ID_SHIFT;
+    /* discard_rpt = 0 so DNC_IS_AUTO_FETCH_DONE_RPT(...) returns false
+     * and the handler proceeds into cm_handle_irq instead of early-
+     * return. event_type = DONE so q-cp's get_irq_status decodes the
+     * completion as a real task-done (not enqueue/checkin). */
+    rpt1 |= (DNC_RPT1_EVENT_TYPE_DONE & 0x7u) << DNC_RPT1_EVENT_TYPE_SHIFT;
+    rpt1 |= (cmd_type & DNC_RPT1_CMD_TYPE_MASK) << DNC_RPT1_CMD_TYPE_SHIFT;
+    return rpt1;
+}
+
+static void r100_dnc_complete_done_passage(R100DNCClusterState *s,
+                                           uint32_t slot_id,
+                                           uint32_t cmd_type,
+                                           uint32_t desc_id_bits)
+{
+    hwaddr slot_base = (hwaddr)slot_id * DCL_DNC_STRIDE;
+    uint32_t global_dnc_id = s->dcl_id * DCL_DNC_COUNT + slot_id;
+    uint32_t rpt1 = r100_dnc_synth_done_rpt1(global_dnc_id, s->chiplet_id,
+                                             cmd_type);
+
+    /* Latch done_rpt0 + done_rpt1 in regstore so the handler's readq
+     * sees a coherent payload regardless of whether QEMU splits the
+     * 8-byte access into two 4-byte loads. */
+    regstore_store(&s->store, slot_base + DNC_TASK_DONE_RPT0_OFF,
+                   desc_id_bits);
+    regstore_store(&s->store, slot_base + DNC_TASK_DONE_RPT1_OFF, rpt1);
+}
+
+static void r100_dnc_done_bh(void *opaque)
+{
+    R100DNCClusterState *s = opaque;
+
+    while (s->done_fifo_head != s->done_fifo_tail) {
+        R100DNCDoneEntry *e = &s->done_fifo[s->done_fifo_head];
+        uint32_t global_dnc_id;
+        uint32_t intid;
+        qemu_irq irq;
+
+        s->done_fifo_head =
+            (s->done_fifo_head + 1) % DNC_DONE_FIFO_DEPTH;
+
+        if (e->cmd_type >= R100_HW_SPEC_DNC_CMD_TYPE_NUM) {
+            s->done_drops_intid++;
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "r100-dnc cl=%u dcl=%u slot=%u: cmd_type=%u "
+                          "out of range — drop\n",
+                          s->chiplet_id, s->dcl_id, e->slot_id,
+                          e->cmd_type);
+            continue;
+        }
+        global_dnc_id = s->dcl_id * DCL_DNC_COUNT + e->slot_id;
+        intid = r100_dnc_intid(global_dnc_id, e->cmd_type);
+        if (intid == 0) {
+            s->done_drops_intid++;
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "r100-dnc cl=%u dcl=%u slot=%u cmd_type=%u: "
+                          "no INTID — drop\n",
+                          s->chiplet_id, s->dcl_id, e->slot_id,
+                          e->cmd_type);
+            continue;
+        }
+
+        r100_dnc_complete_done_passage(s, e->slot_id, e->cmd_type,
+                                       e->desc_id_bits);
+
+        irq = s->slot_done_irq[e->slot_id][e->cmd_type];
+        if (irq) {
+            qemu_irq_pulse(irq);
+            s->done_pulses_fired++;
+            qemu_log_mask(LOG_TRACE,
+                          "r100-dnc cl=%u dcl=%u slot=%u kickoff "
+                          "dnc_id=%u cmd_type=%u desc_id=0x%x → "
+                          "intid=%u spi=%u fired=%" PRIu64 "\n",
+                          s->chiplet_id, s->dcl_id, e->slot_id,
+                          global_dnc_id, e->cmd_type, e->desc_id_bits,
+                          intid, intid - R100_GIC_INTERNAL,
+                          s->done_pulses_fired);
+        } else {
+            s->done_drops_intid++;
+            qemu_log_mask(LOG_UNIMP,
+                          "r100-dnc cl=%u dcl=%u slot=%u cmd_type=%u: "
+                          "GPIO out unwired — drop (machine wiring "
+                          "missing?)\n",
+                          s->chiplet_id, s->dcl_id, e->slot_id,
+                          e->cmd_type);
+        }
+    }
+}
+
+static void r100_dnc_kickoff(R100DNCClusterState *s, hwaddr slot_off,
+                             uint32_t cfg1_val)
+{
+    uint32_t slot_id = (uint32_t)(slot_off / DCL_DNC_STRIDE);
+    uint32_t cmd_type = (cfg1_val >> DNC_DESC_CFG1_QUEUE_SHIFT) &
+                        DNC_DESC_CFG1_QUEUE_MASK;
+    uint32_t desc_id_bits;
+    uint32_t next_tail;
+
+    if (slot_id >= DCL_DNC_COUNT) {
+        return;
+    }
+    /* desc_id was the first word of the passage — q-cp wrote it before
+     * desc_mode/prog0/.../cfg1, so regstore has the latest value. */
+    {
+        hwaddr slot_base = (hwaddr)slot_id * DCL_DNC_STRIDE;
+        if (!regstore_lookup(&s->store, slot_base + DNC_TASK_DESC_ID_OFF,
+                             &desc_id_bits)) {
+            desc_id_bits = 0;
+        }
+    }
+
+    next_tail = (s->done_fifo_tail + 1) % DNC_DONE_FIFO_DEPTH;
+    if (next_tail == s->done_fifo_head) {
+        s->done_drops_fifo++;
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "r100-dnc cl=%u dcl=%u slot=%u: completion FIFO "
+                      "full (%u entries) — drop\n",
+                      s->chiplet_id, s->dcl_id, slot_id,
+                      DNC_DONE_FIFO_DEPTH);
+        return;
+    }
+    s->done_fifo[s->done_fifo_tail] = (R100DNCDoneEntry){
+        .slot_id = slot_id,
+        .cmd_type = cmd_type,
+        .desc_id_bits = desc_id_bits,
+    };
+    s->done_fifo_tail = next_tail;
+
+    if (s->done_bh) {
+        qemu_bh_schedule(s->done_bh);
+    }
+}
+
 static uint64_t r100_dnc_read(void *opaque, hwaddr addr, unsigned size)
 {
     R100DNCClusterState *s = R100_DNC_CLUSTER(opaque);
@@ -309,6 +547,21 @@ static void r100_dnc_write(void *opaque, hwaddr addr, uint64_t val,
     R100DNCClusterState *s = R100_DNC_CLUSTER(opaque);
 
     regstore_store(&s->store, addr, (uint32_t)val);
+
+    /* M9-1c kickoff gate. Inside a DNC slot, a 4-byte write to
+     * TASK_DESC_CFG1 with itdone=1 marks the end of the
+     * dnc_reg_task_passage struct copy — that's the trigger. The
+     * 8-byte writeq variant from DNC_TASK_DESC_CONFIG_WRITE_NORECORD
+     * (turq prologue) lands at +0x818 = CFG0+CFG1 pair; gating on
+     * size==4 strictly disambiguates them. */
+    if (addr < DCL_DNC_REGION_END) {
+        hwaddr slot_off = addr % DCL_DNC_STRIDE;
+
+        if (slot_off == DNC_TASK_DESC_CFG1_OFF && size == 4 &&
+            (val & DNC_DESC_CFG1_ITDONE_BIT)) {
+            r100_dnc_kickoff(s, addr, (uint32_t)val);
+        }
+    }
 }
 
 static const MemoryRegionOps r100_dnc_ops = {
@@ -316,12 +569,20 @@ static const MemoryRegionOps r100_dnc_ops = {
     .write = r100_dnc_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .impl.min_access_size = 4,
-    .impl.max_access_size = 4,
+    /* Allow 8-byte readq for q-cp's DNC_TASK_DONE_READQ. QEMU splits
+     * the access into 32-bit halves through r100_dnc_read; the
+     * regstore was just written by the BH so both halves see the
+     * latched done_rpt0/1 atomically (BHs run between MMIO ops on the
+     * same CPU). 8-byte writeq is also seen via
+     * DNC_TASK_DESC_CONFIG_WRITE_NORECORD; the kickoff gate filters
+     * it out by size == 4. */
+    .impl.max_access_size = 8,
 };
 
 static void r100_dnc_realize(DeviceState *dev, Error **errp)
 {
     R100DNCClusterState *s = R100_DNC_CLUSTER(dev);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
     char name[64];
 
     snprintf(name, sizeof(name), "r100-dnc-cluster.cl%u.dcl%u",
@@ -329,13 +590,37 @@ static void r100_dnc_realize(DeviceState *dev, Error **errp)
     regstore_init(&s->store);
     memory_region_init_io(&s->iomem, OBJECT(dev), &r100_dnc_ops, s,
                           name, R100_DCL_CFG_SIZE);
-    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+    sysbus_init_mmio(sbd, &s->iomem);
+
+    /* M9-1c — one GPIO out per (slot, cmd_type). Total =
+     * DCL_DNC_COUNT * R100_HW_SPEC_DNC_CMD_TYPE_NUM = 8 × 4 = 32 lines
+     * per DCL. r100_soc.c wires these to the matching GIC SPIs from
+     * r100_dnc_intid(). */
+    for (uint32_t slot = 0; slot < DCL_DNC_COUNT; slot++) {
+        for (uint32_t ct = 0; ct < R100_HW_SPEC_DNC_CMD_TYPE_NUM; ct++) {
+            sysbus_init_irq(sbd, &s->slot_done_irq[slot][ct]);
+        }
+    }
+
+    s->done_bh = qemu_bh_new(r100_dnc_done_bh, s);
+    s->done_fifo_head = 0;
+    s->done_fifo_tail = 0;
+    s->done_pulses_fired = 0;
+    s->done_drops_fifo = 0;
+    s->done_drops_intid = 0;
 }
 
 static void r100_dnc_reset(DeviceState *dev)
 {
     R100DNCClusterState *s = R100_DNC_CLUSTER(dev);
     regstore_reset(&s->store);
+    s->done_fifo_head = 0;
+    s->done_fifo_tail = 0;
+    if (s->done_bh) {
+        qemu_bh_cancel(s->done_bh);
+    }
+    /* Counters survive reset so tests can assert cumulative behaviour
+     * (matches r100-cm7's mbtq counter convention). */
 }
 
 static Property r100_dnc_properties[] = {

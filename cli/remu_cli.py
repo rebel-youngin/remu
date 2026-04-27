@@ -1469,10 +1469,13 @@ def _verify_cfg_hdma_wired(host_monitor_sock, npu_monitor_sock,
     CharBackend properties on existing devices (no new MemoryRegion
     overlay to look for), so we inspect `info qtree` on both sides:
 
-    NPU side (r100-cm7):
-      `cfg-chardev`        = "cfg"      (non-empty CharBackend value)
-      `hdma-chardev`       = "hdma"     (non-empty CharBackend value)
-      `cm7-debug-chardev`  = "cm7_dbg"  (non-empty; 3c BD-done tail)
+    NPU side:
+      r100-cm7 :
+        `cfg-chardev`        = "cfg"      (non-empty CharBackend value)
+        `cm7-debug-chardev`  = "cm7_dbg"  (non-empty; 3c BD-done tail)
+      r100-hdma (M9-1c, owns the hdma chardev now that the device
+                 was carved out for q-cp's dw_hdma_v0 MMIO model):
+        device present; `chardev` = "hdma" (non-empty)
 
     Host side (r100-npu-pci):
       `cfg`  = "cfg"
@@ -1492,14 +1495,37 @@ def _verify_cfg_hdma_wired(host_monitor_sock, npu_monitor_sock,
             return True
         return False
 
+    def _has_device_with_nonempty_prop(qtree_text, dev_name, prop):
+        """Walk `info qtree` looking for a `dev: <dev_name>` block whose
+        body contains `<prop> "<non-empty>"`. info qtree's indentation
+        marks block boundaries — the dev's properties are the lines
+        more deeply indented than the dev: line itself, until the next
+        same-or-shallower indent."""
+        target = "dev: " + dev_name + ","
+        in_block = False
+        block_indent = -1
+        for raw in qtree_text.splitlines():
+            stripped = raw.lstrip(" ")
+            indent = len(raw) - len(stripped)
+            if not in_block:
+                if target in stripped:
+                    in_block = True
+                    block_indent = indent
+                continue
+            if indent <= block_indent and stripped:
+                in_block = False
+                continue
+            if stripped.startswith(prop + " ") and '""' not in stripped:
+                return True
+        return False
+
     qtree_npu = ""
     deadline = time.time() + poll_timeout
     while time.time() < deadline:
         qtree_npu = _hmp_query(npu_monitor_sock, "info qtree", timeout=10.0)
         if ("cfg-chardev" in qtree_npu and
                 'cfg-chardev ""' not in qtree_npu and
-                "hdma-chardev" in qtree_npu and
-                'hdma-chardev ""' not in qtree_npu and
+                "r100-hdma" in qtree_npu and
                 "cm7-debug-chardev" in qtree_npu and
                 'cm7-debug-chardev ""' not in qtree_npu):
             break
@@ -1508,23 +1534,31 @@ def _verify_cfg_hdma_wired(host_monitor_sock, npu_monitor_sock,
 
     npu_lines = [ln.rstrip() for ln in qtree_npu.splitlines()
                  if "cfg-chardev" in ln
-                 or "hdma-chardev" in ln
-                 or "cm7-debug-chardev" in ln]
+                 or "cm7-debug-chardev" in ln
+                 or "r100-hdma" in ln
+                 or "r100-cm7" in ln
+                 or ("chardev =" in ln and "hdma" in ln)]
     if not _has_nonempty(npu_lines, "cfg-chardev"):
         raise RuntimeError(
             "NPU-side r100-cm7 'cfg-chardev' property is unset; "
             "the -machine r100-soc,cfg=<id> option didn't latch. "
-            "See %s" % npu_qtree_log)
-    if not _has_nonempty(npu_lines, "hdma-chardev"):
-        raise RuntimeError(
-            "NPU-side r100-cm7 'hdma-chardev' property is unset; "
-            "the -machine r100-soc,hdma=<id> option didn't latch. "
             "See %s" % npu_qtree_log)
     if not _has_nonempty(npu_lines, "cm7-debug-chardev"):
         raise RuntimeError(
             "NPU-side r100-cm7 'cm7-debug-chardev' property is unset; "
             "the -machine r100-soc,cm7-debug=<id> option didn't latch. "
             "See %s" % npu_qtree_log)
+    if "r100-hdma" not in qtree_npu:
+        raise RuntimeError(
+            "NPU-side r100-hdma device not found in info qtree; "
+            "machine wiring missing TYPE_R100_HDMA instance. "
+            "See %s" % npu_qtree_log)
+    if not _has_device_with_nonempty_prop(qtree_npu, "r100-hdma",
+                                          "chardev"):
+        raise RuntimeError(
+            "NPU-side r100-hdma 'chardev' property is unset; "
+            "the -machine r100-soc,hdma=<id> option didn't latch on "
+            "the new device. See %s" % npu_qtree_log)
     npu_snippet = "\n".join(npu_lines) or "(no cfg/hdma/cm7-debug lines)"
 
     qtree_host = ""

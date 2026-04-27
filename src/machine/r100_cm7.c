@@ -40,16 +40,21 @@
  *                   HDMA transfer below.
  *
  *   hdma chardev     (NPU<->host, variable-length frames — remu_hdma_proto.h)
- *                   Egress: OP_WRITE (QINIT + BD-done commits),
- *                   OP_READ_REQ (3c fetches), OP_CFG_WRITE (3c
- *                   FUNC_SCRATCH update). Ingress: OP_READ_RESP for
- *                   pending READ_REQs. Tagged by req_id = qid + 1 so
- *                   responses dispatch to the right BD job slot;
- *                   req_id 0 is reserved for untagged QINIT writes.
+ *                   Owned by `r100-hdma` since M9-1c; r100-cm7 reaches
+ *                   it via a QOM link and the public API in
+ *                   src/machine/r100_hdma.h. r100-hdma routes incoming
+ *                   OP_READ_RESPs by req_id partition: cm7's BD-done
+ *                   responses (req_id 1..R100_CM7_MAX_QUEUES) come back
+ *                   through r100_hdma_set_cm7_callback(). cm7 still
+ *                   drives Egress for QINIT (untagged req_id=0),
+ *                   BD-done OP_WRITE / OP_READ_REQ / OP_CFG_WRITE
+ *                   (req_id = qid + 1) — the helpers just call into
+ *                   r100-hdma instead of touching the chardev directly.
  *
  * Each stream has an optional debug-chardev tail; additionally the
  * BD-done state machine gets its own cm7-debug-chardev for one ASCII
- * line per phase transition. All machine-instantiated via
+ * line per phase transition. The hdma stream's debug tail moved to
+ * r100-hdma along with its CharBackend. All machine-instantiated via
  * `-machine r100-soc,doorbell=<id>,cfg=<id>,hdma=<id>,cm7-debug=<id>`.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -64,9 +69,11 @@
 #include "hw/qdev-properties.h"
 #include "hw/qdev-properties-system.h"
 #include "chardev/char-fe.h"
+#include "exec/address-spaces.h"
 #include "migration/vmstate.h"
 #include "r100_soc.h"
 #include "r100_imsix.h"
+#include "r100_hdma.h"
 #include "remu_frame.h"
 #include "remu_doorbell_proto.h"
 #include "remu_hdma_proto.h"
@@ -117,19 +124,17 @@ struct R100Cm7State {
     CharBackend debug_chr;        /* doorbell ASCII tail */
     CharBackend cfg_chr;          /* cfg ingress (host→NPU) */
     CharBackend cfg_debug_chr;    /* cfg ASCII tail */
-    CharBackend hdma_chr;         /* hdma bidirectional */
-    CharBackend hdma_debug_chr;   /* hdma ASCII tail */
     CharBackend cm7_debug_chr;    /* BD-done state-machine tail (3c) */
 
     R100MailboxState *mailbox;      /* VF0: M6 INTGR sink + M8a ISSR sink */
     R100MailboxState *pf_mailbox;   /* PF: CM7-stub FW_BOOT_DONE + BD-done pi source */
     R100IMSIXState   *imsix;        /* M7: BD-done completion notifier (3c) */
     R100MailboxState *mbtq_mailbox; /* PERI0_MAILBOX_M9_CPU1 — q-cp DNC task queue */
+    R100HDMAState    *hdma;         /* M9-1c: shared chardev owner */
 
     /* Chardev byte stream may split a frame across callbacks. */
     RemuFrameRx rx;
     RemuFrameRx cfg_rx;
-    RemuHdmaRx  hdma_rx;
 
     /* Doorbell-stream counters. */
     uint64_t frames_received;
@@ -225,28 +230,6 @@ static void r100_cm7_cfg_emit_debug(R100Cm7State *s,
     }
 }
 
-static void r100_cm7_hdma_emit_debug(R100Cm7State *s,
-                                     const char *dir,
-                                     uint32_t op, uint32_t req_id,
-                                     uint64_t dst, uint32_t len,
-                                     const char *tag)
-{
-    char line[160];
-    int n;
-
-    if (!qemu_chr_fe_backend_connected(&s->hdma_debug_chr)) {
-        return;
-    }
-    n = snprintf(line, sizeof(line),
-                 "hdma %s op=%s req_id=%u dst=0x%" PRIx64 " len=%u "
-                 "tag=%s sent=%" PRIu64 " recv=%" PRIu64 "\n",
-                 dir, remu_hdma_op_str(op), req_id, dst, len, tag,
-                 s->hdma_frames_sent, s->hdma_frames_received);
-    if (n > 0) {
-        qemu_chr_fe_write(&s->hdma_debug_chr, (const uint8_t *)line, n);
-    }
-}
-
 static void r100_cm7_bd_emit_debug(R100Cm7State *s, uint32_t qid,
                                    const char *transition, uint32_t ci,
                                    uint32_t pi, const char *detail)
@@ -268,18 +251,19 @@ static void r100_cm7_bd_emit_debug(R100Cm7State *s, uint32_t qid,
 
 static void r100_cm7_mbtq_emit_debug(R100Cm7State *s, uint32_t qid,
                                      uint32_t slot, uint32_t pi,
+                                     uint64_t cmd_descr_addr,
                                      const char *status)
 {
-    char line[128];
+    char line[160];
     int n;
 
     if (!qemu_chr_fe_backend_connected(&s->cm7_debug_chr)) {
         return;
     }
     n = snprintf(line, sizeof(line),
-                 "mbtq qid=%u slot=%u pi=%u status=%s pushes=%" PRIu64
-                 " dropped=%" PRIu64 "\n",
-                 qid, slot, pi, status, s->mbtq_pushes,
+                 "mbtq qid=%u slot=%u pi=%u cmd_descr=0x%" PRIx64
+                 " status=%s pushes=%" PRIu64 " dropped=%" PRIu64 "\n",
+                 qid, slot, pi, cmd_descr_addr, status, s->mbtq_pushes,
                  s->mbtq_pushes_dropped);
     if (n > 0) {
         qemu_chr_fe_write(&s->cm7_debug_chr, (const uint8_t *)line, n);
@@ -287,75 +271,77 @@ static void r100_cm7_mbtq_emit_debug(R100Cm7State *s, uint32_t qid,
 }
 
 /* ------------------------------------------------------------------ */
-/* HDMA egress wrappers                                                */
+/* HDMA egress wrappers — delegate to r100-hdma                        */
 /* ------------------------------------------------------------------ */
 
 /* FW_BOOT_DONE value written into PF.ISSR[4] by the CM7 stub on SOFT_RESET. */
 #define REMU_FW_BOOT_DONE 0xFB0D
 
+/* As of M9-1c the `hdma` chardev is owned by r100-hdma (single-frontend
+ * CharBackend constraint); cm7 reaches it through a QOM link. The
+ * three thin wrappers below preserve cm7's existing call sites and
+ * accumulate the per-cm7 success/drop counters so the QINIT and
+ * BD-done observability paths look unchanged from outside. */
+
 static bool r100_cm7_hdma_write_tagged(R100Cm7State *s, uint32_t req_id,
                                        uint64_t dst, const void *payload,
                                        uint32_t len, const char *tag)
 {
-    RemuHdmaEmitResult rc;
-
-    rc = remu_hdma_emit_write_tagged(&s->hdma_chr, "r100-cm7 hdma",
-                                     req_id, dst, payload, len);
-    if (rc == REMU_HDMA_EMIT_OK) {
-        s->hdma_frames_sent++;
-        r100_cm7_hdma_emit_debug(s, "tx", REMU_HDMA_OP_WRITE,
-                                 req_id, dst, len, tag);
-        return true;
+    if (!s->hdma) {
+        s->hdma_frames_dropped++;
+        qemu_log_mask(LOG_UNIMP,
+                      "r100-cm7: hdma WRITE %s dropped (link unbound) "
+                      "dst=0x%" PRIx64 " len=%u req_id=%u\n",
+                      tag, dst, len, req_id);
+        return false;
     }
-    s->hdma_frames_dropped++;
-    qemu_log_mask(LOG_UNIMP,
-                  "r100-cm7: hdma WRITE %s dropped dst=0x%" PRIx64
-                  " len=%u req_id=%u rc=%d\n", tag, dst, len, req_id,
-                  (int)rc);
-    return false;
+    if (!r100_hdma_emit_write_tagged(s->hdma, req_id, dst, payload, len,
+                                     tag)) {
+        s->hdma_frames_dropped++;
+        return false;
+    }
+    s->hdma_frames_sent++;
+    return true;
 }
 
 static bool r100_cm7_hdma_read_req(R100Cm7State *s, uint32_t req_id,
                                    uint64_t src, uint32_t read_len,
                                    const char *tag)
 {
-    RemuHdmaEmitResult rc;
-
-    rc = remu_hdma_emit_read_req(&s->hdma_chr, "r100-cm7 hdma",
-                                 req_id, src, read_len);
-    if (rc == REMU_HDMA_EMIT_OK) {
-        s->hdma_frames_sent++;
-        r100_cm7_hdma_emit_debug(s, "tx", REMU_HDMA_OP_READ_REQ,
-                                 req_id, src, read_len, tag);
-        return true;
+    if (!s->hdma) {
+        s->hdma_frames_dropped++;
+        qemu_log_mask(LOG_UNIMP,
+                      "r100-cm7: hdma READ_REQ %s dropped (link unbound) "
+                      "src=0x%" PRIx64 " len=%u req_id=%u\n",
+                      tag, src, read_len, req_id);
+        return false;
     }
-    s->hdma_frames_dropped++;
-    qemu_log_mask(LOG_UNIMP,
-                  "r100-cm7: hdma READ_REQ %s dropped src=0x%" PRIx64
-                  " read_len=%u req_id=%u rc=%d\n", tag, src, read_len,
-                  req_id, (int)rc);
-    return false;
+    if (!r100_hdma_emit_read_req(s->hdma, req_id, src, read_len, tag)) {
+        s->hdma_frames_dropped++;
+        return false;
+    }
+    s->hdma_frames_sent++;
+    return true;
 }
 
 static bool r100_cm7_hdma_cfg_write(R100Cm7State *s, uint32_t req_id,
                                     uint32_t cfg_off, uint32_t val,
                                     const char *tag)
 {
-    RemuHdmaEmitResult rc;
-
-    rc = remu_hdma_emit_cfg_write(&s->hdma_chr, "r100-cm7 hdma",
-                                  req_id, cfg_off, val);
-    if (rc == REMU_HDMA_EMIT_OK) {
-        s->hdma_frames_sent++;
-        r100_cm7_hdma_emit_debug(s, "tx", REMU_HDMA_OP_CFG_WRITE,
-                                 req_id, cfg_off, 4, tag);
-        return true;
+    if (!s->hdma) {
+        s->hdma_frames_dropped++;
+        qemu_log_mask(LOG_UNIMP,
+                      "r100-cm7: hdma CFG_WRITE %s dropped (link "
+                      "unbound) off=0x%x val=0x%x req_id=%u\n",
+                      tag, cfg_off, val, req_id);
+        return false;
     }
-    s->hdma_frames_dropped++;
-    qemu_log_mask(LOG_UNIMP,
-                  "r100-cm7: hdma CFG_WRITE %s dropped off=0x%x val=0x%x "
-                  "req_id=%u rc=%d\n", tag, cfg_off, val, req_id, (int)rc);
-    return false;
+    if (!r100_hdma_emit_cfg_write(s->hdma, req_id, cfg_off, val, tag)) {
+        s->hdma_frames_dropped++;
+        return false;
+    }
+    s->hdma_frames_sent++;
+    return true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -393,10 +379,10 @@ static void r100_cm7_qinit_stub(R100Cm7State *s)
     uint8_t fw_version[REMU_DDH_VERSION_MAX];
     uint32_t init_done = 1;
 
-    if (!qemu_chr_fe_backend_connected(&s->hdma_chr)) {
+    if (!s->hdma) {
         /* Single-QEMU runs / tests don't wire hdma; treat as no-op. */
         qemu_log_mask(LOG_UNIMP,
-                      "r100-cm7: QINIT stub: hdma chardev not wired, "
+                      "r100-cm7: QINIT stub: hdma link unbound, "
                       "skipping\n");
         s->qinit_stubs_dropped++;
         return;
@@ -509,11 +495,11 @@ static void r100_cm7_bd_start(R100Cm7State *s, uint32_t qid)
                       "(phase=%d)\n", qid, (int)j->phase);
         return;
     }
-    if (!qemu_chr_fe_backend_connected(&s->hdma_chr)) {
+    if (!s->hdma) {
         s->bd_doorbells_dropped++;
         qemu_log_mask(LOG_UNIMP,
                       "r100-cm7: BD-done qid=%u doorbell but hdma "
-                      "chardev not wired\n", qid);
+                      "link unbound\n", qid);
         return;
     }
     /* kmd publishes `pi` via rebel_mailbox_write(rdev, qid, pi), which
@@ -718,26 +704,82 @@ static void r100_cm7_bd_on_pkt(R100Cm7State *s, R100Cm7BdJob *j,
  * (no chardev egress, no host-relay accounting). Per-instance
  * counters live on R100Cm7State.
  *
- * Current entry payload is a placeholder: id_info.cmd_id = qid+1,
- * everything else zero. q-cp's master memcpy's the 24 B into its
- * inner queue; the worker will eventually deref cmd_descr=NULL and
- * hang on unmodelled DNC HW. Driving entries from real BD payload
- * + adding a DNC peripheral stub are follow-ups.
+ * M9-1c: each push synthesises a minimal `struct cmd_descr` in a
+ * pre-reserved chiplet-0 private-DRAM slot and points the mailbox
+ * entry's cmd_descr field at it. Without this q-cp's worker
+ * derefs NULL at fetch_task.c:173 (`one_task->cmd_descr->...`)
+ * and faults before reaching the new active DNC stub. The synth
+ * sets:
+ *   cmd_descr_common.cmd_type = COMMON_CMD_TYPE_COMPUTE (0)
+ *   cmd_descr_common.descr_type = COMMON_DESCR_TYPE_DEFAULT (0)
+ *   cmd_descr_dnc.dnc_task_conf.core_affinity = BIT(0)
+ * everything else zero. The worker reads `core_affinity & BIT(i)`
+ * to decide which DNC slot to dispatch to (fetch_task.c:181); 0x1
+ * routes to DNC0 inside the worker's dnc range, which is what our
+ * r100-dnc-cluster active path is wired to fire on.
  */
+static void r100_cm7_synth_cmd_descr(R100Cm7State *s, uint32_t pi_index,
+                                     uint64_t *out_npu_addr)
+{
+    /* dnc_task_conf.core_affinity is a uint64_t bitfield at offset 20
+     * of cmd_descr (after the 20 B cmd_descr_common). Layout chosen
+     * to match g_cmd_descr_common_rebel.h + g_cmd_descr_dnc_rebel.h
+     * exactly — bytes 0..19 zero, bytes 20..27 little-endian 0x1. */
+    enum {
+        DNC_TASK_CONF_OFF      = 20u, /* sizeof(cmd_descr_common) */
+        DESCR_BUF_LEN          = 32u, /* covers task_conf in full */
+    };
+    uint8_t buf[DESCR_BUF_LEN];
+    uint64_t addr = R100_CMD_DESCR_SYNTH_BASE +
+                    (uint64_t)(pi_index % R100_CMD_DESCR_SYNTH_COUNT) *
+                    R100_CMD_DESCR_SYNTH_STRIDE;
+    MemTxResult mr;
+
+    memset(buf, 0, sizeof(buf));
+    /* core_affinity = 1 (bit 0 → DNC0). Low byte of the 8-byte field. */
+    buf[DNC_TASK_CONF_OFF] = 0x01u;
+
+    mr = address_space_write(&address_space_memory, addr,
+                             MEMTXATTRS_UNSPECIFIED, buf, sizeof(buf));
+    if (mr != MEMTX_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "r100-cm7: cmd_descr synth write failed addr=0x%"
+                      PRIx64 "\n", addr);
+        *out_npu_addr = 0;
+        return;
+    }
+    *out_npu_addr = addr;
+}
+
 static void r100_cm7_mbtq_push(R100Cm7State *s, uint32_t qid)
 {
     uint32_t entry[R100_MBTQ_ENTRY_SIZE_WORD];
     uint32_t slot;
     uint32_t pi_after;
+    uint64_t cmd_descr_addr = 0;
 
     if (!s->mbtq_mailbox) {
         s->mbtq_pushes_dropped++;
-        r100_cm7_mbtq_emit_debug(s, qid, 0, 0, "no-mailbox");
+        r100_cm7_mbtq_emit_debug(s, qid, 0, 0, 0, "no-mailbox");
         return;
     }
 
+    /* Stage cmd_descr first so the entry's pointer is valid the moment
+     * q-cp pops it. */
+    r100_cm7_synth_cmd_descr(s, s->mbtq_pi_next, &cmd_descr_addr);
+
+    /*
+     * dnc_one_task on-wire layout (task_mgr/task.h):
+     *   word 0..0  union exec_id    id_info  (32 bits)
+     *   word 1..2  struct cmd_descr *cmd_descr (64 bits, NPU phys)
+     *   word 3..4  uint64_t         jurq_used (64 bits, 0)
+     *   word 5     padding to MTQ_ENTRY_SIZE_WORD = 6
+     */
     memset(entry, 0, sizeof(entry));
     entry[0] = qid + 1u;
+    entry[1] = (uint32_t)cmd_descr_addr;
+    entry[2] = (uint32_t)(cmd_descr_addr >> 32);
+    /* entry[3..5] left zero — jurq_used + tail padding. */
 
     slot = R100_MBTQ_QUEUE_IDX +
            (s->mbtq_pi_next & (R100_MBTQ_ENTRY_MAX - 1u)) *
@@ -749,7 +791,8 @@ static void r100_cm7_mbtq_push(R100Cm7State *s, uint32_t qid)
                                 &pi_after, 1);
     s->mbtq_pushes++;
 
-    r100_cm7_mbtq_emit_debug(s, qid, slot, pi_after, "ok");
+    r100_cm7_mbtq_emit_debug(s, qid, slot, pi_after, cmd_descr_addr,
+                             cmd_descr_addr ? "ok" : "ok-null-descr");
 }
 
 /* ------------------------------------------------------------------ */
@@ -766,12 +809,6 @@ static int r100_cm7_cfg_can_receive(void *opaque)
 {
     R100Cm7State *s = opaque;
     return remu_frame_rx_headroom(&s->cfg_rx);
-}
-
-static int r100_cm7_hdma_can_receive(void *opaque)
-{
-    R100Cm7State *s = opaque;
-    return remu_hdma_rx_headroom(&s->hdma_rx);
 }
 
 static void r100_cm7_deliver(R100Cm7State *s, uint32_t off, uint32_t val)
@@ -910,25 +947,29 @@ static void r100_cm7_cfg_receive(void *opaque, const uint8_t *buf, int size)
 }
 
 /* ------------------------------------------------------------------ */
-/* HDMA chardev RX (host→NPU OP_READ_RESP responses — M8b 3c)          */
+/* HDMA RX callback (host→NPU OP_READ_RESP responses — M8b 3c)         */
+/*                                                                     */
+/* r100-hdma owns the chardev backend and demuxes by req_id partition: */
+/* it calls this back for the cm7 range (1..R100_CM7_MAX_QUEUES). The  */
+/* old in-cm7 RemuHdmaRx accumulator is gone — the device-level RX     */
+/* state now lives on R100HDMAState.                                   */
 /* ------------------------------------------------------------------ */
 
-static void r100_cm7_hdma_dispatch(R100Cm7State *s,
+static void r100_cm7_hdma_dispatch(void *opaque,
                                    const RemuHdmaHeader *hdr,
                                    const uint8_t *payload)
 {
+    R100Cm7State *s = opaque;
     R100Cm7BdJob *j;
     uint32_t slot;
 
     s->hdma_frames_received++;
-    r100_cm7_hdma_emit_debug(s, "rx", hdr->op, hdr->req_id, hdr->dst,
-                             hdr->len, "resp");
 
+    /* op == OP_READ_RESP enforced by r100-hdma; assert defensively. */
     if (hdr->op != REMU_HDMA_OP_READ_RESP) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "r100-cm7: hdma RX unexpected op=%s req_id=%u "
-                      "dst=0x%" PRIx64 " len=%u (only READ_RESP "
-                      "dispatched NPU-side)\n",
+                      "dst=0x%" PRIx64 " len=%u\n",
                       remu_hdma_op_str(hdr->op), hdr->req_id, hdr->dst,
                       hdr->len);
         return;
@@ -963,19 +1004,6 @@ static void r100_cm7_hdma_dispatch(R100Cm7State *s,
     }
 }
 
-static void r100_cm7_hdma_receive(void *opaque, const uint8_t *buf, int size)
-{
-    R100Cm7State *s = opaque;
-    const RemuHdmaHeader *hdr;
-    const uint8_t *payload;
-
-    while (size > 0) {
-        if (remu_hdma_rx_feed(&s->hdma_rx, &buf, &size, &hdr, &payload)) {
-            r100_cm7_hdma_dispatch(s, hdr, payload);
-        }
-    }
-}
-
 /* ------------------------------------------------------------------ */
 /* Realize / reset / vmstate / properties                              */
 /* ------------------------------------------------------------------ */
@@ -1007,14 +1035,13 @@ static void r100_cm7_realize(DeviceState *dev, Error **errp)
                                  r100_cm7_cfg_receive,
                                  NULL, NULL, s, NULL, true);
     }
-    /* hdma is likewise optional; without it BD-done READ_REQs silently
-     * fail and the job FSM never leaves IDLE (rbln_queue_test times
-     * out — that's the single-QEMU / M6 test path). */
-    if (qemu_chr_fe_backend_connected(&s->hdma_chr)) {
-        qemu_chr_fe_set_handlers(&s->hdma_chr,
-                                 r100_cm7_hdma_can_receive,
-                                 r100_cm7_hdma_receive,
-                                 NULL, NULL, s, NULL, true);
+    /* hdma chardev now owned by r100-hdma; cm7 plugs into its RX
+     * demux through the cm7-callback hook. Optional — when the link
+     * is unbound (single-QEMU / M6 test paths) the BD-done state
+     * machine silently fails its READ_REQ emits and the job FSM
+     * never leaves IDLE. */
+    if (s->hdma) {
+        r100_hdma_set_cm7_callback(s->hdma, r100_cm7_hdma_dispatch, s);
     }
 }
 
@@ -1026,8 +1053,6 @@ static void r100_cm7_unrealize(DeviceState *dev)
     qemu_chr_fe_deinit(&s->debug_chr, false);
     qemu_chr_fe_deinit(&s->cfg_chr, false);
     qemu_chr_fe_deinit(&s->cfg_debug_chr, false);
-    qemu_chr_fe_deinit(&s->hdma_chr, false);
-    qemu_chr_fe_deinit(&s->hdma_debug_chr, false);
     qemu_chr_fe_deinit(&s->cm7_debug_chr, false);
 }
 
@@ -1037,7 +1062,6 @@ static void r100_cm7_reset(DeviceState *dev)
 
     remu_frame_rx_reset(&s->rx);
     remu_frame_rx_reset(&s->cfg_rx);
-    remu_hdma_rx_reset(&s->hdma_rx);
     /* Drop any in-flight BD jobs — a reset between runs invalidates
      * the host-view DMA addresses. Counters survive reset so tests
      * can assert cumulative behaviour. */
@@ -1089,8 +1113,6 @@ static Property r100_cm7_properties[] = {
     DEFINE_PROP_CHR("debug-chardev", R100Cm7State, debug_chr),
     DEFINE_PROP_CHR("cfg-chardev", R100Cm7State, cfg_chr),
     DEFINE_PROP_CHR("cfg-debug-chardev", R100Cm7State, cfg_debug_chr),
-    DEFINE_PROP_CHR("hdma-chardev", R100Cm7State, hdma_chr),
-    DEFINE_PROP_CHR("hdma-debug-chardev", R100Cm7State, hdma_debug_chr),
     DEFINE_PROP_CHR("cm7-debug-chardev", R100Cm7State, cm7_debug_chr),
     DEFINE_PROP_LINK("mailbox", R100Cm7State, mailbox,
                      TYPE_R100_MAILBOX, R100MailboxState *),
@@ -1100,6 +1122,8 @@ static Property r100_cm7_properties[] = {
                      TYPE_R100_IMSIX, R100IMSIXState *),
     DEFINE_PROP_LINK("mbtq-mailbox", R100Cm7State, mbtq_mailbox,
                      TYPE_R100_MAILBOX, R100MailboxState *),
+    DEFINE_PROP_LINK("hdma", R100Cm7State, hdma,
+                     TYPE_R100_HDMA, R100HDMAState *),
     DEFINE_PROP_END_OF_LIST(),
 };
 

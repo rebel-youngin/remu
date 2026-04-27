@@ -509,14 +509,49 @@ failing phase. Common fixes:
 #### Sanity-checking the stub
 
 The host-side `info qtree` must show `cfg` and `hdma` CharBackends
-bound on `r100-npu-pci`; the NPU-side must show `cfg-chardev`,
-`hdma-chardev`, and (if `cm7_log` is wired) `cm7-debug-chardev` all
-non-empty on `r100-cm7`. `./remucli run --host` auto-verifies both
-ends and logs snippets to `host/info-qtree-cfg-hdma.log` and
+bound on `r100-npu-pci`. The NPU-side must show `cfg-chardev` and
+(if `cm7_log` is wired) `cm7-debug-chardev` non-empty on `r100-cm7`,
+and a separate `r100-hdma` device with its own `chardev = "hdma"`
+property (M9-1c moved the chardev off cm7 onto the new device,
+which models q-cp's dw_hdma_v0 register block — see
+`docs/roadmap.md` → M9-1c). `./remucli run --host` auto-verifies
+both ends and logs snippets to `host/info-qtree-cfg-hdma.log` and
 `npu/info-qtree-cfg-hdma.log`. A missing property means the
 `-machine r100-soc,cfg=/hdma=/cm7-debug=…` or
 `-device r100-npu-pci,cfg=/hdma=…` option didn't latch — check
 `cli/remu_cli.py` chardev id literals.
+
+#### M9-1c — active DNC + HDMA reg block
+
+After M9-1c, every queue-doorbell on `INTGR1` bit `qid` does three
+things in parallel: (a) the BD-done state machine walks queue_desc /
+BD / packet via `r100-hdma` reads (Stage 3c, unchanged); (b) cm7
+synthesises a minimal `cmd_descr` in chiplet-0 private DRAM at
+`R100_CMD_DESCR_SYNTH_BASE = 0x20000000` (16-slot ring, 256 B
+stride) and pushes a `dnc_one_task` carrying that pointer onto the
+M9 mailbox so q-cp's `taskmgr_fetch_dnc_task_master_cp1` can pop a
+non-NULL descriptor; (c) — when q-cp's CP1 worker eventually calls
+`dnc_send_task` — the writes land on `r100-dnc-cluster`, the final
+4-byte store to slot+0x81C with `itdone=1` triggers a BH that
+synthesises a `dnc_reg_done_passage` at slot+0xA00 and pulses the
+matching DNC GIC SPI from `r100_dnc_intid()`.
+
+Log signatures (NPU side, with cm7-debug + dnc-debug active):
+
+| Trace line | Means |
+|---|---|
+| `mbtq qid=N slot=M pi=P cmd_descr=0x20000000 status=ok` | `r100_cm7_mbtq_push` published a fresh entry. cmd_descr=0 means the address-space write into the synth slot failed — check that 0x20000000 is in chiplet-0 DRAM range. |
+| `r100-dnc cl=C dcl=D slot=S kickoff dnc_id=N cmd_type=T desc_id=0x... → intid=I spi=I-32 fired=...` | q-cp reached `dnc_send_task` and wrote DESC_CFG1 with itdone=1; r100-dnc latched the done passage and pulsed the DNC SPI. |
+| `r100-dnc cl=C dcl=D slot=S: completion FIFO full` | Pending completions exceeded `DNC_DONE_FIFO_DEPTH=32`. Almost certainly indicates an IRQ-storm bug (e.g. spurious tlb_invalidate-shaped writes). |
+
+Common failure: the kickoff trace never fires even though mbtq
+pushes are landing. That means q-cp's CP1 worker isn't reaching
+`dnc_send_task` for our pushed task. First check via CP1 GDB
+(`tests/scripts/gdb_inspect_cp1.gdb`): is the worker thread on a
+DNC range that includes DNC0? Read 0x20000000 directly and confirm
+`cmd_descr_dnc.dnc_task_conf.core_affinity` matches what r100-cm7
+wrote (offset 20, byte 0 = 0x01). Bitfield mismatch → adjust the
+synth in `r100_cm7_synth_cmd_descr`.
 
 ## Interpreting a boot log
 

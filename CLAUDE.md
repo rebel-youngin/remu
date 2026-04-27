@@ -101,16 +101,44 @@ so the kmd's `dma_fence` resolves. See
 signatures.
 
 In parallel with Stage 3c BD-done, every queue-doorbell also pushes a
-24 B `dnc_one_task` placeholder onto the q-cp DNC compute task queue
-(real `r100-mailbox` instance at `R100_PERI0_MAILBOX_M9_BASE`,
-chiplet 0). q-cp's `taskmgr_fetch_dnc_task_master_cp1` polls
-`MBTQ_PI_IDX` (ISSR[0]) on this mailbox; the push wakes that loop
-without IRQ wiring (poll-based protocol). PCIE_CM7 firmware does
-this on silicon — REMU has no Cortex-M7 vCPU so `r100-cm7` takes the
-role via `r100_mailbox_set_issr_words()` (in-process; no chardev).
-Push counters + cm7-debug `mbtq qid=N slot=M pi=P status=ok` traces
-for observability. The push is observed-but-unused until the DNC
-peripheral stub lands.
+24 B `dnc_one_task` entry onto the q-cp DNC compute task queue (real
+`r100-mailbox` instance at `R100_PERI0_MAILBOX_M9_BASE`, chiplet 0).
+q-cp's `taskmgr_fetch_dnc_task_master_cp1` polls `MBTQ_PI_IDX` (ISSR[0])
+on this mailbox; the push wakes that loop without IRQ wiring (poll-based
+protocol). PCIE_CM7 firmware does this on silicon — REMU has no
+Cortex-M7 vCPU so `r100-cm7` takes the role via
+`r100_mailbox_set_issr_words()` (in-process; no chardev). M9-1c
+synthesises a minimal `cmd_descr` (cmd_type=COMPUTE,
+`dnc_task_conf.core_affinity=BIT(0)`) into a chiplet-0 private DRAM
+slot at `R100_CMD_DESCR_SYNTH_BASE = 0x20000000` (16 × 256 B ring) and
+points the entry's `cmd_descr` field at it, so q-cp's worker can
+dereference + reach `dnc_send_task` instead of NULL-deref'ing.
+cm7-debug emits `mbtq qid=N slot=M pi=P cmd_descr=0x... status=ok`
+traces; q-cp consumption is the M9-2 verification gap.
+
+#### r100-hdma + active r100-dnc (M9-1c)
+
+The `hdma` chardev moved from `r100-cm7` onto a new `r100-hdma` device
+(QOM type `r100-hdma`, MMIO at `R100_HDMA_BASE = 0x1D80380000` on
+chiplet 0). The motivation is that q-cp itself programs a DesignWare
+dw_hdma_v0 register block at that address — REMU now models that
+register block, and the chardev sits on the model's host-side
+counterpart since CharBackends are single-frontend. r100-cm7 reaches
+the chardev through a QOM link (`hdma` link prop) and the public emit
+helpers in `src/machine/r100_hdma.h`. req_id partitioning on the wire
+(documented in `src/bridge/remu_hdma_proto.h`):
+0x00 = QINIT untagged, 0x01..0x0F = cm7 BD-done per qid+1,
+0x80..0xBF = r100-hdma MMIO-driven channel ops.
+
+The passive `r100-dnc-cluster` register-file stub (sparse regstore
+seeding IP_INFO / SHM TPG / RDSN bits for boot) gained an active
+task-completion path: writes to slot+0x81C (TASK_DESC_CFG1) with
+`access_size=4` and `itdone=1` schedule a BH that pulses the matching
+DNC GIC SPI (lookup table at `r100_dnc_intid()` in
+`r100/remu_addrmap.h`; INTIDs are non-contiguous — DNC0=410,
+DNC1=422…) and latches a synthesised `dnc_reg_done_passage` at
+slot+0xA00 so q-cp's `dnc_X_done_handler` reads a coherent record.
+GIC `num-irq` was bumped 256 → 992 so the wider DNC INTID set fits.
 
 Both QEMUs `mmap` the same 128 MB `/dev/shm/remu-<name>/remu-shm` with
 `share=on`. Splice points (same backend, two places):
@@ -151,10 +179,11 @@ Every `--host` run captures and checks:
   `msix-{table,pba}` overlaying `r100.bar5.msix`.
 - **M8a**: NPU `r100-mailbox` has `issr-chardev = "issr"`; host
   `r100-npu-pci` has `issr = "issr"`.
-- **M8b 3b/3c**: NPU `r100-cm7` has `cfg-chardev = "cfg"` +
-  `hdma-chardev = "hdma"` + `cm7-debug-chardev = "cm7_dbg"`; host
-  `r100-npu-pci` has `cfg = "cfg"` + `hdma = "hdma"` (logged to
-  `{host,npu}/info-qtree-cfg-hdma.log`).
+- **M8b 3b/3c + M9-1c**: NPU `r100-cm7` has `cfg-chardev = "cfg"` +
+  `cm7-debug-chardev = "cm7_dbg"`; NPU `r100-hdma` exists with
+  `chardev = "hdma"` (M9-1c moved the chardev off cm7 onto the new
+  device); host `r100-npu-pci` has `cfg = "cfg"` + `hdma = "hdma"`
+  (logged to `{host,npu}/info-qtree-cfg-hdma.log`).
 
 All results go to `host/info-*.log` + `npu/info-*.log`. Failures print
 to stdout (non-fatal — NPU still boots for post-mortem poking).
@@ -225,6 +254,8 @@ remucli               Bash wrapper — the one entry point
 src/machine/          NPU-side QEMU device models (symlinked into external/qemu/hw/arm/r100/)
                         r100_soc.{c,h}      machine + QOM type-name registry
                         r100_mailbox.{c,h}  mailbox — .c private state, .h public helpers
+                        r100_hdma.{c,h}     HDMA reg block — .c private state,
+                                            .h public emit API (M9-1c)
                         r100_<dev>.c        one file per device (state struct private)
 src/host/             Host-side (x86 guest) PCI device models (symlinked into external/qemu/hw/misc/r100-host/)
 src/include/          Added to -I during QEMU configure

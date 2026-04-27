@@ -96,8 +96,8 @@ so `r100-cm7` emulates PCIE_CM7's effect on this path too.
 | Stage | What | Status | Commit |
 |---|---|---|---|
 | 1b | Real `r100-mailbox` instance at `R100_PERI0_MAILBOX_M9_BASE` (chiplet 0) — replaces lazy-RAM placeholder. `r100-cm7` pushes a 24 B placeholder `dnc_one_task` (`{cmd_id=qid+1, 0, 0}`) + bumps `MBTQ_PI_IDX` on every `INTGR1` queue-doorbell. New `r100_mailbox_set_issr_words` helper bypasses the issr_store funnel (no chardev egress, no host-relay accounting). cm7-debug emits `mbtq qid=N slot=M pi=P status=ok` for observability. Stage 3c BD-done unaffected — `rbln_queue_test` still passes. Push reaches storage at the right slots; q-cp consumption still under investigation (likely waits for DNC stub in 1c) | done | — |
-| 1c | `r100-dnc` register-block model (accept task, fire completion IRQ to q-cp); HDMA register-block model so q-cp can DMA-read host RAM | pending | — |
-| 2 | DNC task BD discrimination (decode packet type from BD payload, populate real `cmd_descr` pointer in NPU SRAM, replace placeholder push). q-cp completion → BD.DONE write-back + MSI-X | pending | — |
+| 1c | Active `r100-dnc-cluster` task-completion path (TASK_DESC_CFG1.itdone trigger → BH-scheduled GIC SPI on the matching DNC INTID, synthesised done_passage at TASK_DONE). New `r100-hdma` device modelling DesignWare dw_hdma_v0 at `R100_HDMA_BASE = 0x1D80380000` (chiplet 0); takes ownership of the `hdma` chardev (single-frontend), with `r100-cm7` reaching it through a QOM link + public emit API in `r100_hdma.h`. r100-cm7's mbtq push synthesises a minimal valid `cmd_descr` (cmd_type=COMPUTE, core_affinity=BIT(0)) into chiplet-0 private DRAM at `R100_CMD_DESCR_SYNTH_BASE = 0x20000000`, replacing the M9-1b NULL-deref placeholder. GIC `num-irq` bumped 256 → 992 to fit DNC INTIDs (up to 617). Phase 1 boot + m5/m6/m7/m8 + Stage 3c BD-done qid=0 all preserved. **Open verification gap:** q-cp's CP1 worker not yet observed reaching `dnc_send_task` end-to-end — investigation deferred to M9-2 (likely cmd_descr layout or worker DNC range) | done | — |
+| 2 | q-cp end-to-end: confirm worker pops mbtq → calls `dnc_send_task` → DNC stub IRQ fires → `cb_complete` runs. Provide `pcie_msix_trigger` (declared-only in CP1 today) via weak stub or fw-patch trampoline so cb_complete's BD.DONE write-back + MSI-X notify completes. BD-type discrimination (skip mbtq push for `packet_write_data` BDs that Stage 3c handles directly) | pending | — |
 | 3 | umd test binary in `guest/` (`rblnCreateContext` → submit → wait → exit 0) | pending | — |
 
 ### Components (current state)
@@ -115,10 +115,14 @@ for the HMP sanity recipes.
 - `src/machine/r100_soc.c` — machine. Splices memdev into chiplet-0 DRAM,
   instantiates three `r100-mailbox` blocks (PF, VF0, and the M9-1b
   compute task queue at `R100_PERI0_MAILBOX_M9_BASE`), optional
-  `r100-cm7` / `r100-imsix` gated on chardev machine-props. Wires
-  `cfg` + `hdma` + `cm7-debug` chardevs onto `r100-cm7`; links
-  `r100-cm7` to `r100-imsix` (BD-done MSI-X) and to the M9 mailbox
-  (M9-1b mbtq pushes). Skips lazy-RAM at the M9 slot to avoid overlap.
+  `r100-cm7` / `r100-imsix` / `r100-hdma` gated on chardev machine-props.
+  Wires `cfg` + `cm7-debug` chardevs onto `r100-cm7`; the `hdma` chardev
+  goes to `r100-hdma` (M9-1c). Links `r100-cm7` to `r100-imsix` (BD-done
+  MSI-X), to `r100-hdma` (chardev egress), and to the M9 mailbox (M9-1b
+  mbtq pushes). Wires DNC done SPIs from each DCL (8 × 4 lines per DCL)
+  to the chiplet GIC via `r100_dnc_intid()` (M9-1c). Skips lazy-RAM at
+  the M9 slot to avoid overlap. GIC `num-irq` is 992 (was 256 pre-M9-1c)
+  to fit DNC INTIDs.
 - `src/machine/r100_mailbox.c` — Samsung IPM SFR (`INTGR/INTCR/INTMR/INTSR/INTMSR/ISSR0..63`),
   two `qemu_irq` outs tracking INTMSR. API: `r100_mailbox_raise_intgr`,
   `r100_mailbox_set_issr`, `r100_mailbox_get_issr`,
@@ -133,10 +137,34 @@ for the HMP sanity recipes.
   stub on `INTGR1 bit 7` (Stage 3b); (3) the BD-done state machine on
   `INTGR1 bits 0..N` that drives `rbln_queue_test` (Stage 3c);
   (4) `r100_cm7_mbtq_push` on the same INTGR1 queue-doorbell — pushes
-  a placeholder `dnc_one_task` to the M9 task-queue mailbox to wake
-  q-cp's `taskmgr_fetch_dnc_task_master_cp1` poll loop (M9-1b).
-  Optional `cm7-debug` chardev emits ASCII phase-transition + mbtq
-  push traces.
+  a `dnc_one_task` (with synthesised `cmd_descr` since M9-1c) to the
+  M9 task-queue mailbox to wake q-cp's
+  `taskmgr_fetch_dnc_task_master_cp1` poll loop. The hdma chardev
+  used to live here through Stage 3c; it moved to `r100-hdma` in
+  M9-1c — cm7 still drives the same wire-level traffic (QINIT writes,
+  BD-done OP_READ_REQ / OP_WRITE / OP_CFG_WRITE) but does so through
+  the `r100_hdma_emit_*` helpers, and registers an RX callback via
+  `r100_hdma_set_cm7_callback()` for OP_READ_RESP responses tagged
+  `req_id = qid + 1`. Optional `cm7-debug` chardev emits ASCII
+  phase-transition + mbtq push traces.
+- `src/machine/r100_hdma.{c,h}` — DesignWare dw_hdma_v0 register-block
+  model (M9-1c) at `R100_HDMA_BASE` (chiplet 0). Per-channel state for
+  16 WR + 16 RD channels (SAR, DAR, XferSize, doorbell, status,
+  int_status). On WR doorbell → emit OP_WRITE with payload pulled from
+  chiplet sysmem at SAR; on RD doorbell → emit OP_READ_REQ tagged with
+  `req_id = R100_HDMA_REQ_ID_CH_MASK_BASE | (dir << 5) | ch`, complete
+  on matching OP_READ_RESP by `address_space_write` into chiplet sysmem
+  at DAR. Single GIC SPI 186 line + per-channel pending bit set in
+  SUBCTRL_EDMA_INT_CA73 (`0x1FF8184368`, plain RAM in pcie-subctrl).
+  Owns the `hdma` chardev (single-frontend constraint); cm7 reaches
+  it via a QOM link + public emit API.
+- `src/machine/r100_dnc.c` — DCL CFG-window stub. Passive sparse
+  regstore seeds IP_INFO / SHM TPG / RDSN bits during Phase 1 boot.
+  M9-1c added an active path: writes to slot+0x81C
+  (TASK_DESC_CFG1) with `access_size=4` and `itdone=1` schedule a BH
+  that synthesises a `dnc_reg_done_passage` at slot+0xA00 and pulses
+  the matching DNC GIC SPI (lookup at `r100_dnc_intid()`). Passive
+  reads still served by regstore fall-through.
 - `src/machine/r100_imsix.c` — 4 KB MMIO trap at `R100_PCIE_IMSIX_BASE`,
   emits `(offset, db_data)` frames on write to `0xFFC`. Public API
   `r100_imsix_notify(vector)` called by `r100-cm7` BD-done completion.
@@ -153,11 +181,23 @@ for the HMP sanity recipes.
 
 ### Pending components
 
-- DNC stub (accept task, generate completion IRQ to q-cp; q-cp drives
-  BD.DONE + MSI-X) — M9-1c / M9-2
-- HDMA register-block model — M9-1c (q-cp side needs real DMA-read of
-  host RAM, complementing the cross-process `hdma` chardev shortcut
-  used by `r100-cm7` today)
+- q-cp end-to-end DNC kickoff verification — M9-2. Active DNC stub +
+  cmd_descr synth landed in M9-1c; what's left is confirming
+  q-cp's CP1 worker actually reaches `dnc_send_task` and the
+  synthesised IRQ wakes `dnc_X_done_handler`. Likely first
+  investigation step: check whether `cmd_descr_dnc.dnc_task_conf
+  .core_affinity` lands at the byte position r100-cm7 writes (offset
+  20 of cmd_descr; uint64_t bitfield) by reading 0x20000000 from CP1
+  GDB after a queue-doorbell.
+- `pcie_msix_trigger` provision on CP1 — declared only in
+  `common/headers/fw/rbln/msix.h`, called by `cb_complete`
+  (`command_buffer_manager.c:952`). REMU needs either a weak stub
+  (via `cli/fw-patches/`) or a tiny MMIO trap routing the trigger
+  to `r100-imsix`. Without it the q-cp end-to-end path stops at
+  cb_complete instead of closing BD.DONE + MSI-X to the host. — M9-2
+- BD-done qid=1 (kmd "message ring") — Stage 3c only models qid=0;
+  qid=1 reads garbage `qdesc.size` and bails. Pre-existing; not
+  blocking M9-1c. — future work
 - NPU-local DRAM scratch write on BD-done (silicon mirrors `FUNC_SCRATCH`
   into chiplet DRAM too; kmd currently reads it via BAR2 cfg-head path
   only, so Stage 3c's `OP_CFG_WRITE` suffices) — future work

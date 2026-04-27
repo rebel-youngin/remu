@@ -421,4 +421,134 @@
 #define R100_PCIE_IMSIX_DB_OFFSET   0x00000FFCU
 #define R100_PCIE_IMSIX_VECTOR_MASK 0x000007FFU       /* db_data[10:0] */
 
+/* ========================================================================
+ * M9-1c — DNC completion + HDMA register block + cmd_descr synth
+ * ======================================================================== */
+
+/* DNC completion INTIDs (q/cp/include/hal/interrupt.h, transcribed
+ * verbatim — values are NON-CONTIGUOUS so don't compute by addition).
+ *
+ * Each DNC asserts six SPIs starting at the EXCEPTION base in order:
+ *   {EXCEPTION, COMPUTE, UDMA, UDMA_LP, UDMA_ST, TASK16B}
+ * q-cp's dnc_X_done_handler binds all six via gic_irq_connect; the
+ * handler demuxes on done_passage.done_rpt1.cmd_type, so REMU only
+ * needs to deliver the INTID matching the kicked cmd_type. r100_dnc.c
+ * uses r100_dnc_intid(dnc_id, cmd_type) below to look up the right
+ * one before pulsing the GIC SPI line. The dual-DCL layout maps
+ * DCL0 → DNC0..7, DCL1 → DNC8..15 (g_sys_addrmap.h). */
+#define R100_HW_SPEC_DNC_COUNT          16u
+#define R100_HW_SPEC_DNC_IRQ_NUM        6u    /* {EXC,COMP,UDMA,LP,ST,T16B} */
+#define R100_HW_SPEC_DNC_CMD_TYPE_NUM   5u    /* without EXCEPTION */
+
+static const uint32_t r100_dnc_exc_intid_table[R100_HW_SPEC_DNC_COUNT] = {
+    [0]  = 410, [1]  = 422, [2]  = 416, [3]  = 428,
+    [4]  = 434, [5]  = 446, [6]  = 440, [7]  = 452,
+    [8]  = 570, [9]  = 582, [10] = 576, [11] = 588,
+    [12] = 594, [13] = 606, [14] = 600, [15] = 612,
+};
+
+/* Spot-checks — if Samsung re-shuffles a future header release these
+ * trip a compile error rather than silently shipping a bad LUT. */
+_Static_assert(R100_HW_SPEC_DNC_COUNT == 16,
+               "R100 DNC count must match interrupt.h");
+/* Compile-time array-length assertions hit a -Wpedantic edge under
+ * static const uint32_t[]; runtime cardinality is enforced by
+ * r100_dnc_intid()'s bounds check below. */
+
+/* Map (dnc_id, cmd_type) → SPI INTID of the matching DNC done-handler
+ * line. cmd_type uses the COMMON_CMD_TYPE_* enum (COMPUTE=0..UDMA_ST=3),
+ * with the extra DNC-private TASK16B reachable via cmd_type=4. Returns
+ * 0 (an invalid SPI) on out-of-range input — the caller drops the
+ * trigger and emits LOG_GUEST_ERROR rather than randomly pulsing an
+ * unrelated SPI. */
+static inline uint32_t r100_dnc_intid(uint32_t dnc_id, uint32_t cmd_type)
+{
+    if (dnc_id >= R100_HW_SPEC_DNC_COUNT ||
+        cmd_type >= R100_HW_SPEC_DNC_CMD_TYPE_NUM) {
+        return 0;
+    }
+    return r100_dnc_exc_intid_table[dnc_id] + 1u + cmd_type;
+}
+
+/* HDMA single-line completion INTID (q/cp/include/hal/interrupt.h:267).
+ * All 32 channels (16 WR + 16 RD) share this SPI; per-channel "which
+ * one finished" lives in SUBCTRL_EDMA_INT_CA73 (offset below into the
+ * existing pcie-subctrl plain-RAM block). The handler reads the
+ * pending bitmap, services each set bit, and write-1-clears. */
+#define R100_INT_ID_HDMA                186u
+#define R100_PCIE_SUBCTRL_EDMA_INT_CA73_OFF 0x4368u   /* in subctrl 64 KB */
+
+/* HDMA register block (q/cp/src/hal/hdma/hdma_if.c hdma_init_dev).
+ *   hdma_base = cl_id * CHIPLET_INTERVAL + U_PCIE_CORE_OFFSET +
+ *               PCIE_HDMA_OFFSET
+ * U_PCIE_CORE_OFFSET = 0x1C00000000 (rebel_h_baseoffset.h:384).
+ * PCIE_HDMA_OFFSET   = 0x180380000  (hdma_if.c:82).
+ * Per-channel stride from HDMA_REG_{WR,RD}_CH_OFFSET with ch_sep=3:
+ *   stride = 2 << (3+7) = 0x800; WR ch_n at 2*ch*stride, RD at
+ *   (2*ch+1)*stride. 16 ch each → 32 stride slots × 0x800 = 0x10000.
+ * Round up to 0x20000 to give head-room for vsec common regs. */
+#define R100_U_PCIE_CORE_OFFSET     0x1C00000000ULL
+#define R100_PCIE_HDMA_OFFSET       0x180380000ULL
+#define R100_HDMA_BASE              (R100_U_PCIE_CORE_OFFSET + \
+                                     R100_PCIE_HDMA_OFFSET)
+#define R100_HDMA_SIZE              0x20000ULL
+#define R100_HDMA_CH_STRIDE         0x800u
+#define R100_HDMA_CH_COUNT          16u    /* per direction (WR or RD) */
+
+/* DesignWare dw_hdma_v0 per-channel register offsets (hdma_regs.h). */
+#define R100_HDMA_CH_REG_ENABLE         0x00u    /* RW0 = idle */
+#define R100_HDMA_CH_REG_DOORBELL       0x04u    /* HDMA_DB_START / STOP */
+#define R100_HDMA_CH_REG_XFER_SIZE      0x1Cu
+#define R100_HDMA_CH_REG_SAR_LO         0x20u
+#define R100_HDMA_CH_REG_SAR_HI         0x24u
+#define R100_HDMA_CH_REG_DAR_LO         0x28u
+#define R100_HDMA_CH_REG_DAR_HI         0x2Cu
+#define R100_HDMA_CH_REG_STATUS         0x80u    /* enum hdma_status */
+#define R100_HDMA_CH_REG_INT_STATUS     0x84u
+#define R100_HDMA_CH_REG_INT_CLEAR      0x8Cu
+
+#define R100_HDMA_DB_START_BIT          (1u << 0)
+#define R100_HDMA_DB_STOP_BIT           (1u << 1)
+
+/* hdma_status enum (q/cp/.../hdma_regs.h). q-cp polls for STOPPED. */
+#define R100_HDMA_STATUS_RUNNING        0u
+#define R100_HDMA_STATUS_STOPPED        1u
+#define R100_HDMA_STATUS_ABORTED        2u
+
+/* int_status / int_clear bits. */
+#define R100_HDMA_INT_STOP_BIT          (1u << 0)
+#define R100_HDMA_INT_ABORT_BIT         (1u << 1)
+#define R100_HDMA_INT_WATERMARK_BIT     (1u << 2)
+
+/* Common cmd_type value the M9-1c r100-cm7 cmd_descr synth seeds into
+ * cmd_descr_common.cmd_type so q-cp's worker dispatches into the
+ * COMPUTE path. Source: g_cmd_descr_common_rebel.h enum common_cmd_type
+ * (COMMON_CMD_TYPE_COMPUTE = 0). Mirrored here so we don't need the
+ * bundle header during compilation of r100_cm7.c. */
+#define R100_CMD_TYPE_COMPUTE           0u
+
+/* Reserved chiplet-0 private DRAM window holding synthesised
+ * cmd_descr blobs r100-cm7 publishes into MBTQ entries. Sits inside
+ * the BAR0-private lazy-RAM tail (CLAUDE.md BAR0 details:
+ * 0x08000000..0x40000000), well clear of:
+ *   - shared shm head (0..0x08000000),
+ *   - kmd-loaded firmware images (BL31_CP1 0x14100000, FreeRTOS_CP1
+ *     0x14200000),
+ *   - .logbuf at 0x10000000.
+ * 16 entries × 256 B each = one slot per MBTQ_ENTRY_MAX. */
+#define R100_CMD_DESCR_SYNTH_BASE       0x20000000ULL
+#define R100_CMD_DESCR_SYNTH_STRIDE     0x100ULL    /* 256 B per slot */
+#define R100_CMD_DESCR_SYNTH_COUNT      R100_MBTQ_ENTRY_MAX
+
+/* req_id partitioning on the `hdma` chardev (remu_hdma_proto.h).
+ *   0x00         — untagged QINIT writes (r100-cm7).
+ *   0x01..0x0F   — r100-cm7 BD-done per-queue (req_id = qid + 1).
+ *   0x40..0x7F   — reserved (UMQ multi-queue, future).
+ *   0x80..0xBF   — r100-hdma MMIO-driven channel ops (encoded as
+ *                  0x80 | (type<<5) | ch with type=0 WR, type=1 RD,
+ *                  ch in 0..15). */
+#define R100_HDMA_REQ_ID_CH_MASK_BASE   0x80u
+#define R100_HDMA_REQ_ID_CH_DIR_RD      0x20u    /* 1<<5 */
+#define R100_HDMA_REQ_ID_CH_NUM_MASK    0x1Fu    /* fits 0..15 */
+
 #endif /* REMU_ADDRMAP_H */

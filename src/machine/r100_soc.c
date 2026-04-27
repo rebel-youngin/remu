@@ -430,11 +430,14 @@ static void r100_create_flash(MemoryRegion *sysmem)
 /*
  * Init a chiplet: memory regions + peripheral stubs. `memdev` (chiplet 0
  * only) splices a shared backend over DRAM head for host/NPU sharing —
- * M5, commit 72c98f0.
+ * M5, commit 72c98f0. `gic_dev` is the chiplet's own GICv3 — already
+ * realized by r100_soc_init, used here to wire per-DCL DNC completion
+ * SPIs (M9-1c) into q-cp's CP1.cpu0.
  */
 static void r100_chiplet_init(MachineState *machine, int chiplet_id,
                               MemoryRegion *sysmem,
-                              HostMemoryBackend *memdev)
+                              HostMemoryBackend *memdev,
+                              DeviceState *gic_dev)
 {
     uint64_t chiplet_base = (uint64_t)chiplet_id * R100_CHIPLET_OFFSET;
     char name[64];
@@ -620,6 +623,33 @@ static void r100_chiplet_init(MachineState *machine, int chiplet_id,
             memory_region_add_subregion_overlap(
                 cfg_mr, dcls[k].base - R100_CFG_BASE,
                 sysbus_mmio_get_region(sbd, 0), 1);
+
+            /* M9-1c: wire each (slot, cmd_type) GPIO output to the
+             * matching DNC SPI on this chiplet's GIC. q-cp on CP1 binds
+             * dnc_X_done_handler to all six DNC INTIDs per slot via
+             * gic_irq_connect; we only synthesise the four
+             * non-EXCEPTION lines (COMPUTE / UDMA / UDMA_LP / UDMA_ST,
+             * cmd_type 0..3). The done-passage discriminator
+             * cfg1.queue is 2 bits so cmd_type 4 (TASK16B) is never
+             * actually triggered from put_urq_task — leave its line
+             * unwired (sysbus_init_irq still allocates the slot). */
+            for (uint32_t slot = 0; slot < R100_DNC_SLOT_COUNT; slot++) {
+                for (uint32_t ct = 0; ct < R100_HW_SPEC_DNC_CMD_TYPE_NUM;
+                     ct++) {
+                    uint32_t global_dnc_id =
+                        dcls[k].dcl_id * R100_DNC_SLOT_COUNT + slot;
+                    uint32_t intid = r100_dnc_intid(global_dnc_id, ct);
+                    int gpio_idx =
+                        slot * R100_HW_SPEC_DNC_CMD_TYPE_NUM + ct;
+
+                    if (intid == 0) {
+                        continue;
+                    }
+                    sysbus_connect_irq(sbd, gpio_idx,
+                        qdev_get_gpio_in(gic_dev,
+                            R100_INTID_TO_GIC_SPI_GPIO(intid)));
+                }
+            }
             (void)dcls[k].tag;
         }
     }
@@ -829,7 +859,12 @@ static void r100_soc_init(MachineState *machine)
         qdev_prop_set_uint32(gic_dev[chiplet], "num-cpu", cpus_per_gic);
         qdev_prop_set_uint32(gic_dev[chiplet], "first-cpu-index",
                              (uint32_t)chiplet * cpus_per_gic);
-        qdev_prop_set_uint32(gic_dev[chiplet], "num-irq", 256);
+        /* num-irq covers up to INTID num-irq-1. q-cp's interrupt.h
+         * enum reaches INT_ID_RBDMA0_ERR = 977; M9-1c only wires
+         * DNC SPIs (max INTID 617 = DNC15_TASK16B) but a future
+         * round of HAL wiring may need any of the higher IDs, so
+         * size for the full distributor. */
+        qdev_prop_set_uint32(gic_dev[chiplet], "num-irq", 992);
         qdev_prop_set_uint32(gic_dev[chiplet], "revision", 3);
         {
             QList *redist = qlist_new();
@@ -861,7 +896,9 @@ static void r100_soc_init(MachineState *machine)
             /* Wire gtimer outputs → GIC PPI inputs (layout mirrors
              * hw/arm/virt.c). FreeRTOS tick is CNTVIRQ (PPI 27); without
              * this wiring vTaskDelay never fires — commit 680f964.
-             * GICv3 PPI index = (num_irq - GIC_INTERNAL) + i*32 + ppi. */
+             * GICv3 PPI index = (num_irq - GIC_INTERNAL) + i*32 + ppi.
+             * Keep in sync with the num-irq above (992 → SPI count
+             * 960 → PPI region starts at gpio_in[960]). */
             {
                 static const int gt_ppi[NUM_GTIMERS] = {
                     [GTIMER_PHYS]    = ARCH_TIMER_NS_EL1_IRQ,      /* 30 */
@@ -870,7 +907,7 @@ static void r100_soc_init(MachineState *machine)
                     [GTIMER_SEC]     = ARCH_TIMER_S_EL1_IRQ,       /* 29 */
                     [GTIMER_HYPVIRT] = ARCH_TIMER_NS_EL2_VIRT_IRQ, /* 28 */
                 };
-                const int intidbase = (256 - GIC_INTERNAL) + local * 32;
+                const int intidbase = (992 - GIC_INTERNAL) + local * 32;
 
                 for (unsigned t = 0; t < NUM_GTIMERS; t++) {
                     qdev_connect_gpio_out(
@@ -892,7 +929,8 @@ static void r100_soc_init(MachineState *machine)
         HostMemoryBackend *memdev = r100_soc_resolve_memdev(r100m);
         for (chiplet = 0; chiplet < R100_NUM_CHIPLETS; chiplet++) {
             r100_chiplet_init(machine, chiplet, sysmem,
-                              chiplet == 0 ? memdev : NULL);
+                              chiplet == 0 ? memdev : NULL,
+                              gic_dev[chiplet]);
         }
     }
 
@@ -1090,6 +1128,7 @@ static void r100_soc_init(MachineState *machine)
                                        r100m->cm7_debug_chardev_id,
                                        "cm7 debug");
                 DeviceState *cm7 = qdev_new(TYPE_R100_CM7);
+                DeviceState *hdma_dev = NULL;
 
                 if (cfg_chr) {
                     cfg_dbg = r100_soc_resolve_chr(
@@ -1102,6 +1141,29 @@ static void r100_soc_init(MachineState *machine)
                                   "hdma debug");
                 }
 
+                /* M9-1c: r100-hdma owns the `hdma` chardev (single-
+                 * frontend constraint) and exposes the dw_hdma_v0
+                 * MMIO window q-cp programs. Created before cm7 so
+                 * cm7's link can resolve. SPI 186 single line shared
+                 * across all 32 channels; per-channel pending lives
+                 * in SUBCTRL_EDMA_INT_CA73 (plain RAM in pcie-subctrl). */
+                hdma_dev = qdev_new(TYPE_R100_HDMA);
+                qdev_prop_set_uint32(hdma_dev, "chiplet-id", 0);
+                if (hdma_chr) {
+                    qdev_prop_set_chr(hdma_dev, "chardev", hdma_chr);
+                }
+                if (hdma_dbg) {
+                    qdev_prop_set_chr(hdma_dev, "debug-chardev", hdma_dbg);
+                }
+                sysbus_realize_and_unref(SYS_BUS_DEVICE(hdma_dev),
+                                         &error_fatal);
+                sysbus_mmio_map(SYS_BUS_DEVICE(hdma_dev), 0,
+                                R100_HDMA_BASE);
+                sysbus_connect_irq(SYS_BUS_DEVICE(hdma_dev), 0,
+                                   qdev_get_gpio_in(gic_dev[0],
+                                       R100_INTID_TO_GIC_SPI_GPIO(
+                                           R100_INT_ID_HDMA)));
+
                 qdev_prop_set_chr(cm7, "chardev", chr);
                 if (dbg) {
                     qdev_prop_set_chr(cm7, "debug-chardev", dbg);
@@ -1111,12 +1173,6 @@ static void r100_soc_init(MachineState *machine)
                 }
                 if (cfg_dbg) {
                     qdev_prop_set_chr(cm7, "cfg-debug-chardev", cfg_dbg);
-                }
-                if (hdma_chr) {
-                    qdev_prop_set_chr(cm7, "hdma-chardev", hdma_chr);
-                }
-                if (hdma_dbg) {
-                    qdev_prop_set_chr(cm7, "hdma-debug-chardev", hdma_dbg);
                 }
                 if (cm7_dbg) {
                     qdev_prop_set_chr(cm7, "cm7-debug-chardev", cm7_dbg);
@@ -1141,6 +1197,9 @@ static void r100_soc_init(MachineState *machine)
                 }
                 object_property_set_link(OBJECT(cm7), "mbtq-mailbox",
                                          OBJECT(mbx_mbtq_dev),
+                                         &error_fatal);
+                object_property_set_link(OBJECT(cm7), "hdma",
+                                         OBJECT(hdma_dev),
                                          &error_fatal);
                 sysbus_realize_and_unref(SYS_BUS_DEVICE(cm7),
                                          &error_fatal);

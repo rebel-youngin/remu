@@ -42,9 +42,27 @@
  *                     wire so rx_feed short-circuits payload
  *                     accumulation after decoding the header.
  *   +20 u32 req_id  = opaque tag echoed from REQ into matching RESP.
- *                     0 is reserved for untagged ops (OP_WRITE /
- *                     OP_CFG_WRITE from the QINIT stub pre-Stage-3c);
- *                     BD-done jobs use req_id = qid + 1.
+ *                     Partitioned across NPU-side senders so concurrent
+ *                     callers' RESPs disentangle without a dispatcher
+ *                     table per device:
+ *
+ *                       0x00         — untagged QINIT writes (r100-cm7).
+ *                       0x01..0x0F   — r100-cm7 BD-done per-queue
+ *                                      (req_id = qid + 1, qid < 16).
+ *                       0x40..0x7F   — reserved for future UMQ /
+ *                                      multi-queue work.
+ *                       0x80..0xBF   — r100-hdma MMIO-driven channel
+ *                                      ops, encoded as
+ *                                      0x80 | (dir<<5) | ch where dir=0
+ *                                      WR, dir=1 RD, ch in 0..15. See
+ *                                      R100_HDMA_REQ_ID_* in
+ *                                      r100/remu_addrmap.h.
+ *
+ *                     r100-hdma owns the host-side chardev backend
+ *                     (single-frontend) and dispatches each incoming
+ *                     OP_READ_RESP by req_id range — local for the
+ *                     0x80..0xBF channel ops, callback into r100-cm7
+ *                     for 0x01..0x0F.
  *   +24 u8  data[len]  (empty for OP_READ_REQ; mandatory for the rest)
  *
  * REMU_HDMA_HDR_SIZE = 24. Total on-wire per frame = 24 + len.

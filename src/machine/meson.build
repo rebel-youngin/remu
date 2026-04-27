@@ -12,6 +12,7 @@ arm_ss.add(files(
     'r100_dma.c',
     'r100_dnc.c',
     'r100_cm7.c',
+    'r100_hdma.c',
     'r100_imsix.c',
     'r100_logbuf.c',
     'r100_mailbox.c',
