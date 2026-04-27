@@ -214,9 +214,14 @@ NPU side, and `xp /1wx 0xf000200ffc` on the host monitor returns
 
 Pre-P1c, every queue-doorbell also pushed a 24 B `dnc_one_task`
 entry onto the q-cp DNC compute task queue (real `r100-mailbox`
-instance at `R100_PERI0_MAILBOX_M9_BASE`, chiplet 0). q-cp's
+instance at `R100_PERI0_MAILBOX_M9_BASE`, chiplet 0). P3 instantiated
+the other three task-queue mailboxes that q-cp's `_inst[]` table maps
+cmd_types onto — UDMA at `R100_PERI0_MAILBOX_M10_BASE`, UDMA_LP at
+`R100_PERI1_MAILBOX_M9_BASE`, UDMA_ST at `R100_PERI1_MAILBOX_M10_BASE`,
+all on chiplet 0 — so `mtq_init`'s ISSR writes land on real Samsung-IPM
+SFRs across all four cmd_types. q-cp's
 `taskmgr_fetch_dnc_task_master_cp1` polls `MBTQ_PI_IDX` (ISSR[0])
-on this mailbox; the push wakes that loop without IRQ wiring
+on each; the push wakes that loop without IRQ wiring
 (poll-based protocol). PCIE_CM7 firmware does this on silicon —
 REMU has no Cortex-M7 vCPU so `r100-cm7` took the role via
 `r100_mailbox_set_issr_words()` (in-process; no chardev). M9-1c

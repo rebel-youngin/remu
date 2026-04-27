@@ -1013,7 +1013,13 @@ static void r100_soc_init(MachineState *machine)
         R100SoCMachineState *r100m = R100_SOC_MACHINE(machine);
         DeviceState *mbx_vf0_dev;
         DeviceState *mbx_pf_dev;
-        DeviceState *mbx_mbtq_dev;
+        /* P3: q-cp's `_inst[HW_SPEC_DNC_QUEUE_NUM=4]` task-queue
+         * mailboxes — chiplet 0 only (q-cp/CP1 runs there). Indexed by
+         * cmd_type: [0]=COMPUTE, [1]=UDMA, [2]=UDMA_LP, [3]=UDMA_ST.
+         * cm7 currently only links to slot 0; the rest exist so
+         * mtq_init's MBTQ_PI_IDX/CI_IDX writes find a real Samsung-IPM
+         * SFR (not lazy RAM that aliases other writes). */
+        DeviceState *mbx_mbtq_dev[4];
         DeviceState *imsix_dev = NULL;
         Chardev *issr_chr = NULL;
         Chardev *issr_dbg = NULL;
@@ -1061,21 +1067,39 @@ static void r100_soc_init(MachineState *machine)
         sysbus_mmio_map_overlap(SYS_BUS_DEVICE(mbx_pf_dev), 0,
                                 R100_PCIE_MAILBOX_PF_BASE, 10);
 
-        /* Compute task-queue mailbox at PERI0_MAILBOX_M9_CPU1
+        /* P3: task-queue mailboxes at PERI{0,1}_MAILBOX_M{9,10}_CPU1
          * (chiplet 0). q-cp's CP1.cpu0 polls MBTQ_PI_IDX (ISSR[0])
-         * here from taskmgr_fetch_dnc_task_master_cp1; r100-cm7
-         * publishes dnc_one_task entries on each command-queue
-         * doorbell. Poll-based (no IRQ wiring); the mailbox is just
-         * the shared scratch ring. Replaces the lazy-RAM placeholder
-         * for this slot — the chiplet/mailbox loop below skips
-         * (cl=0,j=0). */
-        mbx_mbtq_dev = qdev_new(TYPE_R100_MAILBOX);
-        qdev_prop_set_string(mbx_mbtq_dev, "name",
-                             "peri0_m9_cpu1.chiplet0");
-        sysbus_realize_and_unref(SYS_BUS_DEVICE(mbx_mbtq_dev),
-                                 &error_fatal);
-        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(mbx_mbtq_dev), 0,
-                                R100_PERI0_MAILBOX_M9_BASE, 10);
+         * across all four from taskmgr_fetch_dnc_task_master_cp1, one
+         * per cmd_type (COMPUTE/UDMA/UDMA_LP/UDMA_ST). Poll-based (no
+         * IRQ wiring); each mailbox is just the shared scratch ring
+         * for its cmd_type. Replaces the lazy-RAM placeholders for
+         * these four slots — the chiplet/mailbox loop below skips
+         * (cl=0, j=0..3). */
+        {
+            static const struct {
+                const char *name;
+                uint64_t base;
+            } mbtq_slots[ARRAY_SIZE(mbx_mbtq_dev)] = {
+                { "peri0_m9_cpu1.chiplet0",
+                  R100_PERI0_MAILBOX_M9_BASE },   /* COMPUTE */
+                { "peri0_m10_cpu1.chiplet0",
+                  R100_PERI0_MAILBOX_M10_BASE },  /* UDMA */
+                { "peri1_m9_cpu1.chiplet0",
+                  R100_PERI1_MAILBOX_M9_BASE },   /* UDMA_LP */
+                { "peri1_m10_cpu1.chiplet0",
+                  R100_PERI1_MAILBOX_M10_BASE },  /* UDMA_ST */
+            };
+
+            for (size_t i = 0; i < ARRAY_SIZE(mbtq_slots); i++) {
+                mbx_mbtq_dev[i] = qdev_new(TYPE_R100_MAILBOX);
+                qdev_prop_set_string(mbx_mbtq_dev[i], "name",
+                                     mbtq_slots[i].name);
+                sysbus_realize_and_unref(SYS_BUS_DEVICE(mbx_mbtq_dev[i]),
+                                         &error_fatal);
+                sysbus_mmio_map_overlap(SYS_BUS_DEVICE(mbx_mbtq_dev[i]), 0,
+                                        mbtq_slots[i].base, 10);
+            }
+        }
 
         /*
          * Integrated MSI-X trigger (M7, commit db3d1df). Snoops FW
@@ -1218,8 +1242,14 @@ static void r100_soc_init(MachineState *machine)
                                              OBJECT(imsix_dev),
                                              &error_fatal);
                 }
+                /* cm7's mbtq stub only ever pushed COMPUTE entries
+                 * (qid → bit on INTGR1, not cmd_type), and the stub
+                 * defaults off post-P1c with retirement scheduled in
+                 * P7. Link slot 0 only; the other three task-queue
+                 * mailboxes exist so q-cp/CP0's per-cmd_type push
+                 * (the honest path) lands on real Samsung-IPM SFRs. */
                 object_property_set_link(OBJECT(cm7), "mbtq-mailbox",
-                                         OBJECT(mbx_mbtq_dev),
+                                         OBJECT(mbx_mbtq_dev[0]),
                                          &error_fatal);
                 object_property_set_link(OBJECT(cm7), "hdma",
                                          OBJECT(hdma_dev),
@@ -1280,10 +1310,12 @@ static void r100_soc_init(MachineState *machine)
                 MemoryRegion *mr;
                 char nm[64];
 
-                /* PERI0_MAILBOX_M9 chiplet-0 has a real r100-mailbox
-                 * (q-cp DNC compute task queue) — skip the lazy-RAM
-                 * placeholder so the two don't overlap. */
-                if (cl == 0 && j == 0) {
+                /* P3: all four task-queue slots on chiplet 0 are real
+                 * r100-mailbox blocks (q-cp DNC compute / UDMA /
+                 * UDMA_LP / UDMA_ST queues) — skip the lazy-RAM
+                 * placeholder so the two don't overlap. Other chiplets
+                 * keep lazy-RAM (q-cp CP1 only runs on chiplet 0). */
+                if (cl == 0) {
                     continue;
                 }
                 mr = g_new(MemoryRegion, 1);

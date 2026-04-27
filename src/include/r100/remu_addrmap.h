@@ -213,15 +213,33 @@
 #define R100_PERI0_UART0_BASE       0x1FF9040000ULL
 #define R100_PERI0_UART1_BASE       0x1FF9050000ULL
 #define R100_PERI0_GPIO_BASE        0x1FF90B0000ULL
-/* PERI0_MAILBOX_M9 — q-cp DNC compute task-queue Samsung-IPM SFR.
- * q-cp CP1.cpu0 sits in taskmgr_fetch_dnc_task_master_cp1 polling
- * MBTQ_PI_IDX (ISSR[0]) here (poll-based, no IRQ). On silicon
- * PCIE_CM7 firmware writes 24 B dnc_one_task entries + bumps PI to
- * dispatch work; REMU has no Cortex-M7 vCPU, so r100-cm7 takes that
- * role via r100_mailbox_set_issr_words(). M10 / PERI1 instances are
- * lazy-RAM until their consumers (udma / lpudma / studma queues)
- * are exercised. */
+/* PERI0_MAILBOX_M{9,10} / PERI1_MAILBOX_M{9,10} — q-cp DNC
+ * task-queue Samsung-IPM SFRs. q-cp CP1.cpu0 sits in
+ * taskmgr_fetch_dnc_task_master_cp1 polling MBTQ_PI_IDX (ISSR[0])
+ * across all four (poll-based, no IRQ). q-cp's
+ * `_inst[HW_SPEC_DNC_QUEUE_NUM=4]` table
+ * (`q/cp/src/task_mgr/cp1/mb_task_queue.c:44`) maps cmd_types ->
+ * mailbox indices:
+ *   [0] COMPUTE -> PERI0_MAILBOX_M9_CPU1
+ *   [1] UDMA    -> PERI0_MAILBOX_M10_CPU1
+ *   [2] UDMA_LP -> PERI1_MAILBOX_M9_CPU1
+ *   [3] UDMA_ST -> PERI1_MAILBOX_M10_CPU1
+ * (DDMA / DDMA_HIGHP exist as common_cmd_type enum values but flow
+ * through the auto-fetch DDMA_AF path, not these mailboxes.)
+ *
+ * On silicon PCIE_CM7 firmware writes 24 B dnc_one_task entries +
+ * bumps PI to dispatch work; REMU has no Cortex-M7 vCPU, so
+ * r100-cm7 takes that role via r100_mailbox_set_issr_words() — but
+ * only for the COMPUTE slot today (the cm7 mbtq stub is default off
+ * post-P1c and only ever pushed COMPUTE entries; q-cp on CP0 owns
+ * the real per-cmd_type push). All four are nevertheless
+ * instantiated as real r100-mailbox blocks on chiplet 0 (P3) so
+ * mtq_init's writes to MBTQ_PI_IDX/CI_IDX persist correctly across
+ * cmd_types. */
 #define R100_PERI0_MAILBOX_M9_BASE  0x1FF9140000ULL
+#define R100_PERI0_MAILBOX_M10_BASE 0x1FF9150000ULL
+#define R100_PERI1_MAILBOX_M9_BASE  0x1FF9940000ULL
+#define R100_PERI1_MAILBOX_M10_BASE 0x1FF9950000ULL
 
 /* --- PERI1 block --- */
 #define R100_PERI1_CMU_BASE         0x1FF9800000ULL
