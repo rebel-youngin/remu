@@ -151,6 +151,7 @@ DECLARE_INSTANCE_CHECKER(R100SoCMachineState, R100_SOC_MACHINE,
 
 #include "r100_mailbox.h"               /* TYPE_R100_MAILBOX + helpers */
 #include "r100_imsix.h"                 /* TYPE_R100_IMSIX + notify helper */
+#include "r100_rbdma.h"                 /* TYPE_R100_RBDMA */
 
 #define TYPE_R100_CMU           "r100-cmu"
 #define TYPE_R100_PMU           "r100-pmu"
@@ -164,7 +165,6 @@ DECLARE_INSTANCE_CHECKER(R100SoCMachineState, R100_SOC_MACHINE,
 #define TYPE_R100_PVT           "r100-pvt"
 #define TYPE_R100_LOGBUF        "r100-logbuf-tail"
 #define TYPE_R100_DNC_CLUSTER   "r100-dnc-cluster"
-#define TYPE_R100_RBDMA         "r100-rbdma"
 #define TYPE_R100_CM7           "r100-cm7"
 #define TYPE_R100_IMSIX         "r100-imsix"
 #define TYPE_R100_HDMA          "r100-hdma"

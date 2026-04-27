@@ -261,6 +261,34 @@ DNC1=422…) and latches a synthesised `dnc_reg_done_passage` at
 slot+0xA00 so q-cp's `dnc_X_done_handler` reads a coherent record.
 GIC `num-irq` was bumped 256 → 992 so the wider DNC INTID set fits.
 
+#### r100-rbdma (P4A — DDMA / DDMA_HIGHP cmd_types)
+
+Per-chiplet `r100-rbdma` device (QOM type `r100-rbdma`, MMIO at
+`R100_NBUS_L_RBDMA_CFG_BASE = 0x1FF3700000`, 1 MB) extracted from the
+prior passive RBDMA section that lived inside `r100_dnc.c`. Models the
+RBDMA register block defined by the q-cp HAL autogen
+(`g_rbdma_memory_map.h` / `g_cdma_global_registers.h` /
+`g_cdma_task_registers.h`). Sparse `R100RBDMARegStore` (GHashTable
+offset → u32, mirror of `r100-dnc` / `r100-hbm`) so q-cp's RMW init
+sequences round-trip. Synthetic IP_INFO seeds (info0..5) so
+`rbdma_get_ip_info` / `rbdma_update_credit` see plausible silicon
+shape: 8 TEs, 32-deep TQ / UTQ / PTQ / TEQ / FNSH FIFO. Without these,
+the original passive-zero stub left credit at zero and q-cp would
+never push a task. NORMALTQUEUE / URGENTTQUEUE / PTQUEUE status reads
+return the configured queue depth ("all free between kicks"). Kick on
+the final descriptor word: q-cp's `rbdma_send_task` writes 8 ascending
+words into `RBDMA_CDMA_TASK_BASE_OFF = 0x200`, ending on `RUN_CONF1`
+(`+0x01C`). The store on RUN_CONF1 captures the regstore-resident
+PTID_INIT, pushes an `R100RBDMAFnshEntry` onto a 32-deep ring, and
+schedules a BH that pulses `INT_ID_RBDMA1 = 978` per pushed entry
+whose `RUN_CONF1.intr_disable` bit is clear. q-cp's `rbdma_done_handler`
+then loops on `INTR_FIFO_READABLE_NUM` (live `fnsh_depth() & 0xFF`,
+served above the regstore) and pops `FNSH_INTR_FIFO` (decrements the
+ring head and returns `ptid_init`). `intr_disable=1` (q-cp's
+`dump_shm` / `shm_clear` paths) still pushes the FIFO entry but
+skips the GIC pulse. ERR slot (`INT_ID_RBDMA0_ERR = 977`, idx 0) is
+reserved for symmetry — never pulsed today.
+
 Both QEMUs `mmap` the same 128 MB `/dev/shm/remu-<name>/remu-shm` with
 `share=on`. Splice points (same backend, two places):
 
@@ -324,6 +352,13 @@ cleanup so SIGKILL'd prior state never poisons the next:
 - `tests/m8_issr_test.py` — two phases against two minimal QEMUs: NPU
   writes ISSR → host BAR4 shadow mirror via `xp`; host writes BAR4 →
   NPU mailbox ISSR update without spurious GIC SPI.
+- `tests/p4a_rbdma_stub_test.py` — `--host` smoke; HMP `xp` against
+  chiplet-0 `r100-rbdma` at `0x1FF3700000` asserts `IP_INFO3.num_of_executer = 8`,
+  `NORMALTQUEUE_STATUS = 32`, `PTQUEUE_STATUS = 32`, `INTR_FIFO_NUM = 0`
+  (idle). Kick path is exercised end-to-end once a real workload reaches
+  P10 — there's no synthetic injector because the silicon trigger
+  sequence (8-word descriptor with PTID_INIT then RUN_CONF1) is awkward
+  to drive purely via HMP.
 
 All `./remucli run` invocations write into `output/<name>/` (or
 `output/run-<timestamp>/` if `--name` omitted). Never pass `/tmp/`
@@ -381,6 +416,8 @@ src/machine/          NPU-side QEMU device models (symlinked into external/qemu/
                         r100_pcie_outbound.c PCIe outbound iATU stub —
                                             chiplet-0 4 GB AXI window
                                             tunnelled over `hdma` chardev (P1a)
+                        r100_rbdma.{c,h}    RBDMA reg block — sparse regstore +
+                                            kick → BH → done IRQ; per-chiplet (P4A)
                         r100_<dev>.c        one file per device (state struct private)
 src/host/             Host-side (x86 guest) PCI device models (symlinked into external/qemu/hw/misc/r100-host/)
 src/include/          Added to -I during QEMU configure

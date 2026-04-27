@@ -19,6 +19,7 @@ arm_ss.add(files(
     'r100_mailbox.c',
     'r100_pmu.c',
     'r100_pvt.c',
+    'r100_rbdma.c',
     'r100_smmu.c',
     'r100_sysreg.c',
     'r100_hbm.c',

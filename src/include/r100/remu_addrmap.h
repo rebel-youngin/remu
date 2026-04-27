@@ -496,6 +496,18 @@ static inline uint32_t r100_dnc_intid(uint32_t dnc_id, uint32_t cmd_type)
 #define R100_INT_ID_HDMA                186u
 #define R100_PCIE_SUBCTRL_EDMA_INT_CA73_OFF 0x4368u   /* in subctrl 64 KB */
 
+/* RBDMA INTIDs (q/cp/include/hal/interrupt.h:69-70).
+ *   INT_ID_RBDMA0_ERR = 977 — error / abort path (REMU never synthesises).
+ *   INT_ID_RBDMA1     = 978 — finish-FIFO completion line driven by the
+ *                            r100-rbdma kick-BH (P4A; see r100_rbdma.c).
+ * Both are within `num-irq = 992` configured on the per-chiplet GICv3
+ * in r100_soc.c. Per-chiplet wiring: q-cp's `rbdma_init(cl_id)` runs on
+ * every CA73 CP0 and binds rbdma_done_handler to INT_ID_RBDMA1 on its
+ * local GIC, so each chiplet's r100-rbdma must connect its done line to
+ * the matching gic_dev[chiplet]. */
+#define R100_INT_ID_RBDMA0_ERR          977u
+#define R100_INT_ID_RBDMA1              978u
+
 /* HDMA register block (q/cp/src/hal/hdma/hdma_if.c hdma_init_dev).
  *   hdma_base = cl_id * CHIPLET_INTERVAL + U_PCIE_CORE_OFFSET +
  *               PCIE_HDMA_OFFSET

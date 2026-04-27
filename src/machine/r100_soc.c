@@ -654,6 +654,13 @@ static void r100_chiplet_init(MachineState *machine, int chiplet_id,
         }
     }
 
+    /* P4A — r100-rbdma functional stub. Per-chiplet instantiation
+     * because q-cp's rbdma_init(cl_id) runs on every CA73 CP0 (and
+     * binds rbdma_done_handler to INT_ID_RBDMA1 on its local GIC). The
+     * device exposes two GPIO-out lines: idx 0 = INT_ID_RBDMA0_ERR
+     * (reserved, never pulsed) and idx 1 = INT_ID_RBDMA1 (fnsh-FIFO
+     * completion line driven by the kick-BH). Prio 1 in cfg_mr beats
+     * the chiplet-wide unimpl catch-all. */
     {
         DeviceState *dev = qdev_new(TYPE_R100_RBDMA);
         SysBusDevice *sbd;
@@ -664,6 +671,13 @@ static void r100_chiplet_init(MachineState *machine, int chiplet_id,
         memory_region_add_subregion_overlap(
             cfg_mr, R100_NBUS_L_RBDMA_CFG_BASE - R100_CFG_BASE,
             sysbus_mmio_get_region(sbd, 0), 1);
+
+        sysbus_connect_irq(sbd, 0,
+            qdev_get_gpio_in(gic_dev,
+                R100_INTID_TO_GIC_SPI_GPIO(R100_INT_ID_RBDMA0_ERR)));
+        sysbus_connect_irq(sbd, 1,
+            qdev_get_gpio_in(gic_dev,
+                R100_INTID_TO_GIC_SPI_GPIO(R100_INT_ID_RBDMA1)));
     }
 
     r100_create_pcie_subctrl(cfg_mr, chiplet_id);

@@ -2370,6 +2370,12 @@ TEST_REGISTRY = {
         "desc": "M8 ISSR bridge: NPU↔host both-direction shadow",
         "needs": ("aarch64", "x86_64"),
     },
+    "p4a": {
+        "script": "tests/p4a_rbdma_stub_test.py",
+        "run_name": "p4a-rbdma",
+        "desc": "P4A r100-rbdma stub: IP_INFO seeds + queue-credit + idle FIFO",
+        "needs": ("aarch64", "x86_64"),
+    },
 }
 
 TEST_KEYS = list(TEST_REGISTRY.keys())

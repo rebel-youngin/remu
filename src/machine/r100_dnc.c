@@ -1,8 +1,8 @@
 /*
  * REMU - R100 NPU System Emulator
- * D-Cluster (DNC/SHM/MGLUE) and RBDMA config-space stubs.
+ * D-Cluster (DNC/SHM/MGLUE) config-space stub.
  *
- * q-cp's task init on CP1 touches three sets of registers that BL2/BL31 /
+ * q-cp's task init on CP1 touches two sets of registers that BL2/BL31 /
  * FreeRTOS on CP0 never poke. Without stubs they fall through to the
  * chiplet-wide cfg_mr unimpl catch-all and every read returns 0, so
  * `cp_create_tasks_impl` deadlocks on SHM TPG training ~35 s into boot:
@@ -20,21 +20,20 @@
  *      and failure calls `abort_event(ERR_SHM)` — fatal. First read
  *      of INTR_VEC must already have tpg_done=1.
  *
- *   3. `rbdma_get_ip_info()` — external/.../q/cp/src/hal/rbdma/... —
- *      reads RBDMA_IP_INFO0/1/2/3/4/5 at NBUS_L_RBDMA_CFG_BASE and
- *      logs them. Not a poll, but FW prints `rel_date: 0 rbdma ver: 0`
- *      when all zero. Seed plausible constants for cleaner logs.
- *
- * The two device types here are sparse register files (GHashTable
- * write-back, same pattern as r100_hbm.c) with a small set of
- * read-side overrides per the above. Each DCL instance covers the
- * full 1 MB DCL CFG window so DNC-slot / SHM-bank / MGLUE-register
- * traffic all lands on the same device without per-slot plumbing.
+ * The device type here is a sparse register file (GHashTable
+ * write-back, same pattern as r100_hbm.c / r100_rbdma.c) with a
+ * small set of read-side overrides per the above. Each DCL instance
+ * covers the full 1 MB DCL CFG window so DNC-slot / SHM-bank /
+ * MGLUE-register traffic all lands on the same device without per-
+ * slot plumbing.
  *
  * Mapping in src/machine/r100_soc.c: two `r100-dnc-cluster` instances
  * per chiplet (DCL0 at 0x1FF2000000, DCL1 at 0x1FF2800000), each as a
  * priority-1 subregion of cfg_mr so it outranks the unimpl catch-all.
- * One `r100-rbdma` per chiplet at 0x1FF3700000.
+ *
+ * RBDMA used to share this file as a small passive sibling section
+ * (see commit 4a76ce6); P4A carved it out into r100_rbdma.{c,h} when
+ * it grew an active kick → done IRQ path.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -181,27 +180,7 @@
 #define RDSN_RPT0_VALID_PASS        0x00000006
 
 /* ========================================================================
- * RBDMA register layout (offsets from NBUS_L_RBDMA_CFG_BASE)
- * ======================================================================== */
-
-/* g_cdma_global_registers.h */
-#define RBDMA_IP_INFO0_OFF      0x000
-#define RBDMA_IP_INFO1_OFF      0x004
-#define RBDMA_IP_INFO2_OFF      0x008
-#define RBDMA_IP_INFO3_OFF      0x00C
-#define RBDMA_IP_INFO4_OFF      0x010
-#define RBDMA_IP_INFO5_OFF      0x014
-
-/*
- * Seed values. rel_date is a plausible hex-encoded date (0x20260101).
- * ip_info1: {min_ver=0, maj_ver=1, rbdma_ver=1, ip_id=1}.
- * ip_info2: FW writes chiplet_id here — leave accept-and-remember.
- */
-#define RBDMA_INFO0_REL_DATE    0x20260101U
-#define RBDMA_INFO1_SEED        ((1U << 24) | (1U << 16) | (1U << 8) | 0U)
-
-/* ========================================================================
- * Shared sparse register file (like r100_hbm.c)
+ * Sparse register file (like r100_hbm.c)
  * ======================================================================== */
 
 typedef struct R100RegStore {
@@ -645,112 +624,11 @@ static const TypeInfo r100_dnc_info = {
     .class_init = r100_dnc_class_init,
 };
 
-/* ========================================================================
- * r100-rbdma device (NBUS_L_RBDMA CFG window, 1 MB)
- * ======================================================================== */
-
-struct R100RBDMAState {
-    SysBusDevice parent_obj;
-
-    MemoryRegion iomem;
-    R100RegStore store;
-    uint32_t chiplet_id;
-};
-typedef struct R100RBDMAState R100RBDMAState;
-
-DECLARE_INSTANCE_CHECKER(R100RBDMAState, R100_RBDMA, TYPE_R100_RBDMA)
-
-static uint32_t rbdma_default(hwaddr addr, uint32_t chiplet_id)
-{
-    switch (addr) {
-    case RBDMA_IP_INFO0_OFF:
-        return RBDMA_INFO0_REL_DATE;
-    case RBDMA_IP_INFO1_OFF:
-        return RBDMA_INFO1_SEED;
-    case RBDMA_IP_INFO2_OFF:
-        /*
-         * {chiplet_id:8, reserved:24}. FW writes this during bring-up
-         * so this default only covers the first read; it's overwritten
-         * by rbdma_get_ip_info()'s `info2.chiplet_id = cl_id` store.
-         */
-        return chiplet_id & 0xFFU;
-    default:
-        return 0;
-    }
-}
-
-static uint64_t r100_rbdma_read(void *opaque, hwaddr addr, unsigned size)
-{
-    R100RBDMAState *s = R100_RBDMA(opaque);
-    uint32_t stored;
-
-    if (regstore_lookup(&s->store, addr, &stored)) {
-        return stored;
-    }
-    return rbdma_default(addr, s->chiplet_id);
-}
-
-static void r100_rbdma_write(void *opaque, hwaddr addr, uint64_t val,
-                             unsigned size)
-{
-    R100RBDMAState *s = R100_RBDMA(opaque);
-
-    regstore_store(&s->store, addr, (uint32_t)val);
-}
-
-static const MemoryRegionOps r100_rbdma_ops = {
-    .read = r100_rbdma_read,
-    .write = r100_rbdma_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .impl.min_access_size = 4,
-    .impl.max_access_size = 4,
-};
-
-static void r100_rbdma_realize(DeviceState *dev, Error **errp)
-{
-    R100RBDMAState *s = R100_RBDMA(dev);
-    char name[64];
-
-    snprintf(name, sizeof(name), "r100-rbdma.cl%u", s->chiplet_id);
-    regstore_init(&s->store);
-    memory_region_init_io(&s->iomem, OBJECT(dev), &r100_rbdma_ops, s,
-                          name, R100_NBUS_L_RBDMA_CFG_SIZE);
-    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
-}
-
-static void r100_rbdma_reset(DeviceState *dev)
-{
-    R100RBDMAState *s = R100_RBDMA(dev);
-    regstore_reset(&s->store);
-}
-
-static Property r100_rbdma_properties[] = {
-    DEFINE_PROP_UINT32("chiplet-id", R100RBDMAState, chiplet_id, 0),
-    DEFINE_PROP_END_OF_LIST(),
-};
-
-static void r100_rbdma_class_init(ObjectClass *oc, void *data)
-{
-    DeviceClass *dc = DEVICE_CLASS(oc);
-
-    dc->realize = r100_rbdma_realize;
-    device_class_set_legacy_reset(dc, r100_rbdma_reset);
-    device_class_set_props(dc, r100_rbdma_properties);
-}
-
-static const TypeInfo r100_rbdma_info = {
-    .name = TYPE_R100_RBDMA,
-    .parent = TYPE_SYS_BUS_DEVICE,
-    .instance_size = sizeof(R100RBDMAState),
-    .class_init = r100_rbdma_class_init,
-};
-
 /* ======================================================================== */
 
 static void r100_dnc_register_types(void)
 {
     type_register_static(&r100_dnc_info);
-    type_register_static(&r100_rbdma_info);
 }
 
 type_init(r100_dnc_register_types)
