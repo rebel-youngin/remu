@@ -92,11 +92,23 @@ auto-verifies its bridge via `info pci/mtree/qtree` — see the checklist in
 
 #### M9-1 sub-milestones (mailbox / DNC / HDMA infrastructure)
 
-PCIE_CM7 walks BDs directly for simple packets and forwards DNC tasks
-to q-cp via the `PERI0_MAILBOX_M9_CPU1` compute task queue
-(`mb_task_queue.c`). REMU has no Cortex-M7 vCPU, so `r100-cm7`
-emulates PCIE_CM7's effect on this path. M9-1b/1c land the
-infrastructure required by every later milestone.
+The M9 mailbox is a CA73 **CP0 → CP1** task queue, both ends of
+which live in q-cp firmware: q-cp on CP0 builds a `dnc_one_task`
+inside `cb_parse_*` and calls `mtq_push_task`
+(`q/cp/src/task_mgr/task_manager.c:515` + `cp1/mb_task_queue.c:66`)
+to write into `PERI0_MAILBOX_M9_CPU1`; q-cp on CP1's
+`taskmgr_fetch_dnc_task_master_cp1` polls `MBTQ_PI_IDX` and pops
+via `mtq_pop_task` (`cp1/fetch_task.c:231`). PCIE_CM7 is not on
+this path — its silicon role is PCIE link bring-up, BAR
+programming, reset coordination, and doorbell forwarding. The
+reason `r100-cm7` performs the mbtq push today is that Stage 3c
+short-circuits q-cp's CP0 work before `cb_task` ever runs, so the
+natural CP0-side push never fires; r100-cm7 fakes one to keep CP1's
+fetch loop alive. Once Stages 3a/3c retire (P2/P3/P8), the push
+moves back to q-cp on CP0 and r100-cm7's stub deletes. M9-1b/1c
+nevertheless land real infrastructure (the M9 mailbox device, the
+DNC done-IRQ path, and the `r100-hdma` register block) that every
+later milestone depends on.
 
 | Stage | What | Status | Commit |
 |---|---|---|---|
@@ -206,48 +218,79 @@ side of silicon that actually owns it.
 
 ### Diagnosis
 
-Two structural lies stack inside today's `r100-cm7`:
+Today's `r100-cm7` carries one structural lie: it fakes the *entire*
+host-submitted-BD lifecycle (BD read, CB walk, engine dispatch, DONE
+writeback, MSI-X) inside a QEMU device, hiding work that on silicon
+is split across PCIE_CM7 hardware and q-cp firmware. Earlier drafts
+of this section called this "role conflation between PCIE_CM7 and
+q-cp" — that framing was itself imprecise. PCIE_CM7's silicon role
+is much narrower than "dispatch": it does PCIE link bring-up, BAR
+programming, reset coordination, and doorbell forwarding. **Both
+BD reading and CB packet dispatch are q-cp on CA73**, fully
+implemented in `external/ssw-bundle/products/rebel/q/cp/src/`.
 
-1. **Role conflation.** `r100-cm7` impersonates *both* PCIE_CM7 (BD
-   walking, packet dispatch) and q-cp (BD.DONE writeback, MSI-X
-   trigger). Real silicon splits these — PCIE_CM7 dispatches; q-cp's
-   `cb_complete` (`q/cp/src/cb_mgr/command_buffer_manager.c:882`)
-   is what writes `BD.header |= BD_FLAGS_DONE` (line 906), calls
-   `hil_set_cq_di` (line 909), and invokes `pcie_msix_trigger`
-   (line 952). Stage 3c's BD-done state machine takes q-cp's job.
-   `rbln_queue_test` does not catch the lie because the test only
-   asserts that DONE arrives — it does not validate which side wrote
-   it, in which order, with which side-effects.
+| Job | Real silicon | Today's REMU |
+|---|---|---|
+| BAR4 doorbell → IRQ to CA73 | PCIE_CM7 + chiplet mailbox HW | `r100-cm7` bridge + `r100-mailbox` (M6/M8a — honest) |
+| Read BD (`header / addr / size / cb_jd_addr`) | q-cp `hq_task` on CA73 CP0.cpu0 (`q/cp/src/hq_mgr/host_queue_manager.c:300+`) | Stage 3c reads it inside `r100-cm7` and ignores most fields |
+| Walk CB at `bd->addr`, dispatch packets | q-cp `cb_task` → `cb_parse_*` on CA73 CP0.cpu0 (`q/cp/src/cb_mgr/command_buffer_manager.c:1197/1378`) | Stage 3c skips the walk; synthesises `cmd_type = COMPUTE` regardless of CB content |
+| Push DNC compute tasks to q-cp/CP1 | q-cp on CA73 CP0 (`task_mgr/task_manager.c:515 mtq_push_task`) | M9-1b/1c push from `r100-cm7` (placeholder; q-cp/CP0 never gets the chance) |
+| Program engines (DNC / RBDMA / HDMA) | q-cp HAL drivers writing engine MMIO | Engine MMIO partly modelled (DNC done-IRQ ✓, HDMA reg block ✓, RBDMA pending P5A); q-cp never programs them because Stage 3c short-circuits the chain |
+| Mark `BD.header \|= DONE`, advance `cq.di`, fire MSI-X | q-cp `cb_complete` on CA73 CP0.cpu0 (`command_buffer_manager.c:882`) | Stage 3c does it from inside `r100-cm7` — the lie |
 
-2. **Engine bypass.** Because no `r100-rbdma` exists and no real DNC
-   executor exists, even the dispatch lie is shallow — `r100-cm7`
-   always synthesises `cmd_type = COMPUTE` rather than parsing the
-   BD's real packet stream (`PACKET_NOP/WRITE_DATA/CTX_DMA/LINKED_DMA/
-   FLUSH/LIN_DMA` from `qman_if_common.h`) plus `cb_jd_addr`. This is
-   downstream of the missing engine devices, not a root cause.
+The reason q-cp's existing parser is dormant is **not** that it is
+missing — `cb_parse_nop / write_data / linked_dma / lin_dma /
+ctx_dma / flush / barrier / extern_sync / ib / cb_header / sub_stream`
+all exist in `command_buffer_manager.c`. It is dormant because
+Stage 3c grabs the BD first, marks DONE, and there is nothing left
+for q-cp to act on. `rbln_queue_test` does not catch the lie because
+the test only asserts that DONE arrives — it does not validate which
+side wrote it, in which order, with which side-effects.
 
 ### Design principles
 
-1. **`r100-cm7` is PCIE_CM7 only.** It parses BD packet streams and
-   dispatches. It never writes `BD.header` and never calls
-   `r100_imsix_notify()`.
-2. **BD.DONE + MSI-X come from q-cp's `cb_complete`**, like silicon.
-   That requires a real `pcie_msix_trigger` on CP1 — an MMIO write to
-   `r100-imsix`, not a weak no-op.
-3. **One QEMU device per silicon engine** (DNC, RBDMA, HDMA, sync).
+1. **`r100-cm7` is a bridge, not a CPU emulation.** It owns the
+   doorbell ingress wire (BAR4 frames → mailbox INTGR / ISSR → GIC),
+   the BAR2 cfg-head shadow, and a small handful of stubs for
+   silicon behaviours REMU does not yet model (Stages 3a/3c — both
+   slated for retirement). It does not walk BDs, parse CBs, dispatch
+   packets, or fake completions on the honest path. The "CM7" in the
+   name refers to PCIE_CM7's silicon role as the BAR/doorbell front
+   door, not a claim that REMU runs Cortex-M7 firmware.
+2. **CB walking + dispatch lives in q-cp on CA73 CP0, unmodified.**
+   `hq_task` reads the BD; `cb_parse_*` walks the packet stream at
+   `bd->addr`; q-cp's HAL drivers program engine MMIO; q-cp's
+   `task_manager.c` builds the `dnc_one_task` and calls
+   `mtq_push_task` for CP1. REMU's job is to make the *engine
+   devices* respond to that programming — not to re-implement the
+   parser on the QEMU side.
+3. **BD.DONE + MSI-X come from q-cp's `cb_complete`**, like silicon.
+   `cb_complete` runs on CA73 CP0.cpu0 (`cb_task` is pinned to
+   `BIT(CPU_ID_0)` in `q/cp/src/cp_impl.c:84`). Its
+   `pcie_msix_trigger` call must resolve to a real MMIO write to
+   `r100-imsix` — already true in the CP0 image via
+   `q/sys/osl/FreeRTOS/Source/rbln/msix.c`; P1 below adds the same
+   symbol to the CP1 image as defensive coverage for latent callers
+   (e.g. `services/terminal_service/console_vserial.c`).
+4. **One QEMU device per silicon engine** (DNC, RBDMA, HDMA, sync).
    Per-engine fidelity may be staged (functional → behavioural), but
-   the kick / done interface is silicon-accurate so q-cp drives them
-   unmodified.
-4. **The mbtq carries real work.** `cmd_descr` is built from the
-   actual BD packet/CB content with the real `cmd_type`; the
-   COMPUTE-only synthesis dies.
-5. **All 6 task-queue mailboxes instantiated** — q-cp's
+   the kick / done interface is silicon-accurate so q-cp's existing
+   drivers drive them unmodified.
+5. **The mbtq carries real work.** Today the COMPUTE-only template
+   is synthesised by `r100-cm7` at queue-doorbell time (M9-1b/1c) as
+   scaffolding around Stage 3c. The honest version moves the push
+   back to q-cp on CP0, where `cb_parse_*` builds `cmd_descr` from
+   actual CB content with the real `cmd_type`; the QEMU-side
+   synthesis dies with Stage 3c.
+6. **All 6 task-queue mailboxes instantiated** — q-cp's
    `_inst[cmd_type]` table covers COMPUTE / UDMA / UDMA_LP / UDMA_ST
    / DDMA / DDMA_HIGHP; we instantiate all of them.
-6. **No new fw-patches.** Where FW symbols are missing on CP1
-   (`pcie_msix_trigger`), provide them as REMU-side platform objects
-   linked into the q-cp image at build time — a "platform link seam",
-   not a firmware patch. `cli/fw-patches/` stays empty in regression.
+7. **No new fw-patches.** Where FW symbols are missing in a given
+   image (`pcie_msix_trigger` in CP1's `rbln` library), provide them
+   as REMU-side platform objects injected at link time via the
+   existing `CP_LIB_PATH_CP{0,1}` env-var seam in
+   `q/sys/osl/FreeRTOS/Source/services/CMakeLists.txt` — never as a
+   firmware diff. `cli/fw-patches/` stays empty in regression.
 
 ### Milestones
 
@@ -255,9 +298,9 @@ Naming neutral — the M9-* labels are retired in favour of P*.
 
 | # | Milestone | Status | Notes |
 |---|---|---|---|
-| P1 | Real `pcie_msix_trigger` on CP1 — REMU-side platform object linked into q-cp's image, implements the symbol as a write to `R100_PCIE_IMSIX_BASE + 0xFFC` (the same MMIO `r100-imsix` traps for M7). q-sys/q-cp source stays byte-identical; `cli/fw-patches/` stays empty. Document the link seam in `docs/architecture.md`. | pending | unblocks honest `cb_complete` closure |
-| P2 | q-cp end-to-end on the existing COMPUTE synth — keep M9-1b/1c's mbtq push and synthesised `cmd_descr` (cmd_type=COMPUTE, no `cb_jd_addr` yet), but stop firing MSI-X from `r100-cm7`. Verify q-cp's CP1 worker pops mbtq → `dnc_send_task` → DNC stub `itdone` BH → `cb_complete` → BD.DONE writeback + MSI-X via P1's path → kmd sees completion. From this point on, half of Stage 3c is unnecessary. | pending | absorbs the old M9-2 verification step |
-| P3 | Packet stream parser in `r100-cm7` — replace Stage 3c's "read BD, ignore content, mark DONE" with a real walk of `bd.addr` for ci..pi. Inline-handle `PACKET_NOP/WRITE_DATA/FLUSH`. DMA-class packets (`PACKET_LIN_DMA/CTX_DMA/LINKED_DMA`) dispatch to the engine devices (P5/P6). Forward `bd.cb_jd_addr` to q-cp as a real CB submission — cmd_descr is built from the actual CB, not synthesised. Per-cmd_type routing into the right mbtq slot. `r100-cm7` no longer touches `BD.header`. | pending | requires P2; introduces real cmd_type discrimination |
+| P1 | Real `pcie_msix_trigger` linkage — the symbol's primary live caller (`cb_complete`) runs on CA73 CP0, where `q/sys/osl/FreeRTOS/Source/rbln/msix.c` already provides the implementation. CP1's `rbln` library omits `msix.c` (see its `CMakeLists.txt`), so latent CP1 callers (e.g. `services/terminal_service/console_vserial.c`) currently link against a weak/no-op stub. P1 closes that hole defensively: a REMU-owned shim (`src/fw-platform/cp1_msix.c`, byte-identical body to upstream `msix.c`) is compiled with the q-sys toolchain and `ar`-appended to a copy of `librebel-q-cp1.a`; the augmented archive is fed to q-sys via the existing `CP_LIB_PATH_CP1` env-var seam in `services/CMakeLists.txt`. q-sys / q-cp source stays byte-identical; `cli/fw-patches/` stays empty. Document the seam in `docs/architecture.md`. | pending | unblocks honest `cb_complete` closure on CP0 + insulates against CP1 latent callers |
+| P2 | q-cp end-to-end on the existing COMPUTE synth — keep M9-1b/1c's `r100-cm7`-driven mbtq push and synthesised `cmd_descr` (cmd_type=COMPUTE, no `cb_jd_addr` yet), but stop firing MSI-X from `r100-cm7`. Verify q-cp's CP1 worker pops mbtq → `dnc_send_task` → DNC stub `itdone` BH → q-cp on CP0's `cb_complete` → BD.DONE writeback + MSI-X via P1's path → kmd sees completion. From this point on, half of Stage 3c is unnecessary. | pending | absorbs the old M9-2 verification step |
+| P3 | Engine MMIO surface honest enough for q-cp's existing CB walker — q-cp on CA73 CP0 already implements packet parsing in full (`cb_parse_nop/write_data/linked_dma/lin_dma/ctx_dma/flush/...` in `q/cp/src/cb_mgr/command_buffer_manager.c`). The REMU-side work is to (a) stop Stage 3c from short-circuiting BD reads, so `hq_task` → `cb_task` actually wakes on host-submitted BDs, and (b) make each cmd_type's HAL writes land on a device that responds: DNC done IRQ (M9-1c ✓), HDMA kick/done (P6 — q-cp drives the same `dw_hdma_v0` channel registers M9-1c added), RBDMA kick/done (P5A). The mbtq push moves out of `r100-cm7`'s queue-doorbell stub and into q-cp on CP0, where `cmd_descr` is built from real CB content with the real `cmd_type`. `r100-cm7` no longer parses CBs, synthesises packets, or touches `BD.header`. | pending | requires P2 + P5A + P6; the parser already exists in firmware |
 | P4 | All 6 task-queue mailboxes instantiated — add UDMA / UDMA_LP / UDMA_ST / DDMA / DDMA_HIGHP `r100-mailbox` blocks at the M9 offsets (currently only COMPUTE). Wire ISSR shadow bypass (`r100_mailbox_set_issr_words`) for each. q-cp's `_inst[cmd_type]` per-cmd_type pollers all resolve. | pending | infrastructure for P3's per-cmd_type dispatch |
 | P5A | `r100-rbdma` device, functional stub — new `src/machine/r100_rbdma.{c,h}` modelling the RBDMA register block (base from `g_rbdma_memory_map.h`, layout from `rbdma_regs.h`). Per-channel state for WR + RD; kick register, done IRQ, status. GIC SPI lines wired into chiplet-0 GIC at the right INTIDs. Trap kick → BH-schedule fake done passage + GIC SPI; mirror of `r100-dnc` M9-1c. q-cp's `cb_complete` fires; no DMA performed. | pending | covers cmd_type ∈ {DDMA, DDMA_HIGHP} |
 | P5B | `r100-rbdma` behavioural — parse rbdma `task_type` (OTO/CST/DAS/PTL/IVL/DUM/VCM/OTM/GTH/SCT/GTHR/SCTR), execute via `address_space_read/write` between SAR and DAR, then fire done. Real tensor bytes move. Gated by workload need. | pending | depends on P5A |
@@ -275,9 +318,10 @@ Shortest path to honest end-to-end:
 1. **P1 → P2** — `rbln_queue_test` now passes via the real path
    (q-cp's `cb_complete`, not a QEMU shortcut). Half of Stage 3c is
    already dead weight.
-2. **P3 → P4** — real packet parse + all mailboxes. Any cmd_type the
-   host submits routes correctly, even if downstream engines are
-   stubs.
+2. **P3 → P4** — q-cp's existing `cb_parse_*` walker drives real
+   work, all six mailboxes are live, and every cmd_type the host
+   submits routes correctly through q-cp on CP0 — even if downstream
+   engines are stubs.
 3. **P5A + P6** — RBDMA + HDMA reachable as functional stubs. Every
    cmd_type completes through its real engine entry point.
 4. **P8** — delete Stage 3c. Single source of truth for BD lifecycle.
@@ -288,11 +332,13 @@ Shortest path to honest end-to-end:
    blocks something concrete (e.g. driver re-bind testing).
 
 After P1..P4 + P5A + P6 + P8 + P11 (eight milestones), every BD the
-host submits flows through the silicon-accurate path: PCIE_CM7
-parses → engine does (or fakes-but-reports) the work → q-cp's
-`cb_complete` writes DONE + MSI-X. No fake DONEs, no synthetic
-cmd_types, no QEMU-side completions. From that base, P5B / P7 / P10
-become real-tensor work, not architectural fixes.
+host submits flows through the silicon-accurate path: `r100-cm7`
+forwards the doorbell → q-cp on CA73 CP0 reads the BD, walks the CB,
+programs the engines, pushes DNC tasks to CP1, and closes the loop
+with `cb_complete` → DONE writeback + MSI-X via `r100-imsix`. No
+fake DONEs, no synthetic cmd_types, no QEMU-side completions. From
+that base, P5B / P7 / P10 become real-tensor work, not architectural
+fixes.
 
 ### Success criteria
 
