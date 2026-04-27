@@ -195,6 +195,20 @@ MMIO, properties for parameterisation, `reset` handler for defaults.
 to proceed. Most stubs are store-on-write / return-on-read with
 specific overrides for status bits (e.g. CMU PLL lock).
 
+**Scaffolding vs destination.** A subset of `r100-cm7`'s current-state
+responsibilities are intentionally regression scaffolding rather than
+the silicon-accurate target: specifically the synthetic `FW_BOOT_DONE`
+re-handshake on `INTGR0 bit 0` (Stage 3a) and the BD-done state
+machine on `INTGR1 bits 0..N` (Stage 3c). They exist because q-cp
+lacks a CP1-side `pcie_msix_trigger` symbol and because no real CA73
+soft-reset model exists yet. Both are listed faithfully in the Source
+File Map below as part of today's `r100-cm7` behaviour, but they are
+slated for removal per `docs/roadmap.md` (P8 retires Stage 3c once q-cp
+owns BD.DONE + MSI-X via a real `pcie_msix_trigger`; P9 retires Stage
+3a once a real CA73 cluster reset lands). Treat the file map as
+"what the binary does today", and the roadmap as "what we are moving
+toward".
+
 ### Key Design Decisions
 
 | Decision | Choice | Why |

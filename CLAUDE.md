@@ -9,7 +9,7 @@ q-cp) and drivers (kmd, umd) on emulated hardware.
 ## Documentation
 
 - [docs/architecture.md](docs/architecture.md) — System architecture, memory maps, device model design, FW source references
-- [docs/roadmap.md](docs/roadmap.md) — Phased implementation plan (Phase 1: FW boot, Phase 2: host drivers, Phase 3: inference)
+- [docs/roadmap.md](docs/roadmap.md) — Phase 1 (FW boot, complete), Phase 2 foundation milestones (M1..M9-1, complete) + the unified P1..P11 architectural plan that supersedes the old Phase 2 / Phase 3 boundary
 - [docs/debugging.md](docs/debugging.md) — **How the agent should build / run / inspect logs / drive GDB.** Read this before running the emulator.
 
 ## Build
@@ -114,7 +114,9 @@ slot at `R100_CMD_DESCR_SYNTH_BASE = 0x20000000` (16 × 256 B ring) and
 points the entry's `cmd_descr` field at it, so q-cp's worker can
 dereference + reach `dnc_send_task` instead of NULL-deref'ing.
 cm7-debug emits `mbtq qid=N slot=M pi=P cmd_descr=0x... status=ok`
-traces; q-cp consumption is the M9-2 verification gap.
+traces; q-cp consumption is verified end-to-end as part of P2 (see
+`docs/roadmap.md` — q-cp's `cb_complete` owns BD.DONE + MSI-X once
+P1 lands the real CP1-side `pcie_msix_trigger`).
 
 #### r100-hdma + active r100-dnc (M9-1c)
 
