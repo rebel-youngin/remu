@@ -126,6 +126,21 @@ struct R100Cm7State {
     CharBackend cfg_debug_chr;    /* cfg ASCII tail */
     CharBackend cm7_debug_chr;    /* BD-done state-machine tail (3c) */
 
+    /*
+     * P1c reverse-mirror trap: 4 KB MMIO overlay on chiplet-0 DRAM at
+     * R100_DEVICE_COMM_SPACE_BASE (0x10200000). Models silicon's
+     * inbound iATU that maps host BAR2 cfg-head onto NPU local memory
+     * — host writes (cfg chardev) and NPU writes (q-cp / q-sys MMIO)
+     * both terminate in cfg_shadow, and NPU writes additionally push
+     * an OP_CFG_WRITE upstream so the kmd's BAR2 cfg-head shadow stays
+     * in sync (FUNC_SCRATCH completion path: q-cp's
+     * `cb_complete → writel(scratchpad)` round-trips back into
+     * `rebel_cfg_read(FUNC_SCRATCH)` on the host without an explicit
+     * DMA transaction). Reads always come from cfg_shadow, so the
+     * NPU sees its own stores plus everything the host has published.
+     */
+    MemoryRegion cfg_mirror_mmio;
+
     R100MailboxState *mailbox;      /* VF0: M6 INTGR sink + M8a ISSR sink */
     R100MailboxState *pf_mailbox;   /* PF: CM7-stub FW_BOOT_DONE + BD-done pi source */
     R100IMSIXState   *imsix;        /* M7: BD-done completion notifier (3c) */
@@ -170,6 +185,33 @@ struct R100Cm7State {
     uint64_t mbtq_pushes;
     uint64_t mbtq_pushes_dropped;
     uint32_t mbtq_pi_next;
+
+    /*
+     * P1c kill-switches. Stage 3c shipped the CM7-side BD-done state
+     * machine and DNC mbtq push as stop-gaps for q-cp running blind to
+     * host RAM. P1a's r100-pcie-outbound iATU model gives q-cp on CP0
+     * direct host-RAM access via HDMA, so q-cp now owns the full BD
+     * lifecycle (cb_proc_pkt_loop → cb_complete → pcie_msix_trigger).
+     * Both stubs default off; keep the helpers wired so a regression
+     * can flip a -global back on without re-plumbing INTGR1.
+     */
+    bool bd_done_stub;
+    bool mbtq_stub;
+    /*
+     * The QINIT stub races q-cp on the init_done write: cm7 fires
+     * synchronously from the INTGR1 ISR (~µs after the doorbell), q-cp
+     * runs hq_init / rl_cq_init in the hq_task FreeRTOS context (~ms
+     * later because the path includes 4 KB outbound iATU reads of
+     * dev_desc + queue_desc). When cm7 wins, the kmd's `init_done`
+     * poll (rebel_queue_init) resolves before q-cp's `cq.initialized`
+     * goes true; the kmd's BD-doorbell (DB_IDX_CQ) then arrives at
+     * q-cp's doorbell ISR, which calls hq_set_cq_req_funcs and logs
+     *   "[hq] cq is not initialized"
+     * — leaving the BD permanently un-serviced. Default qinit-stub
+     * off so the kmd only sees init_done after q-cp has actually
+     * finished init (the natural serialisation point).
+     */
+    bool qinit_stub;
 
     R100Cm7BdJob jobs[R100_CM7_MAX_QUEUES];
 };
@@ -379,6 +421,10 @@ static void r100_cm7_qinit_stub(R100Cm7State *s)
     uint8_t fw_version[REMU_DDH_VERSION_MAX];
     uint32_t init_done = 1;
 
+    /* P1c: q-cp on CP0 owns the init_done write (see struct comment). */
+    if (!s->qinit_stub) {
+        return;
+    }
     if (!s->hdma) {
         /* Single-QEMU runs / tests don't wire hdma; treat as no-op. */
         qemu_log_mask(LOG_UNIMP,
@@ -478,6 +524,10 @@ static void r100_cm7_bd_start(R100Cm7State *s, uint32_t qid)
     uint64_t qdesc_dma;
     uint32_t req_id = qid + 1u;
 
+    /* P1c: q-cp on CP0 owns the BD lifecycle (see struct comment). */
+    if (!s->bd_done_stub) {
+        return;
+    }
     if (qid >= R100_CM7_MAX_QUEUES) {
         s->bd_doorbells_dropped++;
         return;
@@ -503,16 +553,17 @@ static void r100_cm7_bd_start(R100Cm7State *s, uint32_t qid)
         return;
     }
     /* kmd publishes `pi` via rebel_mailbox_write(rdev, qid, pi), which
-     * on BAR4 lands at MAILBOX_BASE + qid*4. The host-side
-     * r100-npu-pci forwards the write over the doorbell chardev and
-     * r100_cm7_deliver()'s REMU_DB_KIND_ISSR path lands it in
-     * s->mailbox (VF0 — the current host→NPU ISSR sink, used by both
-     * M8a and this 3c path). On silicon the kmd writes PF.ISSR
-     * directly, but REMU collapses the two BAR4 views into a single
-     * chardev; reading from VF0 therefore matches what the bridge
-     * actually stores. If that mapping is ever split (two chardev
-     * endpoints), switch this to pf_mailbox. */
-    pi = s->mailbox ? r100_mailbox_get_issr(s->mailbox, qid) : 0;
+     * on BAR4 lands at MAILBOX_BASE + qid*4. On silicon that landing
+     * pad is PF.ISSR[qid] — PCIE_CM7 reads PF and (for VF event
+     * delivery) forwards into VF0. q-cp/q-sys reads the value back
+     * via `inst[PCIE_PF=0] = IDX_MAILBOX_PCIE_PF` from PF.ISSR[qid].
+     * REMU's host→NPU relay therefore deposits the kmd payload into
+     * `pf_mailbox` (see KIND_ISSR in r100_cm7_deliver), and the
+     * BD-done state machine here reads it from the same backing
+     * store. P1b post-mortem in docs/debugging.md captures the
+     * earlier VF0-only routing that produced "undefined tdr doorbell
+     * event 0" because q-cp's URG handler reads PF, not VF0. */
+    pi = s->pf_mailbox ? r100_mailbox_get_issr(s->pf_mailbox, qid) : 0;
     if (pi == j->ci) {
         /* Spurious doorbell / already caught up. */
         s->bd_doorbells_dropped++;
@@ -758,6 +809,12 @@ static void r100_cm7_mbtq_push(R100Cm7State *s, uint32_t qid)
     uint32_t pi_after;
     uint64_t cmd_descr_addr = 0;
 
+    /* P1c: stub is off by default (see struct comment); q-cp on CP0
+     * builds the real cmd_descr from CB content and pushes the
+     * dnc_one_task itself once cb_proc_pkt_loop materialises. */
+    if (!s->mbtq_stub) {
+        return;
+    }
     if (!s->mbtq_mailbox) {
         s->mbtq_pushes_dropped++;
         r100_cm7_mbtq_emit_debug(s, qid, 0, 0, 0, "no-mailbox");
@@ -863,17 +920,28 @@ static void r100_cm7_deliver(R100Cm7State *s, uint32_t off, uint32_t val)
             r100_cm7_qinit_stub(s);
         }
         /*
-         * M8b Stage 3c BD-done: bits [0..R100_CM7_MAX_QUEUES-1] map to
-         * command queues. rbln_queue_test rings bit 0 after staging a
-         * single BD; we walk the ring and synthesise BD.DONE + ci
-         * advance + FUNC_SCRATCH update + MSI-X notify, mirroring
-         * what PCIE_CM7 would orchestrate on silicon.
+         * P1c (Phase 1c): the CM7-side BD-done state machine and DNC
+         * mbtq push were Stage 3c stop-gaps used while q-cp couldn't
+         * reach host RAM. With P1a's `r100-pcie-outbound` modelling
+         * the chiplet-0 outbound iATU, q-cp on CP0 now reads BDs /
+         * packets out of host RAM via HDMA and owns the full BD
+         * lifecycle:
          *
-         * In parallel, push a dnc_one_task entry into the q-cp task-
-         * queue mailbox so taskmgr_fetch_dnc_task_master_cp1 wakes.
-         * Stage 3c still owns the BD.DONE + MSI-X completion; the
-         * mbtq push is observed-but-unused until the DNC peripheral
-         * stub lands.
+         *   queue doorbell INTGR1 bit N
+         *      → r100_mailbox_raise_intgr (above) → SPI 185
+         *      → q-cp hq_task wakes
+         *      → rl_cq_proc → rl_cq_bd_proc → cb_proc_pkt_loop
+         *      → cb_complete: BD.DONE | ci++ | FUNC_SCRATCH write
+         *      → pcie_msix_trigger → r100-imsix → host MSI-X
+         *
+         * Synthesising the same effects in CM7 raced with q-cp: the
+         * stub completed first, the kmd's fence resolved, the test
+         * buffer was freed, and q-cp then read garbage and aborted on
+         * "Current packet(0x1) is not supported." We keep the helper
+         * functions compiled in (call sites below) so a regression
+         * can flip a runtime switch back on, but the helpers
+         * themselves now early-return when `s->bd_done_stub` /
+         * `s->mbtq_stub` are off (default off post-P1c).
          */
         for (uint32_t qid = 0; qid < R100_CM7_MAX_QUEUES; qid++) {
             if (val & (1u << qid)) {
@@ -883,6 +951,24 @@ static void r100_cm7_deliver(R100Cm7State *s, uint32_t off, uint32_t val)
         }
         break;
     case REMU_DB_KIND_ISSR:
+        /* P1b: kmd's BAR4 ISSR-payload writes (MAILBOX_BASE + idx*4)
+         * land on PF.ISSR on silicon, and q-cp's
+         * `rl_get_mailbox(PCIE_PF=0, idx)` reads from PF (because
+         * `inst[PCIE_PF] = IDX_MAILBOX_PCIE_PF` in q-cp's mailbox
+         * driver). Routing the relay to VF0 left URG/CQ/MQ payloads
+         * stranded — the FW saw 0 and aborted on a "force abort"
+         * URG_EVENT_FORCE_ABORT (event=0). PF is the authoritative
+         * backing store; the IRQ side stays on VF0 (INTGR1 → SPI
+         * 185) because that's what fires on CA73, exactly mirroring
+         * silicon's CM7→VF0 IRQ-only relay.
+         *
+         * Mirror to VF0 too so any pre-existing reader of VF0.ISSR
+         * (M8a tests, parity) keeps working — the egress chardev is
+         * deliberately PF-only so the host-side BAR4 shadow doesn't
+         * see two writes per kmd store. */
+        if (s->pf_mailbox) {
+            r100_mailbox_set_issr(s->pf_mailbox, issr_idx, val);
+        }
         r100_mailbox_set_issr(s->mailbox, issr_idx, val);
         break;
     case REMU_DB_KIND_OTHER:
@@ -926,6 +1012,15 @@ static void r100_cm7_cfg_deliver(R100Cm7State *s, uint32_t off, uint32_t val)
         r100_cm7_cfg_emit_debug(s, off, val, "bad-offset");
         return;
     }
+    /*
+     * Single source of truth: cfg_shadow. P1c installs an MMIO trap
+     * at R100_DEVICE_COMM_SPACE_BASE (see r100_cm7_realize), so NPU
+     * reads of e.g. DDH_BASE_{LO,HI} land in cfg_mirror_read which
+     * returns the slot below — there is no separate DRAM mirror to
+     * keep in sync. NPU-side writes round-trip back to the host's
+     * cfg_mmio_regs through the same trap (OP_CFG_WRITE), closing
+     * the loop without a feedback path through this function.
+     */
     s->cfg_shadow[off >> 2] = val;
     s->cfg_frames_received++;
     r100_cm7_cfg_emit_debug(s, off, val, "ok");
@@ -1005,6 +1100,106 @@ static void r100_cm7_hdma_dispatch(void *opaque,
 }
 
 /* ------------------------------------------------------------------ */
+/* P1c — DEVICE_COMMUNICATION_SPACE reverse-mirror trap                */
+/*                                                                     */
+/* Overlay at NPU PA R100_DEVICE_COMM_SPACE_BASE (0x10200000, 4 KB)    */
+/* installed in r100_cm7_realize at priority 10 over chiplet-0 DRAM    */
+/* (priority 0). Reads from any NPU CPU return the cfg_shadow slot;    */
+/* writes update cfg_shadow + emit an OP_CFG_WRITE on the hdma         */
+/* chardev so the host's r100-npu-pci cfg-head shadow stays in sync.   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The 4 KB cfg head sees a much wider mix of access widths than the
+ * 8-byte (cfg_off, val) wire frame suggests:
+ *
+ *   - q-sys main() on CP0 does
+ *       memset(DEVICE_COMMUNICATION_SPACE_BASE, 0, CP1_LOGBUF_MAGIC)
+ *     on cold boot (osl/FreeRTOS/Source/main.c:250). The compiler
+ *     lowers this to a mix of `dc zva` cache-line zeros and 1/8-byte
+ *     stores depending on the MMU attributes the FW has installed
+ *     for this region.
+ *   - hil_init_descs reads DDH_BASE_LO/HI as a 64-bit FUNC_READQ.
+ *   - cb_complete writes FUNC_SCRATCH as a 32-bit `writel`.
+ *
+ * Set `impl` to the 32-bit slot stride so the read/write helpers
+ * stay simple, and let QEMU's accepts_io_with_size() machinery pack /
+ * unpack wider or narrower accesses on top. `valid.unaligned = true`
+ * isn't strictly needed — every q-sys / q-cp access is naturally
+ * aligned — but it costs nothing and matches the silicon semantics
+ * (the inbound iATU has no alignment trap).
+ */
+static uint64_t r100_cm7_cfg_mirror_read(void *opaque, hwaddr off,
+                                         unsigned size)
+{
+    R100Cm7State *s = opaque;
+    uint32_t v32;
+
+    if (off + size > REMU_BAR2_CFG_HEAD_SIZE) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "r100-cm7: cfg-mirror read off=0x%" HWADDR_PRIx
+                      " size=%u out of bounds (0..0x%x)\n",
+                      off, size, REMU_BAR2_CFG_HEAD_SIZE);
+        return 0;
+    }
+    v32 = s->cfg_shadow[off >> 2];
+    qemu_log_mask(LOG_TRACE,
+                  "r100-cm7: cfg-mirror read off=0x%" HWADDR_PRIx
+                  " size=%u val=0x%x\n", off, size, v32);
+    return v32;
+}
+
+static void r100_cm7_cfg_mirror_write(void *opaque, hwaddr off,
+                                      uint64_t val, unsigned size)
+{
+    R100Cm7State *s = opaque;
+    uint32_t v32;
+
+    if (off + size > REMU_BAR2_CFG_HEAD_SIZE) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "r100-cm7: cfg-mirror write off=0x%" HWADDR_PRIx
+                      " size=%u val=0x%" PRIx64
+                      " out of bounds (0..0x%x)\n",
+                      off, size, val, REMU_BAR2_CFG_HEAD_SIZE);
+        return;
+    }
+    v32 = (uint32_t)val;
+    s->cfg_shadow[off >> 2] = v32;
+    qemu_log_mask(LOG_TRACE,
+                  "r100-cm7: cfg-mirror write off=0x%" HWADDR_PRIx
+                  " size=%u val=0x%x\n", off, size, v32);
+    /*
+     * Forward to host BAR2 cfg-head shadow over the hdma chardev.
+     * The kmd reads FUNC_SCRATCH (and other DDH fields) via
+     * `rebel_cfg_read`, which dereferences `cfg_mmio_regs[idx]` on
+     * the host side. The OP_CFG_WRITE handler in r100-npu-pci
+     * stores the value there with no further egress, so the loop
+     * terminates: NPU-write → cfg_shadow + hdma → host cfg_mmio_regs.
+     *
+     * req_id is unused on the host side for OP_CFG_WRITE (the dst
+     * field carries the cfg offset), so use 0 — we don't need to
+     * disambiguate concurrent in-flight requests.
+     */
+    if (s->hdma) {
+        if (!r100_cm7_hdma_cfg_write(s, 0u, (uint32_t)(off & ~0x3u),
+                                     v32, "cfg-mirror")) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "r100-cm7: cfg-mirror write off=0x%" HWADDR_PRIx
+                          " HDMA emit failed\n", off);
+        }
+    }
+}
+
+static const MemoryRegionOps r100_cm7_cfg_mirror_ops = {
+    .read       = r100_cm7_cfg_mirror_read,
+    .write      = r100_cm7_cfg_mirror_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid      = { .min_access_size = 1, .max_access_size = 8,
+                    .unaligned = true },
+    .impl       = { .min_access_size = 4, .max_access_size = 4 },
+};
+
+/* ------------------------------------------------------------------ */
 /* Realize / reset / vmstate / properties                              */
 /* ------------------------------------------------------------------ */
 
@@ -1043,6 +1238,23 @@ static void r100_cm7_realize(DeviceState *dev, Error **errp)
     if (s->hdma) {
         r100_hdma_set_cm7_callback(s->hdma, r100_cm7_hdma_dispatch, s);
     }
+
+    /*
+     * P1c reverse-mirror trap: install the 4 KB cfg-shadow MMIO over
+     * chiplet-0 DRAM at R100_DEVICE_COMM_SPACE_BASE. Priority 10 is
+     * higher than the bare DRAM (priority 0), so every NPU access in
+     * this window goes through cfg_mirror_ops instead of leaking into
+     * the underlying RAM region. Always installed when cm7 is
+     * created (i.e. dual-QEMU --host runs); single-QEMU configs don't
+     * instantiate cm7 at all so the trap is implicitly absent there.
+     */
+    memory_region_init_io(&s->cfg_mirror_mmio, OBJECT(dev),
+                          &r100_cm7_cfg_mirror_ops, s,
+                          "r100.cm7.cfg-mirror",
+                          R100_DEVICE_COMM_SPACE_SIZE);
+    memory_region_add_subregion_overlap(get_system_memory(),
+                                        R100_DEVICE_COMM_SPACE_BASE,
+                                        &s->cfg_mirror_mmio, 10);
 }
 
 static void r100_cm7_unrealize(DeviceState *dev)
@@ -1124,6 +1336,12 @@ static Property r100_cm7_properties[] = {
                      TYPE_R100_MAILBOX, R100MailboxState *),
     DEFINE_PROP_LINK("hdma", R100Cm7State, hdma,
                      TYPE_R100_HDMA, R100HDMAState *),
+    /* P1c kill-switches; default false. -global r100-cm7.bd-done-stub=on
+     * (or `mbtq-stub=on` / `qinit-stub=on`) re-enables the Stage 3c
+     * paths for bisecting a q-cp regression. */
+    DEFINE_PROP_BOOL("bd-done-stub", R100Cm7State, bd_done_stub, false),
+    DEFINE_PROP_BOOL("mbtq-stub", R100Cm7State, mbtq_stub, false),
+    DEFINE_PROP_BOOL("qinit-stub", R100Cm7State, qinit_stub, false),
     DEFINE_PROP_END_OF_LIST(),
 };
 

@@ -58,22 +58,29 @@ bool r100_hdma_emit_cfg_write(R100HDMAState *s, uint32_t req_id,
                               const char *tag);
 
 /*
- * Register a single response callback. r100-hdma calls `cb` whenever
- * an OP_READ_RESP frame arrives whose req_id falls in the r100-cm7
- * partition (1..R100_CM7_MAX_QUEUES inclusive). Setting `cb=NULL`
+ * Register response callbacks for OP_READ_RESP frames whose req_id
+ * falls in an "external subscriber" partition. r100-hdma's RX demux
+ * always handles its own MMIO-channel partition (0x80..0xBF) and the
+ * untagged QINIT path internally; everything else is routed by
+ * partition through the registered callbacks. Setting `cb=NULL`
  * unbinds.
  *
- * The callback runs synchronously inside the chardev RX context so
- * it must not block; r100-cm7's BD-done state machine is the only
- * caller and re-enters r100_hdma_emit_* freely.
+ * Each callback runs synchronously inside the chardev RX context
+ * (BQL held) so it must not block on any other lock. r100-cm7's
+ * BD-done state machine and r100-pcie-outbound's sync-read pump are
+ * the only callers and re-enter r100_hdma_emit_* freely.
  *
- * MMIO-driven channel responses (req_id 0x80..0xBF) are consumed
- * inside r100-hdma without going through this callback; the cm7
- * partition is the only "external subscriber" today.
+ * Partition map (also documented in remu_addrmap.h):
+ *
+ *   set_cm7_callback      — req_id 1..R100_CM7_MAX_QUEUES (BD-done).
+ *   set_outbound_callback — req_id 0xC0..0xFF (P1 PCIe outbound
+ *                            iATU-window synchronous reads).
  */
 typedef void (*R100HDMARespCb)(void *opaque, const RemuHdmaHeader *hdr,
                                const uint8_t *payload);
 void r100_hdma_set_cm7_callback(R100HDMAState *s, R100HDMARespCb cb,
                                 void *opaque);
+void r100_hdma_set_outbound_callback(R100HDMAState *s, R100HDMARespCb cb,
+                                     void *opaque);
 
 #endif /* R100_HDMA_H */

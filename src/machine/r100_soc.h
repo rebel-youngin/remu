@@ -168,6 +168,7 @@ DECLARE_INSTANCE_CHECKER(R100SoCMachineState, R100_SOC_MACHINE,
 #define TYPE_R100_CM7           "r100-cm7"
 #define TYPE_R100_IMSIX         "r100-imsix"
 #define TYPE_R100_HDMA          "r100-hdma"
+#define TYPE_R100_PCIE_OUTBOUND "r100-pcie-outbound"
 
 #define R100_RBC_BLOCK_SIZE     0x80000ULL  /* 512KB per RBC block */
 

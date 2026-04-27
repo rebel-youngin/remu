@@ -1164,6 +1164,25 @@ static void r100_soc_init(MachineState *machine)
                                        R100_INTID_TO_GIC_SPI_GPIO(
                                            R100_INT_ID_HDMA)));
 
+                /* P1: PCIe outbound iATU stub. Only meaningful when
+                 * the host chardev is present (otherwise there's
+                 * nowhere to send OP_READ_REQ frames); single-QEMU
+                 * runs leave the 4 GB AXI window unmapped just like
+                 * before, so any q-cp BD-read attempt still surfaces
+                 * as an unassigned-region access in the log. */
+                if (hdma_chr) {
+                    DeviceState *outbound = qdev_new(TYPE_R100_PCIE_OUTBOUND);
+
+                    qdev_prop_set_uint32(outbound, "chiplet-id", 0);
+                    object_property_set_link(OBJECT(outbound), "hdma",
+                                             OBJECT(hdma_dev),
+                                             &error_fatal);
+                    sysbus_realize_and_unref(SYS_BUS_DEVICE(outbound),
+                                             &error_fatal);
+                    sysbus_mmio_map(SYS_BUS_DEVICE(outbound), 0,
+                                    R100_PCIE_AXI_SLV_BASE_ADDR);
+                }
+
                 qdev_prop_set_chr(cm7, "chardev", chr);
                 if (dbg) {
                     qdev_prop_set_chr(cm7, "debug-chardev", dbg);

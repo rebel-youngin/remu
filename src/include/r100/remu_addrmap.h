@@ -546,9 +546,52 @@ static inline uint32_t r100_dnc_intid(uint32_t dnc_id, uint32_t cmd_type)
  *   0x40..0x7F   — reserved (UMQ multi-queue, future).
  *   0x80..0xBF   — r100-hdma MMIO-driven channel ops (encoded as
  *                  0x80 | (type<<5) | ch with type=0 WR, type=1 RD,
- *                  ch in 0..15). */
+ *                  ch in 0..15).
+ *   0xC0..0xFF   — r100-pcie-outbound synchronous PF-window reads
+ *                  (P1; cookie = req_id & 0x3F, rotates on each
+ *                  request, only one in flight at a time). */
 #define R100_HDMA_REQ_ID_CH_MASK_BASE   0x80u
 #define R100_HDMA_REQ_ID_CH_DIR_RD      0x20u    /* 1<<5 */
 #define R100_HDMA_REQ_ID_CH_NUM_MASK    0x1Fu    /* fits 0..15 */
+
+#define R100_PCIE_OUTBOUND_REQ_ID_BASE  0xC0u
+#define R100_PCIE_OUTBOUND_REQ_ID_MASK  0x3Fu    /* cookie space */
+
+/* ========================================================================
+ * P1 — PCIe outbound iATU window + DEVICE_COMMUNICATION_SPACE mirror
+ * ========================================================================
+ *
+ * Real silicon: q-cp/CP0 dereferences host-RAM bus addresses (BD ring,
+ * rbln_device_desc, queue_desc, packet stream, ...) by issuing AXI
+ * loads/stores in the chiplet-0 iATU outbound window. The DW iATU
+ * translates AXI[cpu_addr ± offset] → PCIe TLP[pci_addr ± offset];
+ * pcie_ep.c:418 programs PF cpu_addr=0x8000000000, pci_addr=0x0,
+ * size=4 GB. Per-VF outbound windows start at +(vf+1)*4GB but are
+ * not exercised today (PF-only).
+ *
+ * REMU has neither the DW PCIe IP nor a real iATU. r100-pcie-outbound
+ * (src/machine/r100_pcie_outbound.c) installs a 4 GB MMIO trap at
+ * R100_PCIE_AXI_SLV_BASE_ADDR; reads block on a HDMA OP_READ_REQ /
+ * OP_READ_RESP round-trip via the existing `hdma` chardev (req_id
+ * partition 0xC0..0xFF, see above), writes are fire-and-forget OP_WRITE.
+ * The MMIO `addr` parameter is already the PCIe bus address — the iATU
+ * mapping is identity after the AXI base is subtracted by QEMU's
+ * MemoryRegion bookkeeping.
+ *
+ * BAR2 cfg-head mirror: real silicon's inbound iATU maps host BAR2
+ * onto NPU local memory at the FW_LOGBUF_SIZE offset, so kmd's BAR2
+ * stores at FW_LOGBUF_SIZE + 0xC0/0xC4 (DDH_BASE_LO/HI) end up readable
+ * by q-cp through `hil_reg_base[0] + DDH_BASE_LO` (= NPU DRAM
+ * 0x102000C0). REMU's BAR2 lives on the host side (lazy RAM + cfg-head
+ * trap forwarding to the NPU via `cfg` chardev). r100-cm7's cfg
+ * delivery now write-throughs to NPU DRAM at this address so q-cp's
+ * `hil_init_descs` / FUNC_READQ-style accesses find the value the kmd
+ * wrote.
+ */
+#define R100_PCIE_AXI_SLV_BASE_ADDR     0x8000000000ULL
+#define R100_PCIE_OUTBOUND_PF_SIZE      0x100000000ULL   /* 4 GB */
+
+#define R100_DEVICE_COMM_SPACE_BASE     0x10200000ULL    /* NPU DRAM */
+#define R100_DEVICE_COMM_SPACE_SIZE     0x1000ULL        /* 4 KB */
 
 #endif /* REMU_ADDRMAP_H */

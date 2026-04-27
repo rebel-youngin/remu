@@ -514,6 +514,24 @@ static void r100_hdma_handle_read_req(R100NpuPciState *s,
                       hdr->dst, hdr->len, res, hdr->req_id);
         s->hdma_frames_dropped++;
         r100_hdma_emit_debug(s, "rx", hdr, "dma-fail");
+        /* P1: r100-pcie-outbound parks a vCPU on a per-device cond
+         * until the matching READ_RESP arrives. If we silently dropped
+         * the failed read, that vCPU would deadlock for the rest of
+         * the run. Emit a zero-payload reply (with the same req_id)
+         * so the NPU side surfaces the failure as a guest-visible
+         * read of 0x0 — loud enough to trip q-cp's NULL-deref guard
+         * but recoverable. The cm7 BD-done partition (req_id 1..15)
+         * is host-driven scaffolding that we control and that does
+         * its own retry/abort on missing payload, so don't synthesise
+         * a stub reply for it. */
+        if (hdr->req_id >= R100_PCIE_OUTBOUND_REQ_ID_BASE) {
+            uint8_t zero[REMU_HDMA_MAX_PAYLOAD] = {0};
+            uint32_t reply_len = MIN(hdr->len, sizeof(zero));
+            (void)remu_hdma_emit_read_resp(&s->hdma_chr,
+                                           "r100-npu-pci hdma fail-stub",
+                                           hdr->req_id, hdr->dst,
+                                           zero, reply_len);
+        }
         return;
     }
     s->hdma_frames_received++;

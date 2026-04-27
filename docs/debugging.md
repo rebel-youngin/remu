@@ -66,7 +66,7 @@ output/my-test/
   issr.log      # M8a       — NPU → host ISSR frames
   cfg.log       # M8b 3b    — host → NPU BAR2 cfg-head writes (DDH_BASE_{LO,HI}, …)
   hdma.log      # M8b 3b+3c — bidirectional HDMA (OP_WRITE / OP_READ_REQ / OP_READ_RESP / OP_CFG_WRITE)
-  cm7.log       # M8b 3c    — NPU r100-cm7 BD-done state-machine ASCII trace
+  cm7.log       # M8b 3c    — NPU r100-cm7 BD-done state-machine ASCII trace (default off post-P1c)
   shm -> /dev/shm/remu-my-test/
   npu/
     monitor.sock       # HMP over unix socket
@@ -314,7 +314,7 @@ host BAR4 `xp /1wx 0xfe000090` (shadow). Empty `qemu.stderr.log`
 means the run-directory redirect failed.
 
 The CM7 stub retires when REMU grows a real CA73 soft-reset model
-(`docs/roadmap.md` → Phase 2 pending components).
+(`docs/roadmap.md` → P8).
 
 ### x86 Linux guest boot (M8b Stage 2, commit `1ef7208`)
 
@@ -374,7 +374,7 @@ cleanly across both QEMUs via two new chardevs:
 
 | chardev | dir | frame | role |
 |---------|-----|-------|------|
-| `cfg` | host→NPU | 8-byte `(cfg_off, val)` | BAR2 cfg-head mirror. Host-side `r100-npu-pci` traps the 4 KB MMIO window at BAR2 offset `FW_LOGBUF_SIZE` and forwards every write (notably `DDH_BASE_{LO,HI}` at +0xC0/+0xC4) to the NPU's `r100-cm7`, which maintains `cfg_shadow[1024]`. Stage 3c adds the reverse flow too: `OP_CFG_WRITE` HDMA frames from the NPU update the host-side `cfg_mmio_regs[]` directly (used by BD-done to publish `FUNC_SCRATCH`). |
+| `cfg` | host→NPU | 8-byte `(cfg_off, val)` | BAR2 cfg-head mirror. Host-side `r100-npu-pci` traps the 4 KB MMIO window at BAR2 offset `FW_LOGBUF_SIZE` and forwards every write (notably `DDH_BASE_{LO,HI}` at +0xC0/+0xC4) to the NPU's `r100-cm7`, which maintains `cfg_shadow[1024]`. P1b adds the reverse flow: NPU-side stores via the `cfg_mirror_mmio` trap (q-cp's `cb_complete → writel(FUNC_SCRATCH)`) emit `OP_CFG_WRITE` HDMA frames that update the host's `cfg_mmio_regs[]` directly, so `rebel_cfg_read` sees firmware writes. |
 | `hdma` | NPU↔host | 24 B header + payload | Bidirectional DMA. NPU→host: `OP_WRITE` (write descriptor into guest RAM, Stage 3b QINIT + Stage 3c `bd.header |= DONE` / `queue_desc.ci++`), `OP_READ_REQ` (Stage 3c — ask host to `pci_dma_read` a region tagged by `req_id`), `OP_CFG_WRITE` (Stage 3c — push a scalar into host-local `cfg_mmio_regs`). Host→NPU: `OP_READ_RESP` (paired response to a pending `OP_READ_REQ`). See `src/bridge/remu_hdma_proto.h`. |
 
 On `INTGR1 bit 7`, the NPU-side CM7 stub in `src/machine/r100_cm7.c`
@@ -409,9 +409,19 @@ replace the stub with a real `OP_READ_REQ` + `OP_READ_RESP` pair
 now that the protocol supports it).
 
 After Stage 3b the kmd boots past `hw_init` into `rbln_queue_test`.
-Stage 3c closes that loop — see next section.
+Stage 3c was the original way to close that loop; P1c moved
+ownership to q-cp on CP0 — see the "P1b/P1c" section below for the
+current flow.
 
-### Stage 3c — BD-done state machine (r100-cm7)
+### Stage 3c — BD-done state machine (r100-cm7) — retired by P1c, default off
+
+> **Status:** P1c retired this scaffolding by default. q-cp on CP0
+> now owns the entire BD walk natively (`hq_task → cb_task →
+> cb_complete`) over the P1a outbound iATU + the P1b cfg-mirror
+> trap. The state machine below is still compiled in and can be
+> re-enabled with `-global r100-cm7.bd-done-stub=on` for bisects
+> against q-cp regressions; see "P1b/P1c" below for the new
+> default flow.
 
 `rbln_queue_test` in `rebellions.ko` submits a BD that writes a
 scalar via `packet_write_data`, then waits on a `dma_fence` for
@@ -420,9 +430,8 @@ completion. On silicon, PCIE_CM7 firmware handles the `INTGR1 bit 0`
 descriptor, reads each BD, reads the packet payload, applies the
 side-effect (here: write into `FUNC_SCRATCH`), marks the BD done,
 advances `queue_desc.ci`, and fires an MSI-X on the completion
-vector. REMU models this as a file called `r100_cm7.c` that is
-finally allowed to live up to its name — no more "doorbell"
-misnomer.
+vector. The stub below is REMU's pre-P1c workaround that drove the
+same wire transactions from QEMU's main loop instead.
 
 **State machine per-queue** (`R100Cm7BdJob`, slot per qid):
 
@@ -523,18 +532,29 @@ both ends and logs snippets to `host/info-qtree-cfg-hdma.log` and
 
 #### M9-1c — active DNC + HDMA reg block
 
-After M9-1c, every queue-doorbell on `INTGR1` bit `qid` does three
-things in parallel: (a) the BD-done state machine walks queue_desc /
-BD / packet via `r100-hdma` reads (Stage 3c, unchanged); (b) cm7
-synthesises a minimal `cmd_descr` in chiplet-0 private DRAM at
-`R100_CMD_DESCR_SYNTH_BASE = 0x20000000` (16-slot ring, 256 B
-stride) and pushes a `dnc_one_task` carrying that pointer onto the
-M9 mailbox so q-cp's `taskmgr_fetch_dnc_task_master_cp1` can pop a
-non-NULL descriptor; (c) — when q-cp's CP1 worker eventually calls
-`dnc_send_task` — the writes land on `r100-dnc-cluster`, the final
-4-byte store to slot+0x81C with `itdone=1` triggers a BH that
-synthesises a `dnc_reg_done_passage` at slot+0xA00 and pulses the
-matching DNC GIC SPI from `r100_dnc_intid()`.
+> **Status post-P1c:** parts (a) and (b) below are gated off by
+> default. q-cp on CP0 owns the BD walk natively (the `INTGR1` bit
+> still relays as SPI 185 → `hq_task` → `cb_task` over the P1a
+> outbound iATU + P1b cfg-mirror trap), and `mtq_push_task` on CP0
+> owns the mailbox push. The traces in the table below only fire
+> with `-global r100-cm7.bd-done-stub=on` / `mbtq-stub=on` (used for
+> bisecting q-cp regressions). Part (c) — `r100-dnc-cluster`
+> kickoff → done passage → DNC SPI — stays default-on; q-cp's
+> `dnc_send_task` is the producer either way.
+
+When the cm7 stubs are enabled (or pre-P1c), every queue-doorbell on
+`INTGR1` bit `qid` does three things in parallel: (a) the BD-done
+state machine walks queue_desc / BD / packet via `r100-hdma` reads
+(Stage 3c); (b) cm7 synthesises a minimal `cmd_descr` in chiplet-0
+private DRAM at `R100_CMD_DESCR_SYNTH_BASE = 0x20000000` (16-slot
+ring, 256 B stride) and pushes a `dnc_one_task` carrying that
+pointer onto the M9 mailbox so q-cp's
+`taskmgr_fetch_dnc_task_master_cp1` can pop a non-NULL descriptor;
+(c) — when q-cp's CP1 worker eventually calls `dnc_send_task` —
+the writes land on `r100-dnc-cluster`, the final 4-byte store to
+slot+0x81C with `itdone=1` triggers a BH that synthesises a
+`dnc_reg_done_passage` at slot+0xA00 and pulses the matching DNC GIC
+SPI from `r100_dnc_intid()`.
 
 Log signatures (NPU side, with cm7-debug + dnc-debug active):
 
@@ -552,6 +572,167 @@ DNC range that includes DNC0? Read 0x20000000 directly and confirm
 `cmd_descr_dnc.dnc_task_conf.core_affinity` matches what r100-cm7
 wrote (offset 20, byte 0 = 0x01). Bitfield mismatch → adjust the
 synth in `r100_cm7_synth_cmd_descr`.
+
+#### P1a — chiplet-0 PCIe outbound iATU stub
+
+Real silicon translates AArch64 loads in the
+`R100_PCIE_AXI_SLV_BASE_ADDR = 0x8000000000ULL` range into PCIe TLPs
+via the chiplet-0 DesignWare iATU; the kmd publishes bus addresses
+with `HOST_PHYS_BASE = 0x8000000000ULL` already added so q-cp on
+CA73 CP0 can dereference them directly. REMU has no DW iATU. P1a
+adds:
+
+- **`r100-pcie-outbound`** (`src/machine/r100_pcie_outbound.c`,
+  4 GB MMIO @ 0x8000000000, chiplet 0 PF only) — reads block on a
+  `qemu_cond_wait_bql()` until an `OP_READ_RESP` with the matching
+  cookie arrives, writes are fire-and-forget `OP_WRITE`. Bound to
+  the existing `r100-hdma` device through a QOM `link<>` and a
+  newly-public `r100_hdma_set_outbound_callback()` (independent of
+  the cm7 BD-done callback).
+- **BAR2 cfg-head → NPU MMIO trap** in `r100-cm7` (P1a → P1b
+  refinement). The `cfg` ingress path no longer writes through to
+  NPU DRAM; instead, P1b installs a 4 KB MMIO subregion overlay
+  (`r100_cm7_cfg_mirror_ops`, prio 10) at
+  `R100_DEVICE_COMM_SPACE_BASE = 0x10200000`, and `cfg_shadow[1024]`
+  is the single source of truth on the NPU side. q-cp's
+  `hil_init_descs` reads `DDH_BASE_LO/HI/SIZE` from the trap, which
+  returns the matching `cfg_shadow` slots; q-sys CP0's cold-boot
+  `memset(DEVICE_COMMUNICATION_SPACE_BASE, 0, CP1_LOGBUF_MAGIC)` flows
+  through the same trap unmodified (the ops accept 1/2/4/8-byte and
+  unaligned access, with `impl.access_size = 4` letting QEMU split
+  wider stores). See "P1b/P1c" below for the reverse leg.
+
+`req_id` partitions on the `hdma` wire (canonical in
+`src/include/r100/remu_addrmap.h`):
+
+| Range | Owner |
+|-------|-------|
+| `0x00` | QINIT untagged (`r100-cm7`, Stage 3b) |
+| `0x01..0x0F` | `r100-cm7` BD-done per `qid+1` (Stage 3c) |
+| `0x80..0xBF` | `r100-hdma` MMIO-driven channel ops (M9-1c) |
+| `0xC0..0xFF` | `r100-pcie-outbound` synchronous PF-window reads (P1a) |
+
+Verifying P1a on a `--host` run (output paths under `output/<name>/`):
+
+```
+$ grep "Device descriptor\|Queue descriptor\|Context descriptor" \
+       output/<name>/hils.log
+[HILS … cpu=0 INFO  func=0] Device descriptor addr 0x8002d00000, size 286720
+[HILS … cpu=0 INFO  func=0] Queue descriptor  addr 0x8002d000ec, size 32
+[HILS … cpu=0 INFO  func=0] Context descriptor addr 0x8002d0012c, size 1112
+
+$ grep "outbound" output/<name>/hdma.log
+hdma cl=0 tx op=READ_REQ  req_id=0xc0 dst=0x2d0000c len=… tag=outbound-rd …
+hdma cl=0 rx op=READ_RESP req_id=0xc0 dst=0x2d0000c len=… tag=resp …
+
+$ python3 - <<'EOF' && echo OK
+import socket
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect("output/<name>/npu/monitor.sock")
+s.sendall(b"xp /4wx 0x102000c0\n")
+print(s.recv(4096).decode())
+EOF
+# 0x102000c0: 0x02d00000 0x00000080 0x00046000 0x00000000
+#   ^ DDH_BASE_LO (= kmd's coherent DMA addr, no HOST_PHYS_BASE)
+#                ^ DDH_BASE_HI = 0x80 (HOST_PHYS_BASE >> 32)
+#                              ^ DDH_SIZE = 0x46000
+```
+
+Failure modes:
+
+- `hdma … status=dma-fail req_id=0xc?` — host's `pci_dma_read`
+  returned non-`MEMTX_OK` for a bus address q-cp dereferenced.
+  P1a synthesises a zero-payload `OP_READ_RESP` so the parked vCPU
+  surfaces a guest-visible `0` (and trips q-cp's NULL-deref
+  guard) instead of dead-locking. Usual cause: kmd has already
+  freed / unmapped the DMA buffer (probe-failure teardown), or
+  the bus address is outside the kmd's allocation.
+- NPU monitor `xp /4wx 0x102000c0` reads zero while
+  `cfg.log` shows `cfg off=0xc0 val=0x… status=ok` — the cfg
+  ingress path failed to update `cfg_shadow`. Check
+  `npu/qemu.stderr.log` for `r100-cm7: cfg deliver` traces and the
+  `cfg-mirror read` LOG_TRACE entry that q-cp is hitting.
+- q-cp logs `Device descriptor addr 0, size 0` — pre-P1b symptom
+  where q-cp's CA73 dcache still held the `memset(0)` from
+  `hil_init_pf`. P1b's MMIO trap is uncacheable so the dcache
+  alias no longer applies; if you still see this, double-check
+  `info qtree` shows the prio-10 `r100.cm7.cfg-mirror` subregion
+  on chiplet-0 system memory.
+
+#### P1b/P1c — honest BD lifecycle on q-cp/CP0
+
+P1a wired q-cp's outbound iATU and gave q-cp's `hil_init_descs` a
+working DDH publish path. P1b and P1c finish the loop:
+
+- **P1b** (NPU→host cfg reverse mirror) — the `cfg_mirror_mmio`
+  trap installed in P1a now also forwards every NPU-side write to
+  the host's BAR2 cfg-head shadow over the `hdma` chardev as an
+  `OP_CFG_WRITE`. The host's `r100-npu-pci` decodes that into
+  `cfg_mmio_regs[dst >> 2] = val`, so the kmd's `rebel_cfg_read`
+  sees q-cp's writes. This is the path used by q-cp's
+  `cb_complete → writel(FUNC_SCRATCH, magic)` to publish back to
+  `rbln_queue_test`.
+- **P1c** (retire `r100-cm7` BD-done + mbtq-push stubs) — q-cp on
+  CP0 now owns the BD walk (`hq_task → cb_task → cb_complete`),
+  the cmd_descr push to the M9 mailbox (`mtq_push_task`), and the
+  MSI-X completion (`pcie_msix_trigger`). The legacy QEMU-side
+  scaffolding from Stage 3c lives behind these compile-out flags
+  (default off):
+
+  ```
+  -global r100-cm7.bd-done-stub=on   # re-enable BD walk on INTGR1 bits 0..N-1
+  -global r100-cm7.mbtq-stub=on      # re-enable cmd_descr synth + mailbox push
+  -global r100-cm7.qinit-stub=on     # re-enable Stage 3b fw_version + init_done write-back
+  ```
+
+  Use these for bisecting q-cp regressions: turn `bd-done-stub=on`
+  if you suspect q-cp's BD walk before MSI-X, `qinit-stub=on` if
+  `init_done` polling hangs, and so on.
+
+Verifying the loop on a `--host` run:
+
+```
+$ tail output/<name>/host/serial.log
+… rbln_queue_test: queue test ok …                # silent on success; this line on the kmd's debug build only
+
+$ tail output/<name>/hils.log
+[HILS … cpu=0 INFO  func=0] cb_parse_write_data dst=0x50200ffc val=0xcafedead
+[HILS … cpu=0 INFO  func=0] cb_complete: send MSIx interrupt to host
+
+$ tail output/<name>/hdma.log
+hdma cl=0 rx op=CFG_WRITE req_id=0 dst=0xffc len=4 val=0xcafedead status=ok …
+
+$ tail output/<name>/msix.log
+msix off=0xffc db_data=0x0 vector=0 status=ok count=1
+
+$ python3 - <<'EOF'
+import socket
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect("output/<name>/host/monitor.sock")
+s.sendall(b"xp /1wx 0xf000200ffc\n"); print(s.recv(4096).decode())
+EOF
+# 0xf000200ffc: 0xcafedead   ← matches RBLN_MAGIC_CODE
+```
+
+Failure modes:
+
+- `rbln_queue_test: command-queue-0 has not same value, 0 != cafedead`
+  on the host serial — `cfg_mirror` write reached `cfg_shadow` but
+  the OP_CFG_WRITE never made it across. Check `hdma.log` on both
+  sides for a matching `op=CFG_WRITE dst=0xffc` frame; if missing,
+  inspect `npu/qemu.stderr.log` for `cfg-mirror write … HDMA emit
+  failed`.
+- Soft lockup in `rebel_hw_init` waiting on `init_done` — q-sys's
+  cold-boot `memset` on `DEVICE_COMMUNICATION_SPACE_BASE` was
+  rejected by an over-strict trap. Confirm
+  `r100_cm7_cfg_mirror_ops.valid` allows `min_access_size = 1` /
+  `max_access_size = 8` / `unaligned = true` (regression check:
+  search for `cfg-mirror write … out of bounds` in
+  `npu/qemu.stderr.log`).
+- `[cb] Current packet(0x1) is not supported` in `hils.log` —
+  `r100-cm7`'s legacy BD-done state machine completed the BD before
+  q-cp could parse it. Verify `r100-cm7.bd-done-stub` is `off`
+  (default) in `info qtree` on the NPU monitor.
 
 ## Interpreting a boot log
 

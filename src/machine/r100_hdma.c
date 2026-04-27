@@ -105,6 +105,12 @@ struct R100HDMAState {
     R100HDMARespCb cm7_cb;
     void *cm7_cb_opaque;
 
+    /* Optional outbound RX callback for OP_READ_RESPs in the
+     * r100-pcie-outbound req_id partition (0xC0..0xFF). Bound at
+     * realize time by r100-pcie-outbound. */
+    R100HDMARespCb outbound_cb;
+    void *outbound_cb_opaque;
+
     /* Counters. */
     uint64_t hdma_frames_sent;
     uint64_t hdma_frames_dropped;
@@ -223,6 +229,13 @@ void r100_hdma_set_cm7_callback(R100HDMAState *s, R100HDMARespCb cb,
 {
     s->cm7_cb = cb;
     s->cm7_cb_opaque = opaque;
+}
+
+void r100_hdma_set_outbound_callback(R100HDMAState *s, R100HDMARespCb cb,
+                                     void *opaque)
+{
+    s->outbound_cb = cb;
+    s->outbound_cb_opaque = opaque;
 }
 
 /* ------------------------------------------------------------------ */
@@ -555,6 +568,17 @@ static void r100_hdma_dispatch(R100HDMAState *s,
 
     if (r100_hdma_decode_req_id(hdr->req_id, &dir, &ch)) {
         r100_hdma_complete_rd_resp(s, dir, ch, hdr, payload);
+        return;
+    }
+    /* r100-pcie-outbound partition: 0xC0..0xFF. */
+    if (hdr->req_id >= R100_PCIE_OUTBOUND_REQ_ID_BASE) {
+        if (s->outbound_cb) {
+            s->outbound_cb(s->outbound_cb_opaque, hdr, payload);
+            return;
+        }
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "r100-hdma: READ_RESP req_id=0x%x in outbound "
+                      "partition but cb unbound\n", hdr->req_id);
         return;
     }
     /* Otherwise route to the cm7 partition (1..R100_CM7_MAX_QUEUES).
