@@ -525,20 +525,47 @@ static inline uint32_t r100_dnc_intid(uint32_t dnc_id, uint32_t cmd_type)
 #define R100_HDMA_CH_STRIDE         0x800u
 #define R100_HDMA_CH_COUNT          16u    /* per direction (WR or RD) */
 
-/* DesignWare dw_hdma_v0 per-channel register offsets (hdma_regs.h). */
+/* DesignWare dw_hdma_v0 per-channel register offsets (hdma_regs.h —
+ * struct hdma_ch_regs layout, offsets are per-element byte offsets
+ * from the WR/RD slot base computed by R100_HDMA_CH_STRIDE). */
 #define R100_HDMA_CH_REG_ENABLE         0x00u    /* RW0 = idle */
 #define R100_HDMA_CH_REG_DOORBELL       0x04u    /* HDMA_DB_START / STOP */
+#define R100_HDMA_CH_REG_ELEM_PF        0x08u    /* LL prefetch hint (RAZ/WI) */
+#define R100_HDMA_CH_REG_HANDSHAKE      0x0Cu    /* HW handshake (RAZ/WI) */
+#define R100_HDMA_CH_REG_LLP_LO         0x10u    /* LL head address low */
+#define R100_HDMA_CH_REG_LLP_HI         0x14u    /* LL head address high */
+#define R100_HDMA_CH_REG_CYCLE          0x18u    /* cycle.state / cycle.bit */
 #define R100_HDMA_CH_REG_XFER_SIZE      0x1Cu
 #define R100_HDMA_CH_REG_SAR_LO         0x20u
 #define R100_HDMA_CH_REG_SAR_HI         0x24u
 #define R100_HDMA_CH_REG_DAR_LO         0x28u
 #define R100_HDMA_CH_REG_DAR_HI         0x2Cu
+#define R100_HDMA_CH_REG_WATERMARK      0x30u    /* watermark IRQ enable */
+#define R100_HDMA_CH_REG_CTRL1          0x34u    /* LLEN / TYPE / RO / ... */
+#define R100_HDMA_CH_REG_FUNC_NUM       0x38u    /* PF/VF select (RAZ/WI) */
+#define R100_HDMA_CH_REG_QOS            0x3Cu    /* weight / pf-depth / TC */
 #define R100_HDMA_CH_REG_STATUS         0x80u    /* enum hdma_status */
 #define R100_HDMA_CH_REG_INT_STATUS     0x84u
+#define R100_HDMA_CH_REG_INT_SETUP      0x88u    /* RAIE/LAIE/RSIE/LSIE/... */
 #define R100_HDMA_CH_REG_INT_CLEAR      0x8Cu
+#define R100_HDMA_CH_REG_MSI_STOP_LO    0x90u
+#define R100_HDMA_CH_REG_MSI_STOP_HI    0x94u
+#define R100_HDMA_CH_REG_MSI_WATERMARK_LO 0x98u
+#define R100_HDMA_CH_REG_MSI_WATERMARK_HI 0x9Cu
+#define R100_HDMA_CH_REG_MSI_ABORT_LO   0xA0u
+#define R100_HDMA_CH_REG_MSI_ABORT_HI   0xA4u
+#define R100_HDMA_CH_REG_MSI_MSGD       0xA8u    /* MSI message data */
 
 #define R100_HDMA_DB_START_BIT          (1u << 0)
 #define R100_HDMA_DB_STOP_BIT           (1u << 1)
+
+/* CTRL1 bit definitions (hdma_regs.h HDMA_CTRL1_*). Only LLEN is
+ * load-bearing for the P5 LL walker — the rest are kept here as
+ * documentation so the regstore round-trips them faithfully on the
+ * test path q-cp's dump_regs uses. */
+#define R100_HDMA_CTRL1_LLEN_BIT        (1u << 0)
+#define R100_HDMA_CTRL1_TYPE_BIT        (1u << 1)
+#define R100_HDMA_CTRL1_RO_BIT          (1u << 4)
 
 /* hdma_status enum (q/cp/.../hdma_regs.h). q-cp polls for STOPPED. */
 #define R100_HDMA_STATUS_RUNNING        0u
@@ -549,6 +576,41 @@ static inline uint32_t r100_dnc_intid(uint32_t dnc_id, uint32_t cmd_type)
 #define R100_HDMA_INT_STOP_BIT          (1u << 0)
 #define R100_HDMA_INT_ABORT_BIT         (1u << 1)
 #define R100_HDMA_INT_WATERMARK_BIT     (1u << 2)
+
+/* P5: dw_hdma_v0 linked-list element shapes — sourced from
+ * external/.../q/cp/common/headers/public/qman_if_common.h. Each LL
+ * chain is a sequence of `dw_hdma_v0_lli` (24 B: ctrl, transfer_size,
+ * sar.reg, dar.reg) with optional `dw_hdma_v0_llp` (16 B: ctrl,
+ * reserved, llp.reg) jumps when q-cp's record_desc transitions to a
+ * new desc-buf chunk. The `control` field is shared across both shapes
+ * so the walker can pre-read the first 4 bytes to discriminate.
+ *
+ * CB     = element valid (cycle bit; q-cp always sets to 1)
+ * LLP    = element is a jump (LLP shape, follow llp.reg)
+ * LIE    = local-IRQ-enable on this LLI's completion (chain end marker
+ *          for our walker — q-cp's record_lli sets this on the last
+ *          data element, and a trailing record_llp(0,0) terminator
+ *          follows but the walker stops on LIE before reaching it). */
+#define R100_HDMA_LL_CTRL_CB            (1u << 0)
+#define R100_HDMA_LL_CTRL_TCB           (1u << 1)
+#define R100_HDMA_LL_CTRL_LLP           (1u << 2)
+#define R100_HDMA_LL_CTRL_LIE           (1u << 3)
+#define R100_HDMA_LL_CTRL_RIE           (1u << 4)
+
+#define R100_HDMA_LLI_SIZE              24u    /* sizeof(dw_hdma_v0_lli) */
+#define R100_HDMA_LLP_SIZE              16u    /* sizeof(dw_hdma_v0_llp) */
+
+/* Safety cap for the synchronous LL walker. Real chains are typically
+ * a handful of LLIs (one per contiguous PA range, q-cp splits at 2 MB
+ * page boundaries). 1024 elements covers a 2 GB chain without any
+ * runtime overhead, while still bailing out on a malformed cycle-bit
+ * loop instead of spinning the vCPU forever. */
+#define R100_HDMA_LL_MAX_ELEMS          1024u
+
+/* Per-chunk size for D2D in-NPU copies inside one LLI. The LLI's
+ * transfer_size can be up to 2 MB (q-cp's contiguous_size cap); we
+ * loop in 64 KB strides to keep the on-stack scratch reasonable. */
+#define R100_HDMA_D2D_CHUNK             (64u * 1024u)
 
 /* Common cmd_type value the M9-1c r100-cm7 cmd_descr synth seeds into
  * cmd_descr_common.cmd_type so q-cp's worker dispatches into the

@@ -1,6 +1,6 @@
 /*
  * REMU - R100 NPU System Emulator
- * DesignWare dw_hdma_v0 register-block model (M9-1c).
+ * DesignWare dw_hdma_v0 register-block model (M9-1c + P5).
  *
  * On silicon, q-cp's `hdma_if.c` programs DMA channels in a PCIe-
  * attached DesignWare HDMA controller at
@@ -9,32 +9,65 @@
  *               + U_PCIE_CORE_OFFSET (0x1C00000000)
  *               + PCIE_HDMA_OFFSET   (0x180380000)
  *
- * 16 WR + 16 RD channels each with a small register window (SAR,
- * DAR, XferSize, doorbell, status, int_status). q-cp:
- *   1. fills SAR/DAR/XferSize for a chosen channel,
- *   2. writes HDMA_DB_START_BIT to the doorbell,
- *   3. either polls hdma_ch_read_status until STOPPED or waits for
- *      an MSI on INT_ID_HDMA (= 186, single line shared across all
- *      32 channels; the per-channel "which one finished" bitmap
- *      lives in SUBCTRL_EDMA_INT_CA73 = 0x1FF8184368).
+ * 16 WR + 16 RD channels each with a small register window
+ * (struct hdma_ch_regs in q/cp/.../hdma_regs.h: enable, doorbell,
+ * elem_pf, handshake, llp, cycle, xfer_size, sar, dar, watermark,
+ * ctrl1, func_num, qos, status, int_status, int_setup, int_clear,
+ * msi_{stop,watermark,abort}, msi_msgd). q-cp's hdma_ch_trigger
+ * sequence is:
+ *
+ *     ctrl1   |= LLEN
+ *     func_num = pf/vf select
+ *     llp      = chain head (chan->desc)
+ *     enable   = 1
+ *     doorbell = HDMA_DB_START
+ *
+ * The completion path is either an MSI to the host (D2D channels —
+ * not exercised here, msi_stop fan-out deferred) or a local SPI on
+ * INT_ID_HDMA (= 186; single line shared across all 32 channels, with
+ * per-channel pending bitmap in SUBCTRL_EDMA_INT_CA73 at 0x1FF8184368).
+ * q-cp's hdma_forward_irq reads SUBCTRL_EDMA_INT_CA73 to find which
+ * channel finished and dispatches into hdma_irq_handler.
  *
  * REMU has neither the DW HDMA IP nor the actual PCIe RC, so this
  * device emulates the *peripheral effect* over the existing `hdma`
- * chardev (remu_hdma_proto.h). For each WR/RD doorbell:
+ * chardev (remu_hdma_proto.h). Two paths share the kick handler:
  *
- *   - WR (NPU → host): we emit OP_WRITE with payload pulled from
- *     chiplet-local sysmem at SAR. dst on the wire is the host DMA
- *     address (DAR, after stripping REMU_HOST_PHYS_BASE — kmd
- *     publishes in either convention; cm7_host_dma() does the same
- *     fix-up). The completion is fire-and-forget: status switches to
- *     STOPPED before the doorbell write returns, the SUBCTRL pending
- *     bit is set, and SPI 186 is pulsed.
+ *   1. Non-LL doorbell (M9-1c hand-driven test path) — single-shot
+ *      using the SAR/DAR/XFER_SIZE fields with no chain. WR is
+ *      fire-and-forget (status flips to STOPPED before the doorbell
+ *      write returns); RD parks `pending_req_id` and completes
+ *      asynchronously when the matching OP_READ_RESP arrives.
  *
- *   - RD (host → NPU): we emit OP_READ_REQ tagged with a
- *     channel-derived req_id (R100_HDMA_REQ_ID_CH_MASK_BASE | dir |
- *     ch). Status stays RUNNING until the matching OP_READ_RESP
- *     lands; on receipt we address_space_write the payload back into
- *     chiplet sysmem at DAR, then flip status + pulse SPI 186.
+ *   2. LL doorbell (P5; q-cp's `cmd_descr_hdma` / `hdma_ll_trigger`
+ *      production path) — when CTRL1.LLEN=1, the kick walks the
+ *      `dw_hdma_v0_lli`/`dw_hdma_v0_llp` chain rooted at LLP_LO|HI:
+ *
+ *        - read 24 B element header at the cursor (control,
+ *          transfer_size, sar, dar). The `control` byte's LLP bit
+ *          discriminates `dw_hdma_v0_llp` (16 B; jump to next chunk)
+ *          from `dw_hdma_v0_lli` (24 B; data transfer).
+ *        - for an LLI, route by SAR/DAR vs REMU_HOST_PHYS_BASE:
+ *            * dir=WR && DAR≥host: NPU→host. address_space_read at
+ *              SAR, emit OP_WRITE with stripped DAR. Chunked into
+ *              REMU_HDMA_MAX_PAYLOAD-sized frames.
+ *            * dir=RD && SAR≥host: host→NPU. Per chunk, emit
+ *              OP_READ_REQ with stripped SAR + park on the
+ *              channel's resp_cond via qemu_cond_wait_bql() (BQL
+ *              released so the chardev iothread can deliver
+ *              OP_READ_RESP). On wake, address_space_write the
+ *              payload at DAR.
+ *            * neither addr is host: D2D / NPU-internal copy. Direct
+ *              address_space_read → address_space_write loop.
+ *        - LIE bit on the LLI signals end-of-chain; on hit we exit
+ *          the loop, flip status to STOPPED, set INT_STOP, write the
+ *          per-channel SUBCTRL pending bit, and pulse SPI 186.
+ *
+ *      Sequential chunking + per-channel cond means each RD channel
+ *      can have at most one OP_READ_REQ in flight; the WR direction
+ *      is fire-and-forget. With only 16 RD channels and a single
+ *      `pending_req_id` slot per channel, the existing 0x80..0xBF
+ *      req_id partition is unchanged.
  *
  * The chardev backend is single-frontend (CharBackend), so r100-hdma
  * is the sole host-side counterpart and r100-cm7 reaches it through
@@ -42,12 +75,22 @@
  * partitions keep cm7's BD-done responses (1..R100_CM7_MAX_QUEUES)
  * from colliding with this device's channel-driven 0x80..0xBF range.
  *
+ * SMMU note: this engine consumes SAR/DAR as device PAs in the
+ * "bypass" regime (HDMA-SID LUT all entries SID=17, SSID.V=0; see
+ * docs/hdma-notion-notes.md § 4). REMU's r100_smmu.c is a register-
+ * only stub so S1∘S2 = identity, matching the regime kmd / q-cp use
+ * today. Honouring real FW page tables is tracked as a long-term
+ * follow-on (docs/roadmap.md → "SMMU honour FW page tables") — the
+ * natural plug point is a translation hook in
+ * r100_hdma_lli_{wr,rd,d2d} just before each address_space_* call.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/main-loop.h"
 #include "qapi/error.h"
 #include "hw/sysbus.h"
 #include "hw/irq.h"
@@ -74,15 +117,57 @@ typedef enum {
     R100_HDMA_DIR_RD = 1,    /* host → NPU */
 } R100HdmaDir;
 
+/*
+ * Per-channel walker state for LL mode (P5).
+ *
+ * Owned + accessed under BQL. The cond is ONLY used in the RD walk
+ * path so it can drop BQL while the chardev iothread delivers the
+ * matching OP_READ_RESP. WR walks are fire-and-forget per chunk and
+ * never touch the cond. We init/destroy on realize/unrealize (NOT in
+ * reset; cond_destroy on a parked waiter would deadlock the cluster
+ * reset path).
+ *
+ * Buffer is sized to one OP_READ_RESP frame (REMU_HDMA_MAX_PAYLOAD).
+ * Larger LLIs are chunked into back-to-back round trips, each
+ * consuming one resp slot — `pending_req_id` matches every chunk
+ * since only one OP_READ_REQ is in flight per channel at a time.
+ */
+typedef struct R100HdmaWalk {
+    QemuCond  resp_cond;
+    bool      ll_active;     /* LL walk in progress on this channel */
+    bool      resp_ready;    /* most recent RD chunk delivered */
+    uint32_t  resp_len;
+    uint8_t   resp_buf[REMU_HDMA_MAX_PAYLOAD];
+} R100HdmaWalk;
+
 typedef struct R100HdmaChan {
+    /* Programming registers (RW from q-cp's HAL). The set of fields
+     * here matches struct hdma_ch_regs in the firmware tree
+     * 1:1 except for padding_1[16] which we treat as RAZ/WI. */
     uint32_t enable;
     uint32_t doorbell;
+    uint32_t elem_pf;
+    uint32_t handshake;
+    uint64_t llp;            /* LL chain head; only meaningful with LLEN */
+    uint32_t cycle;
     uint32_t xfer_size;
     uint64_t sar;            /* WR: NPU phys; RD: host phys */
     uint64_t dar;            /* WR: host phys; RD: NPU phys */
+    uint32_t watermark;
+    uint32_t ctrl1;          /* LLEN bit gates LL-walk path */
+    uint32_t func_num;
+    uint32_t qos;
     uint32_t status;         /* RUNNING / STOPPED / ABORTED */
     uint32_t int_status;     /* STOP / ABORT / WATERMARK bits */
+    uint32_t int_setup;
+    uint64_t msi_stop;
+    uint64_t msi_watermark;
+    uint64_t msi_abort;
+    uint32_t msi_msgd;
+
     uint32_t pending_req_id; /* req_id assigned to RUNNING RD frame */
+
+    R100HdmaWalk walk;
 } R100HdmaChan;
 
 struct R100HDMAState {
@@ -409,11 +494,307 @@ static void r100_hdma_kick_rd(R100HDMAState *s, uint32_t ch)
     s->doorbells_started++;
 }
 
+/* ------------------------------------------------------------------ */
+/* P5: LL-mode walk                                                    */
+/* ------------------------------------------------------------------ */
+
+/* Run one chunk of a host→NPU LLI: emit OP_READ_REQ, park on the
+ * channel's resp_cond until r100_hdma_complete_rd_resp signals, then
+ * write the payload at dar_npu. Returns false on any failure (chardev
+ * disconnect, address_space_write fault). The caller is responsible
+ * for the chunk-loop bookkeeping (offsets) and for clearing
+ * c->pending_req_id once the LLI's chunks are exhausted. */
+static bool r100_hdma_lli_rd_chunk(R100HDMAState *s, uint32_t ch,
+                                   uint64_t sar_host, uint64_t dar_npu,
+                                   uint32_t chunk_len)
+{
+    R100HdmaChan *c = &s->ch[R100_HDMA_DIR_RD][ch];
+    uint32_t req_id = r100_hdma_make_req_id(R100_HDMA_DIR_RD, ch);
+    MemTxResult mr;
+
+    c->walk.resp_ready = false;
+    c->walk.resp_len = 0;
+    c->pending_req_id = req_id;
+
+    if (!r100_hdma_emit_read_req(s, req_id, sar_host, chunk_len,
+                                 "ll-rd")) {
+        return false;
+    }
+
+    /* BQL released across the wait so the chardev iothread can
+     * deliver OP_READ_RESP — same pattern as r100-pcie-outbound. */
+    while (!c->walk.resp_ready) {
+        qemu_cond_wait_bql(&c->walk.resp_cond);
+    }
+    if (c->walk.resp_len < chunk_len) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "r100-hdma: LL RD ch=%u short resp got=%u "
+                      "want=%u dar=0x%" PRIx64 "\n",
+                      ch, c->walk.resp_len, chunk_len, dar_npu);
+        /* Still write whatever came back — q-cp's CB walker will
+         * surface garbage in the destination, which is preferable
+         * to silently corrupting the channel state. */
+    }
+    mr = address_space_write(&address_space_memory, dar_npu,
+                             MEMTXATTRS_UNSPECIFIED, c->walk.resp_buf,
+                             c->walk.resp_len);
+    if (mr != MEMTX_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "r100-hdma: LL RD ch=%u dar=0x%" PRIx64
+                      " write failed\n", ch, dar_npu);
+        return false;
+    }
+    return true;
+}
+
+static bool r100_hdma_lli_rd(R100HDMAState *s, uint32_t ch,
+                             uint64_t sar_host, uint64_t dar_npu,
+                             uint32_t len)
+{
+    uint32_t off = 0;
+
+    while (off < len) {
+        uint32_t chunk = MIN(len - off, REMU_HDMA_MAX_PAYLOAD);
+        if (!r100_hdma_lli_rd_chunk(s, ch, sar_host + off,
+                                    dar_npu + off, chunk)) {
+            return false;
+        }
+        off += chunk;
+    }
+    return true;
+}
+
+static bool r100_hdma_lli_wr(R100HDMAState *s, uint32_t ch,
+                             uint64_t sar_npu, uint64_t dar_host,
+                             uint32_t len)
+{
+    uint32_t req_id = r100_hdma_make_req_id(R100_HDMA_DIR_WR, ch);
+    uint8_t  buf[REMU_HDMA_MAX_PAYLOAD];
+    uint32_t off = 0;
+    MemTxResult mr;
+
+    while (off < len) {
+        uint32_t chunk = MIN(len - off, REMU_HDMA_MAX_PAYLOAD);
+        mr = address_space_read(&address_space_memory, sar_npu + off,
+                                MEMTXATTRS_UNSPECIFIED, buf, chunk);
+        if (mr != MEMTX_OK) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "r100-hdma: LL WR ch=%u sar=0x%" PRIx64
+                          " read failed\n", ch, sar_npu + off);
+            return false;
+        }
+        if (!r100_hdma_emit_write_tagged(s, req_id, dar_host + off, buf,
+                                         chunk, "ll-wr")) {
+            return false;
+        }
+        off += chunk;
+    }
+    return true;
+}
+
+/* D2D / NPU-internal LLI copy. Both SAR and DAR are NPU PAs (with
+ * SMMU bypass — see the file-banner SMMU note). 64 KB scratch on the
+ * stack is comfortably below FreeRTOS_CP* task stacks (we're running
+ * on a vCPU thread, not in a guest task). Larger LLIs loop the
+ * scratch.
+ *
+ * `g_alloca` would be clearer but linux/posix `alloca` is
+ * size-bounded by the platform stack — keep this on a fixed-size
+ * static buffer to avoid surprises on stripped-down hosts. */
+static bool r100_hdma_lli_d2d(R100HDMAState *s, uint32_t ch,
+                              uint64_t sar_npu, uint64_t dar_npu,
+                              uint32_t len)
+{
+    uint8_t  buf[R100_HDMA_D2D_CHUNK];
+    uint32_t off = 0;
+    MemTxResult mr;
+
+    while (off < len) {
+        uint32_t chunk = MIN(len - off, sizeof(buf));
+        mr = address_space_read(&address_space_memory, sar_npu + off,
+                                MEMTXATTRS_UNSPECIFIED, buf, chunk);
+        if (mr != MEMTX_OK) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "r100-hdma: LL D2D ch=%u sar=0x%" PRIx64
+                          " read failed\n", ch, sar_npu + off);
+            return false;
+        }
+        mr = address_space_write(&address_space_memory, dar_npu + off,
+                                 MEMTXATTRS_UNSPECIFIED, buf, chunk);
+        if (mr != MEMTX_OK) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "r100-hdma: LL D2D ch=%u dar=0x%" PRIx64
+                          " write failed\n", ch, dar_npu + off);
+            return false;
+        }
+        off += chunk;
+    }
+    return true;
+}
+
+/* Walk one LL chain rooted at c->llp. Returns true iff the chain
+ * terminated on an LIE LLI (q-cp's "last data element" marker); false
+ * on any read/write error, malformed cycle bit, or runaway chain
+ * (R100_HDMA_LL_MAX_ELEMS guard).
+ *
+ * Element discrimination: the first 4 bytes of both shapes are the
+ * `control` u32. For dw_hdma_v0_lli (24 B) the layout is
+ * {control, transfer_size, sar.reg, dar.reg}; for dw_hdma_v0_llp
+ * (16 B) it's {control, reserved, llp.reg}. We pre-read 24 bytes
+ * (the larger of the two) and reuse the field positions accordingly.
+ * For an LLP element `transfer_size` slot is the reserved word and
+ * `sar` slot is the next-chain `llp.reg` — see qman_if_common.h. */
+static bool r100_hdma_walk_ll(R100HDMAState *s, R100HdmaDir dir,
+                              uint32_t ch)
+{
+    R100HdmaChan *c = &s->ch[dir][ch];
+    uint64_t cursor = c->llp;
+    int elems = 0;
+    bool last_seen = false;
+
+    if (cursor == 0) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "r100-hdma: LL walk dir=%d ch=%u with LLP=0\n",
+                      (int)dir, ch);
+        return false;
+    }
+
+    c->walk.ll_active = true;
+
+    while (cursor != 0 && elems < R100_HDMA_LL_MAX_ELEMS) {
+        struct {
+            uint32_t control;
+            uint32_t transfer_size;
+            uint64_t sar;
+            uint64_t dar;
+        } QEMU_PACKED elem;
+        MemTxResult mr;
+        bool ok = true;
+
+        mr = address_space_read(&address_space_memory, cursor,
+                                MEMTXATTRS_UNSPECIFIED, &elem,
+                                sizeof(elem));
+        if (mr != MEMTX_OK) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "r100-hdma: LL walk read elem ch=%u "
+                          "addr=0x%" PRIx64 " failed\n", ch,
+                          (uint64_t)cursor);
+            c->walk.ll_active = false;
+            return false;
+        }
+        elems++;
+
+        /* Cycle-bit invalid → end of chain (or trailing zero LLP
+         * record_llp(0,0) terminator). q-cp always sets CB on the
+         * LLI/LLP elements it builds. */
+        if (!(elem.control & R100_HDMA_LL_CTRL_CB)) {
+            break;
+        }
+
+        /* LLP shape: jump to next chain head. The dw_hdma_v0_llp
+         * layout puts llp.reg at offset +8, which lines up with our
+         * `sar` slot in the over-read above. */
+        if (elem.control & R100_HDMA_LL_CTRL_LLP) {
+            cursor = elem.sar;
+            continue;
+        }
+
+        /* LLI shape: dispatch by SAR/DAR direction. */
+        {
+            bool sar_host = (elem.sar >= REMU_HOST_PHYS_BASE);
+            bool dar_host = (elem.dar >= REMU_HOST_PHYS_BASE);
+
+            if (elem.transfer_size == 0) {
+                /* Empty LLI — q-cp doesn't emit these in the
+                 * cmd_descr_hdma path but the test_hdma_if unit
+                 * tests do; treat as no-op. */
+            } else if (sar_host && dar_host) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "r100-hdma: LL ch=%u dir=%d both addrs "
+                              "host (sar=0x%" PRIx64 " dar=0x%" PRIx64
+                              ") — unsupported\n",
+                              ch, (int)dir, elem.sar, elem.dar);
+                ok = false;
+            } else if (dir == R100_HDMA_DIR_WR && dar_host) {
+                ok = r100_hdma_lli_wr(
+                        s, ch, elem.sar,
+                        elem.dar - REMU_HOST_PHYS_BASE,
+                        elem.transfer_size);
+            } else if (dir == R100_HDMA_DIR_RD && sar_host) {
+                ok = r100_hdma_lli_rd(
+                        s, ch,
+                        elem.sar - REMU_HOST_PHYS_BASE,
+                        elem.dar, elem.transfer_size);
+            } else {
+                /* D2D / NPU-internal copy. q-cp's dev_hdma_handle
+                 * pre-translates SAR/DAR for the local chiplet via
+                 * IPA_TO_PA, so we land here when both SAR and DAR
+                 * are NPU PAs. SMMU bypass means PA == DVA. */
+                ok = r100_hdma_lli_d2d(s, ch, elem.sar, elem.dar,
+                                       elem.transfer_size);
+            }
+        }
+
+        if (!ok) {
+            c->walk.ll_active = false;
+            return false;
+        }
+
+        if (elem.control & R100_HDMA_LL_CTRL_LIE) {
+            last_seen = true;
+            break;
+        }
+
+        cursor += R100_HDMA_LLI_SIZE;
+    }
+
+    c->walk.ll_active = false;
+    if (!last_seen) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "r100-hdma: LL walk dir=%d ch=%u terminated "
+                      "without LIE (elems=%d cursor=0x%" PRIx64 ")\n",
+                      (int)dir, ch, elems, (uint64_t)cursor);
+        return false;
+    }
+    return true;
+}
+
+static void r100_hdma_kick_ll(R100HDMAState *s, R100HdmaDir dir,
+                              uint32_t ch)
+{
+    R100HdmaChan *c = &s->ch[dir][ch];
+    bool ok;
+
+    c->status = R100_HDMA_STATUS_RUNNING;
+    c->int_status = 0;
+    s->doorbells_started++;
+
+    ok = r100_hdma_walk_ll(s, dir, ch);
+    if (ok) {
+        c->status = R100_HDMA_STATUS_STOPPED;
+        c->int_status |= R100_HDMA_INT_STOP_BIT;
+    } else {
+        c->status = R100_HDMA_STATUS_ABORTED;
+        c->int_status |= R100_HDMA_INT_ABORT_BIT;
+        s->doorbells_dropped++;
+    }
+    c->pending_req_id = 0;
+    r100_hdma_signal_completion(s, dir, ch);
+}
+
+/* ------------------------------------------------------------------ */
+/* Doorbell entry                                                      */
+/* ------------------------------------------------------------------ */
+
 static void r100_hdma_doorbell(R100HDMAState *s, R100HdmaDir dir,
                                uint32_t ch, uint32_t val)
 {
     if (val & R100_HDMA_DB_START_BIT) {
-        if (dir == R100_HDMA_DIR_WR) {
+        R100HdmaChan *c = &s->ch[dir][ch];
+
+        if (c->ctrl1 & R100_HDMA_CTRL1_LLEN_BIT) {
+            r100_hdma_kick_ll(s, dir, ch);
+        } else if (dir == R100_HDMA_DIR_WR) {
             r100_hdma_kick_wr(s, ch);
         } else {
             r100_hdma_kick_rd(s, ch);
@@ -440,17 +821,40 @@ static uint64_t r100_hdma_read(void *opaque, hwaddr addr, unsigned size)
     }
     c = &s->ch[dir][ch];
     switch (reg) {
-    case R100_HDMA_CH_REG_ENABLE:     return c->enable;
-    case R100_HDMA_CH_REG_DOORBELL:   return c->doorbell;
-    case R100_HDMA_CH_REG_XFER_SIZE:  return c->xfer_size;
-    case R100_HDMA_CH_REG_SAR_LO:     return (uint32_t)c->sar;
-    case R100_HDMA_CH_REG_SAR_HI:     return (uint32_t)(c->sar >> 32);
-    case R100_HDMA_CH_REG_DAR_LO:     return (uint32_t)c->dar;
-    case R100_HDMA_CH_REG_DAR_HI:     return (uint32_t)(c->dar >> 32);
-    case R100_HDMA_CH_REG_STATUS:     return c->status;
-    case R100_HDMA_CH_REG_INT_STATUS: return c->int_status;
-    case R100_HDMA_CH_REG_INT_CLEAR:  return 0;
-    default:                           return 0;
+    case R100_HDMA_CH_REG_ENABLE:        return c->enable;
+    case R100_HDMA_CH_REG_DOORBELL:      return c->doorbell;
+    case R100_HDMA_CH_REG_ELEM_PF:       return c->elem_pf;
+    case R100_HDMA_CH_REG_HANDSHAKE:     return c->handshake;
+    case R100_HDMA_CH_REG_LLP_LO:        return (uint32_t)c->llp;
+    case R100_HDMA_CH_REG_LLP_HI:        return (uint32_t)(c->llp >> 32);
+    case R100_HDMA_CH_REG_CYCLE:         return c->cycle;
+    case R100_HDMA_CH_REG_XFER_SIZE:     return c->xfer_size;
+    case R100_HDMA_CH_REG_SAR_LO:        return (uint32_t)c->sar;
+    case R100_HDMA_CH_REG_SAR_HI:        return (uint32_t)(c->sar >> 32);
+    case R100_HDMA_CH_REG_DAR_LO:        return (uint32_t)c->dar;
+    case R100_HDMA_CH_REG_DAR_HI:        return (uint32_t)(c->dar >> 32);
+    case R100_HDMA_CH_REG_WATERMARK:     return c->watermark;
+    case R100_HDMA_CH_REG_CTRL1:         return c->ctrl1;
+    case R100_HDMA_CH_REG_FUNC_NUM:      return c->func_num;
+    case R100_HDMA_CH_REG_QOS:           return c->qos;
+    case R100_HDMA_CH_REG_STATUS:        return c->status;
+    case R100_HDMA_CH_REG_INT_STATUS:    return c->int_status;
+    case R100_HDMA_CH_REG_INT_SETUP:     return c->int_setup;
+    case R100_HDMA_CH_REG_INT_CLEAR:     return 0;
+    case R100_HDMA_CH_REG_MSI_STOP_LO:
+        return (uint32_t)c->msi_stop;
+    case R100_HDMA_CH_REG_MSI_STOP_HI:
+        return (uint32_t)(c->msi_stop >> 32);
+    case R100_HDMA_CH_REG_MSI_WATERMARK_LO:
+        return (uint32_t)c->msi_watermark;
+    case R100_HDMA_CH_REG_MSI_WATERMARK_HI:
+        return (uint32_t)(c->msi_watermark >> 32);
+    case R100_HDMA_CH_REG_MSI_ABORT_LO:
+        return (uint32_t)c->msi_abort;
+    case R100_HDMA_CH_REG_MSI_ABORT_HI:
+        return (uint32_t)(c->msi_abort >> 32);
+    case R100_HDMA_CH_REG_MSI_MSGD:      return c->msi_msgd;
+    default:                              return 0;
     }
 }
 
@@ -475,6 +879,22 @@ static void r100_hdma_write(void *opaque, hwaddr addr, uint64_t val,
         c->doorbell = v32;
         r100_hdma_doorbell(s, dir, ch, v32);
         break;
+    case R100_HDMA_CH_REG_ELEM_PF:
+        c->elem_pf = v32;
+        break;
+    case R100_HDMA_CH_REG_HANDSHAKE:
+        c->handshake = v32;
+        break;
+    case R100_HDMA_CH_REG_LLP_LO:
+        c->llp = (c->llp & 0xFFFFFFFF00000000ULL) | v32;
+        break;
+    case R100_HDMA_CH_REG_LLP_HI:
+        c->llp = (c->llp & 0x00000000FFFFFFFFULL) |
+                 ((uint64_t)v32 << 32);
+        break;
+    case R100_HDMA_CH_REG_CYCLE:
+        c->cycle = v32;
+        break;
     case R100_HDMA_CH_REG_XFER_SIZE:
         c->xfer_size = v32;
         break;
@@ -492,8 +912,47 @@ static void r100_hdma_write(void *opaque, hwaddr addr, uint64_t val,
         c->dar = (c->dar & 0x00000000FFFFFFFFULL) |
                  ((uint64_t)v32 << 32);
         break;
+    case R100_HDMA_CH_REG_WATERMARK:
+        c->watermark = v32;
+        break;
+    case R100_HDMA_CH_REG_CTRL1:
+        c->ctrl1 = v32;
+        break;
+    case R100_HDMA_CH_REG_FUNC_NUM:
+        c->func_num = v32;
+        break;
+    case R100_HDMA_CH_REG_QOS:
+        c->qos = v32;
+        break;
+    case R100_HDMA_CH_REG_INT_SETUP:
+        c->int_setup = v32;
+        break;
     case R100_HDMA_CH_REG_INT_CLEAR:
         c->int_status &= ~v32;
+        break;
+    case R100_HDMA_CH_REG_MSI_STOP_LO:
+        c->msi_stop = (c->msi_stop & 0xFFFFFFFF00000000ULL) | v32;
+        break;
+    case R100_HDMA_CH_REG_MSI_STOP_HI:
+        c->msi_stop = (c->msi_stop & 0x00000000FFFFFFFFULL) |
+                      ((uint64_t)v32 << 32);
+        break;
+    case R100_HDMA_CH_REG_MSI_WATERMARK_LO:
+        c->msi_watermark = (c->msi_watermark & 0xFFFFFFFF00000000ULL) | v32;
+        break;
+    case R100_HDMA_CH_REG_MSI_WATERMARK_HI:
+        c->msi_watermark = (c->msi_watermark & 0x00000000FFFFFFFFULL) |
+                           ((uint64_t)v32 << 32);
+        break;
+    case R100_HDMA_CH_REG_MSI_ABORT_LO:
+        c->msi_abort = (c->msi_abort & 0xFFFFFFFF00000000ULL) | v32;
+        break;
+    case R100_HDMA_CH_REG_MSI_ABORT_HI:
+        c->msi_abort = (c->msi_abort & 0x00000000FFFFFFFFULL) |
+                       ((uint64_t)v32 << 32);
+        break;
+    case R100_HDMA_CH_REG_MSI_MSGD:
+        c->msi_msgd = v32;
         break;
     case R100_HDMA_CH_REG_STATUS:
     case R100_HDMA_CH_REG_INT_STATUS:
@@ -520,10 +979,32 @@ static void r100_hdma_complete_rd_resp(R100HDMAState *s,
                                        const uint8_t *payload)
 {
     R100HdmaChan *c = &s->ch[dir][ch];
-    uint64_t npu_dst = (uint64_t)s->chiplet_id * R100_CHIPLET_OFFSET +
-                       c->dar;
+    uint64_t npu_dst;
     MemTxResult mr;
 
+    /* P5: LL walker has BQL released and is parked on resp_cond.
+     * Hand off the payload + signal; the walker proceeds with
+     * address_space_write itself and counts the chunk towards the
+     * LLI offset. status/SUBCTRL pending is not flipped here —
+     * r100_hdma_kick_ll does that after the whole chain finishes. */
+    if (c->walk.ll_active) {
+        if (hdr->req_id != c->pending_req_id) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "r100-hdma: LL RD ch=%u stray RESP req_id="
+                          "0x%x (pending=0x%x)\n",
+                          ch, hdr->req_id, c->pending_req_id);
+            return;
+        }
+        c->walk.resp_len = MIN(hdr->len,
+                               (uint32_t)sizeof(c->walk.resp_buf));
+        memcpy(c->walk.resp_buf, payload, c->walk.resp_len);
+        c->walk.resp_ready = true;
+        qemu_cond_broadcast(&c->walk.resp_cond);
+        return;
+    }
+
+    /* Non-LL single-shot path (M9-1c hand-driven test). */
+    npu_dst = (uint64_t)s->chiplet_id * R100_CHIPLET_OFFSET + c->dar;
     if (hdr->len != c->xfer_size) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "r100-hdma: RD ch=%u resp len mismatch got=%u "
@@ -620,12 +1101,23 @@ static void r100_hdma_realize(DeviceState *dev, Error **errp)
     R100HDMAState *s = R100_HDMA(dev);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
     char name[64];
+    uint32_t dir, ch;
 
     snprintf(name, sizeof(name), "r100-hdma.cl%u", s->chiplet_id);
     memory_region_init_io(&s->iomem, OBJECT(dev), &r100_hdma_ops, s,
                           name, R100_HDMA_SIZE);
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->hdma_irq);
+
+    /* P5: per-channel cond for the LL walker's RD parking. Init
+     * here (not in reset) so a cluster reset that fires while a vCPU
+     * is parked doesn't tear down the cond underneath it — reset just
+     * clears the boolean state and broadcasts. */
+    for (dir = 0; dir < 2; dir++) {
+        for (ch = 0; ch < R100_HDMA_CH_COUNT; ch++) {
+            qemu_cond_init(&s->ch[dir][ch].walk.resp_cond);
+        }
+    }
 
     if (qemu_chr_fe_backend_connected(&s->hdma_chr)) {
         qemu_chr_fe_set_handlers(&s->hdma_chr, r100_hdma_can_receive,
@@ -637,6 +1129,13 @@ static void r100_hdma_realize(DeviceState *dev, Error **errp)
 static void r100_hdma_unrealize(DeviceState *dev)
 {
     R100HDMAState *s = R100_HDMA(dev);
+    uint32_t dir, ch;
+
+    for (dir = 0; dir < 2; dir++) {
+        for (ch = 0; ch < R100_HDMA_CH_COUNT; ch++) {
+            qemu_cond_destroy(&s->ch[dir][ch].walk.resp_cond);
+        }
+    }
 
     qemu_chr_fe_deinit(&s->hdma_chr, false);
     qemu_chr_fe_deinit(&s->hdma_debug_chr, false);
@@ -645,9 +1144,48 @@ static void r100_hdma_unrealize(DeviceState *dev)
 static void r100_hdma_reset(DeviceState *dev)
 {
     R100HDMAState *s = R100_HDMA(dev);
+    uint32_t dir, ch;
 
     remu_hdma_rx_reset(&s->rx);
-    memset(s->ch, 0, sizeof(s->ch));
+
+    /* Reset clears the programming state but preserves the conds —
+     * memset over the cond is undefined since QemuCond wraps a
+     * pthread_cond_t. Field-clear here, then wake any parked walker
+     * so it bails out cleanly with resp_ready=false (the walker
+     * polls the bool and re-loops, but ll_active=false makes the
+     * outer kick path exit on the next iteration). */
+    for (dir = 0; dir < 2; dir++) {
+        for (ch = 0; ch < R100_HDMA_CH_COUNT; ch++) {
+            R100HdmaChan *c = &s->ch[dir][ch];
+
+            c->enable = 0;
+            c->doorbell = 0;
+            c->elem_pf = 0;
+            c->handshake = 0;
+            c->llp = 0;
+            c->cycle = 0;
+            c->xfer_size = 0;
+            c->sar = 0;
+            c->dar = 0;
+            c->watermark = 0;
+            c->ctrl1 = 0;
+            c->func_num = 0;
+            c->qos = 0;
+            c->status = 0;
+            c->int_status = 0;
+            c->int_setup = 0;
+            c->msi_stop = 0;
+            c->msi_watermark = 0;
+            c->msi_abort = 0;
+            c->msi_msgd = 0;
+            c->pending_req_id = 0;
+            c->walk.ll_active = false;
+            c->walk.resp_ready = false;
+            c->walk.resp_len = 0;
+            memset(c->walk.resp_buf, 0, sizeof(c->walk.resp_buf));
+            qemu_cond_broadcast(&c->walk.resp_cond);
+        }
+    }
     /* Counters survive reset by convention (see r100-cm7). */
 }
 

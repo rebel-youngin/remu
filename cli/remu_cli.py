@@ -17,7 +17,7 @@ Usage:
     ./remucli gdb [--port PORT] [-b ELF]
     ./remucli status
     ./remucli images [--check | --from-dir PATH]
-    ./remucli test [m5|m6|m7|m8|all]...
+    ./remucli test [m5|m6|m7|m8|p4a|p4b|p5|all]...
     ./remucli clean [--name NAME | --all]
     ./remucli completion {bash,zsh,fish}
 """
@@ -2380,6 +2380,12 @@ TEST_REGISTRY = {
         "script": "tests/p4b_rbdma_oto_test.py",
         "run_name": "p4b-rbdma",
         "desc": "P4B r100-rbdma OTO: gdbstub-driven 4 KB byte-move via shm splice",
+        "needs": ("aarch64", "x86_64"),
+    },
+    "p5": {
+        "script": "tests/p5_hdma_ll_test.py",
+        "run_name": "p5-hdma",
+        "desc": "P5 r100-hdma LL: gdbstub-driven dw_hdma_v0_lli D2D byte-move",
         "needs": ("aarch64", "x86_64"),
     },
 }

@@ -24,7 +24,7 @@ around `cli/remu_cli.py`). Only runtime dep: `pip install --user click`.
 ./remucli run --name my-test        # Phase 1: NPU only → output/my-test/
 ./remucli run --name dbg --gdb      # Phase 1: paused, GDB on :1234
 ./remucli run --host --name pair    # Phase 2: NPU + x86 host QEMUs + r100-npu-pci bridge
-./remucli test                      # M5/M6/M7/M8 bridge tests (`test m5 m7` for subset)
+./remucli test                      # M5/M6/M7/M8/P4A/P4B/P5 bridge tests (`test m5 p5` for subset)
 ./remucli clean --name pair         # wipe orphan procs/shm/sockets from a SIGKILL'd run
 ./remucli clean --all               # nuke every REMU-shaped process + /dev/shm/remu-*
 ./guest/build-guest-image.sh        # M8b Stage 2: stage images/x86_guest/{bzImage,initramfs.cpio.gz}
@@ -397,6 +397,20 @@ cleanup so SIGKILL'd prior state never poisons the next:
   RUN_CONF1 trigger. Asserts byte-for-byte equality at the destination
   via the same shm mmap. Exercises the full P4B byte-mover path end-to-end
   in a single test process (no umd/kmd/x86 boot stack on the critical path).
+- `tests/p5_hdma_ll_test.py` — `--host` boot, mirrors the p4b shm-splice
+  + gdbstub harness (gdbstub on `tcp::4568` to avoid clashing with p4b).
+  Stages a single `dw_hdma_v0_lli{ctrl=CB|LIE, transfer_size=4 KB,
+  sar=0x07000000, dar=0x07800000}` followed by a
+  `record_llp(0,0)` terminator at chiplet-0 DRAM offset `0x07900000`,
+  then drives `CTRL1=LLEN`, `LLP_LO|HI=desc`, `ENABLE=1`,
+  `DOORBELL=START` against `r100-hdma` WR-ch0 at
+  `0x1C00000000 + 0x180380000`. Both SAR/DAR are NPU-local DRAM so the
+  walker takes the D2D in-process loop (`address_space_read` →
+  `address_space_write`) — covers the LL chain decode + control-bit
+  walking without depending on a live host BAR. The host-leg paths
+  (NPU→host OP_WRITE chunking, host→NPU OP_READ_REQ + parked
+  `qemu_cond_wait_bql()` round-trip) fall out of P10's umd `simple_copy`
+  via a one-line address_space ↔ chardev swap from the D2D path.
 
 All `./remucli run` invocations write into `output/<name>/` (or
 `output/run-<timestamp>/` if `--name` omitted). Never pass `/tmp/`
