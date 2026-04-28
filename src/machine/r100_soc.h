@@ -41,6 +41,30 @@ struct R100SoCMachineState {
      * would fail with "Device not found". */
     char *memdev_id;
 
+    /* `-machine r100-soc,host-ram=<id>` : P10-fix splice. The host
+     * x86 QEMU's main RAM is itself backed by a shareable
+     * memory-backend-file; mounting the same backend on the NPU side
+     * lets r100-pcie-outbound's PF-window MR be a plain alias over
+     * those bytes (instead of round-tripping iATU reads/writes through
+     * the `hdma` chardev). q-cp's `hq_task` then dereferences the kmd's
+     * coherent DMA pages as cheaply as a normal RAM load — no
+     * BQL-stalled cond_wait, no chardev iothread on the hot path.
+     * Resolved lazily at machine-init time (same late-binding
+     * reasoning as memdev). */
+    char *host_ram_id;
+
+    /* `-machine r100-soc,cfg-shadow=<id>` : P10-fix cfg-mirror splice.
+     * 4 KB shareable memory-backend-file aliased over the r100-cm7
+     * cfg-mirror trap at DEVICE_COMMUNICATION_SPACE_BASE. The host's
+     * r100-npu-pci aliases the same backend over its BAR2 cfg-head
+     * subregion, so kmd writes to FUNC_SCRATCH / DDH_BASE_LO are
+     * observable on q-cp's next read with no cfg-chardev round trip
+     * — eliminates the cfg/doorbell ordering race exposed once the
+     * outbound iATU stopped serialising on `hdma`. Resolved lazily
+     * at machine-init time (same late-binding reasoning as memdev /
+     * host-ram). */
+    char *cfg_shadow_id;
+
     /* `-machine r100-soc,doorbell=<chardev-id>` : M6 cross-process
      * doorbell ingress from the x86 host guest's BAR4. Resolved to a
      * Chardev at machine-init time for the same reason memdev is
@@ -89,28 +113,16 @@ struct R100SoCMachineState {
      * frame emitted). Mirror of doorbell_debug_chardev_id. */
     char *issr_debug_chardev_id;
 
-    /* `-machine r100-soc,cfg=<chardev-id>` : host→NPU BAR2 cfg-head
-     * mirror. When set, host-side r100-npu-pci installs a 4 KB MMIO
-     * trap at BAR2 offset FW_LOGBUF_SIZE and forwards every write to
-     * this chardev as an 8-byte (cfg_off, val) frame; NPU-side
-     * r100-cm7 consumes them into cfg_shadow[] which is exposed to
-     * q-cp via the P1b cfg-mirror MMIO trap at
-     * R100_DEVICE_COMM_SPACE_BASE. Same late-binding rule as memdev /
-     * doorbell / msix / issr. */
-    char *cfg_chardev_id;
-    /* Optional debug tail for cfg ingress (one ASCII line per
-     * received frame). Mirror of doorbell_debug_chardev_id. */
-    char *cfg_debug_chardev_id;
-
-    /* `-machine r100-soc,hdma=<chardev-id>` : NPU<->host HDMA executor.
-     * Bidirectional variable-length frames (remu_hdma_proto.h):
-     * r100-hdma's MMIO-driven channels (OP_WRITE / OP_READ_REQ in the
-     * 0x80..0xBF req_id partition), r100-pcie-outbound's synchronous
-     * PF-window reads (0xC0..0xFF), and r100-cm7's cfg-mirror
-     * reverse-path OP_CFG_WRITE (req_id 0). Host-side r100-npu-pci
-     * decodes and executes them as pci_dma_{read,write} plus local
-     * cfg-head shadow stores, and emits OP_READ_RESP back. Same
-     * late-binding rule as memdev / doorbell / msix / issr / cfg. */
+    /* `-machine r100-soc,hdma=<chardev-id>` : NPU→host HDMA executor.
+     * Variable-length frames (remu_hdma_proto.h): r100-hdma's
+     * MMIO-driven channels publish OP_WRITE / OP_READ_REQ in the
+     * 0x80..0xBF req_id partition; host-side r100-npu-pci decodes and
+     * executes them as pci_dma_{read,write} and emits OP_READ_RESP
+     * back. P10-fix retired the prior r100-cm7 OP_CFG_WRITE
+     * reverse-path (req_id 0x00) and the r100-pcie-outbound
+     * synchronous PF-window reads (0xC0..0xFF) — both partitions are
+     * available again for UMQ multi-queue scaffolding. Same
+     * late-binding rule as memdev / doorbell / msix / issr. */
     char *hdma_chardev_id;
     /* Optional debug tail for hdma (one ASCII line per frame sent or
      * received). Mirror of doorbell_debug_chardev_id. */

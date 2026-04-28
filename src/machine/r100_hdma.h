@@ -7,25 +7,31 @@
  * other NPU-side models call against the chardev backend r100-hdma
  * owns.
  *
- * As of M9-1c r100-hdma is the single owner of the `hdma` chardev:
- *
- *   - r100-cm7 (cfg-mirror reverse path) emits OP_CFG_WRITE through
- *     `r100_hdma_emit_cfg_write` so q-cp's NPU-side stores into the
- *     BAR2 cfg-head shadow round-trip back to the kmd. cm7 has no
- *     incoming OP_READ_RESP consumer of its own.
+ * As of M9-1c r100-hdma is the single owner of the `hdma` chardev.
+ * Two on-NPU senders share the wire under disjoint req_id partitions
+ * (canonical map in src/include/r100/remu_addrmap.h):
  *
  *   - q-cp itself drives MMIO-level channel transactions through the
  *     r100-hdma SysBus MMIO region; the device translates each
- *     doorbell into a chardev frame using a disjoint req_id partition
- *     (0x80..0xBF) and consumes its own OP_READ_RESPs locally.
+ *     doorbell into a chardev frame using partition 0x80..0xBF and
+ *     consumes its own OP_READ_RESPs locally.
  *
- *   - r100-pcie-outbound parks vCPUs on synchronous PF-window reads
- *     in the 0xC0..0xFF partition; r100-hdma dispatches matching
- *     OP_READ_RESPs back through the registered outbound callback.
+ * Two historical chardev consumers retired with the P10-fix shared-
+ * memory plumbing:
  *
- * Splitting the chardev would have required a second host-side
- * frontend — QEMU CharBackends are single-frontend — so r100-hdma
- * mediates and r100-cm7 reaches it via a QOM link.
+ *   - r100-pcie-outbound used to park vCPUs on synchronous PF-window
+ *     reads in the 0xC0..0xFF partition with an OP_READ_REQ /
+ *     OP_READ_RESP round-trip. It now aliases the host-ram backend
+ *     directly, so the partition is reserved.
+ *
+ *   - r100-cm7 used to push P1b cfg-mirror writes upstream as
+ *     OP_CFG_WRITE frames at req_id 0x00. The NPU and host x86 QEMUs
+ *     now alias a shared `cfg-shadow` memory-backend-file over their
+ *     BAR2 cfg-head / cfg-mirror MMIO traps, so NPU-side stores are
+ *     visible to the kmd's next `rebel_cfg_read` with no chardev round
+ *     trip; the opcode and partition are reserved.
+ *
+ * See r100_cm7.c / r100_npu_pci.c / r100_pcie_outbound.c file banners.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -40,10 +46,10 @@
 typedef struct R100HDMAState R100HDMAState;
 
 /*
- * Emit one OP_WRITE / OP_READ_REQ / OP_CFG_WRITE frame on the chardev.
- * Returns true on success, false on disconnected backend or short
- * write (counters incremented on the device for either path; caller
- * may log additional context). `req_id` must follow the partitioning
+ * Emit one OP_WRITE / OP_READ_REQ frame on the chardev. Returns true
+ * on success, false on disconnected backend or short write (counters
+ * incremented on the device for either path; caller may log
+ * additional context). `req_id` must follow the partitioning
  * documented in remu_hdma_proto.h — passing a value outside the
  * caller's allocated range is a programming error and emits
  * LOG_GUEST_ERROR but the frame still goes out.
@@ -57,30 +63,5 @@ bool r100_hdma_emit_write_tagged(R100HDMAState *s, uint32_t req_id,
 bool r100_hdma_emit_read_req(R100HDMAState *s, uint32_t req_id,
                              uint64_t src, uint32_t read_len,
                              const char *tag);
-bool r100_hdma_emit_cfg_write(R100HDMAState *s, uint32_t req_id,
-                              uint32_t cfg_off, uint32_t val,
-                              const char *tag);
-
-/*
- * Register a response callback for OP_READ_RESP frames whose req_id
- * falls in an "external subscriber" partition. r100-hdma's RX demux
- * always handles its own MMIO-channel partition (0x80..0xBF)
- * internally; everything else is routed by partition through the
- * registered callback. Setting `cb=NULL` unbinds.
- *
- * The callback runs synchronously inside the chardev RX context
- * (BQL held) so it must not block on any other lock. The single
- * caller today is r100-pcie-outbound's sync-read pump, which
- * re-enters r100_hdma_emit_* freely.
- *
- * Partition map (also documented in remu_addrmap.h):
- *
- *   set_outbound_callback — req_id 0xC0..0xFF (P1 PCIe outbound
- *                            iATU-window synchronous reads).
- */
-typedef void (*R100HDMARespCb)(void *opaque, const RemuHdmaHeader *hdr,
-                               const uint8_t *payload);
-void r100_hdma_set_outbound_callback(R100HDMAState *s, R100HDMARespCb cb,
-                                     void *opaque);
 
 #endif /* R100_HDMA_H */

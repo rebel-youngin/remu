@@ -8,7 +8,7 @@
  * host-side r100-npu-pci decodes each frame and executes it against
  * the x86 guest's PCI DMA space via pci_dma_{write,read}.
  *
- * The channel is bidirectional with four opcodes:
+ * The channel is bidirectional with three opcodes:
  *
  *   OP_WRITE     (NPU -> host) pci_dma_write(dst, payload, len)
  *   OP_READ_REQ  (NPU -> host) "please pci_dma_read(src=dst, len) and
@@ -17,36 +17,41 @@
  *                               payload follows the header on the wire.
  *   OP_READ_RESP (host -> NPU) "here's len bytes that were at src=dst
  *                               for req_id"
- *   OP_CFG_WRITE (NPU -> host) "store payload[0] into your BAR2
- *                               cfg-head shadow at offset dst" — the
- *                               reverse of the host->NPU cfg
- *                               forwarding path, used so the NPU side
- *                               can publish FUNC_SCRATCH values the
- *                               kmd reads via rebel_cfg_read().
+ *
+ * The historical `OP_CFG_WRITE` opcode (NPU -> host store into the
+ * host's BAR2 cfg-head shadow at offset `dst`) was retired together
+ * with the chardev-mediated cfg path: the host x86 QEMU and the NPU
+ * QEMU now alias a shared `cfg-shadow` memory-backend-file over their
+ * BAR2 cfg-head and cfg-mirror MMIO traps respectively, so NPU-side
+ * stores are visible to the kmd's next `rebel_cfg_read` with no
+ * round trip — see r100_cm7.c / r100_npu_pci.c file banners. Opcode
+ * 4 stays unallocated.
  *
  * Variable-length frames:
  *
  *   +0  u32 magic   = 'HDMA' little-endian (sync / framing paranoia)
  *   +4  u32 op      = REMU_HDMA_OP_*
  *   +8  u64 dst     = destination DMA addr (WRITE) / source DMA addr
- *                     (READ_REQ, echoed in RESP) / cfg-head byte
- *                     offset (CFG_WRITE)
- *   +16 u32 len     = payload length in bytes (WRITE / READ_RESP /
- *                     CFG_WRITE), OR requested read length for
- *                     READ_REQ — that op carries no payload on the
- *                     wire so rx_feed short-circuits payload
- *                     accumulation after decoding the header.
+ *                     (READ_REQ, echoed in RESP)
+ *   +16 u32 len     = payload length in bytes (WRITE / READ_RESP),
+ *                     OR requested read length for READ_REQ — that
+ *                     op carries no payload on the wire so rx_feed
+ *                     short-circuits payload accumulation after
+ *                     decoding the header.
  *   +20 u32 req_id  = opaque tag echoed from REQ into matching RESP.
  *                     Partitioned across NPU-side senders so concurrent
  *                     callers' RESPs disentangle without a dispatcher
  *                     table per device:
  *
- *                       0x00         — r100-cm7 OP_CFG_WRITE upstream
- *                                      from the P1b cfg-mirror reverse
- *                                      path (OP_CFG_WRITE has no
- *                                      matching response on the wire).
- *                       0x01..0x7F   — reserved (UMQ multi-queue may
- *                                      reclaim this range).
+ *                       0x00..0x7F   — reserved. The legacy cm7
+ *                                      BD-done partition lived at
+ *                                      0x01..0x0F until P7 retired
+ *                                      the FSM and the P1b cfg-mirror
+ *                                      reverse-emit at 0x00 was
+ *                                      retired with the shm-backed
+ *                                      cfg-shadow alias. UMQ
+ *                                      multi-queue may reclaim this
+ *                                      range.
  *                       0x80..0xBF   — r100-hdma MMIO-driven channel
  *                                      ops, encoded as
  *                                      0x80 | (dir<<5) | ch where dir=0
@@ -90,7 +95,9 @@ enum {
     REMU_HDMA_OP_WRITE     = 1u,
     REMU_HDMA_OP_READ_REQ  = 2u,
     REMU_HDMA_OP_READ_RESP = 3u,
-    REMU_HDMA_OP_CFG_WRITE = 4u,
+    /* opcode 4 (OP_CFG_WRITE) retired with the shm-backed cfg-shadow
+     * alias; do not reallocate without bumping a wire-format bit, the
+     * remote may still log "unknown op" if it ever shows up. */
 };
 
 typedef struct RemuHdmaHeader {
@@ -103,14 +110,13 @@ typedef struct RemuHdmaHeader {
 
 /* Stringify op for debug-tail ASCII lines; returns a short tag so the
  * per-run hdma.log is grep-friendly ("op=WRITE/READ_REQ/READ_RESP/
- * CFG_WRITE/UNK"). */
+ * UNK"). */
 static inline const char *remu_hdma_op_str(uint32_t op)
 {
     switch (op) {
     case REMU_HDMA_OP_WRITE:     return "WRITE";
     case REMU_HDMA_OP_READ_REQ:  return "READ_REQ";
     case REMU_HDMA_OP_READ_RESP: return "READ_RESP";
-    case REMU_HDMA_OP_CFG_WRITE: return "CFG_WRITE";
     default:                     return "UNK";
     }
 }
@@ -356,18 +362,6 @@ remu_hdma_emit_read_resp(CharBackend *chr, const char *role,
 {
     return remu_hdma_emit(chr, role, REMU_HDMA_OP_READ_RESP,
                           req_id, src, payload, len);
-}
-
-/* NPU -> host BAR2 cfg-head shadow write (M8b 3c). `cfg_off` is a
- * byte offset within the 4 KB cfg head; `val` is a single u32. */
-static inline RemuHdmaEmitResult
-remu_hdma_emit_cfg_write(CharBackend *chr, const char *role,
-                         uint32_t req_id, uint32_t cfg_off, uint32_t val)
-{
-    uint8_t buf[4];
-    stl_le_p(buf, val);
-    return remu_hdma_emit(chr, role, REMU_HDMA_OP_CFG_WRITE,
-                          req_id, (uint64_t)cfg_off, buf, sizeof(buf));
 }
 
 #endif /* REMU_BRIDGE_REMU_HDMA_PROTO_H */

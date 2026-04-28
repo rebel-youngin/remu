@@ -610,11 +610,14 @@ static inline uint32_t r100_dnc_intid(uint32_t dnc_id, uint32_t cmd_type)
 #define R100_HDMA_D2D_CHUNK             (64u * 1024u)
 
 /* req_id partitioning on the `hdma` chardev (remu_hdma_proto.h).
- *   0x00         — r100-cm7 OP_CFG_WRITE upstream from the cfg-mirror
- *                  reverse path (untagged; OP_CFG_WRITE has no
- *                  matching response on the wire).
- *   0x01..0x7F   — reserved for future subscribers (UMQ multi-queue
- *                  may reclaim this range).
+ *   0x00..0x7F   — reserved. The legacy cm7 BD-done partition lived
+ *                  at 0x01..0x0F until P7 retired the FSM, and the
+ *                  P1b r100-cm7 OP_CFG_WRITE reverse-emit at 0x00
+ *                  was retired with the shm-backed `cfg-shadow`
+ *                  alias (host x86 QEMU and NPU QEMU now share a
+ *                  4 KB memory-backend-file over BAR2 cfg-head /
+ *                  cfg-mirror traps; no chardev round trip). UMQ
+ *                  multi-queue may reclaim this range.
  *   0x80..0xBF   — r100-hdma MMIO-driven channel ops (encoded as
  *                  0x80 | (type<<5) | ch with type=0 WR, type=1 RD,
  *                  ch in 0..15).

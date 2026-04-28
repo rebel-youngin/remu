@@ -184,12 +184,6 @@ struct R100HDMAState {
 
     RemuHdmaRx rx;
 
-    /* Optional outbound RX callback for OP_READ_RESPs in the
-     * r100-pcie-outbound req_id partition (0xC0..0xFF). Bound at
-     * realize time by r100-pcie-outbound. */
-    R100HDMARespCb outbound_cb;
-    void *outbound_cb_opaque;
-
     /* Counters. */
     uint64_t hdma_frames_sent;
     uint64_t hdma_frames_dropped;
@@ -279,35 +273,6 @@ bool r100_hdma_emit_read_req(R100HDMAState *s, uint32_t req_id,
                   " read_len=%u req_id=0x%x rc=%d\n", tag, src,
                   read_len, req_id, (int)rc);
     return false;
-}
-
-bool r100_hdma_emit_cfg_write(R100HDMAState *s, uint32_t req_id,
-                              uint32_t cfg_off, uint32_t val,
-                              const char *tag)
-{
-    RemuHdmaEmitResult rc;
-
-    rc = remu_hdma_emit_cfg_write(&s->hdma_chr, "r100-hdma", req_id,
-                                  cfg_off, val);
-    if (rc == REMU_HDMA_EMIT_OK) {
-        s->hdma_frames_sent++;
-        r100_hdma_emit_debug(s, "tx", REMU_HDMA_OP_CFG_WRITE, req_id,
-                             cfg_off, 4, tag);
-        return true;
-    }
-    s->hdma_frames_dropped++;
-    qemu_log_mask(LOG_UNIMP,
-                  "r100-hdma: CFG_WRITE %s dropped off=0x%x val=0x%x "
-                  "req_id=0x%x rc=%d\n", tag, cfg_off, val, req_id,
-                  (int)rc);
-    return false;
-}
-
-void r100_hdma_set_outbound_callback(R100HDMAState *s, R100HDMARespCb cb,
-                                     void *opaque)
-{
-    s->outbound_cb = cb;
-    s->outbound_cb_opaque = opaque;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1038,24 +1003,18 @@ static void r100_hdma_dispatch(R100HDMAState *s,
         r100_hdma_complete_rd_resp(s, dir, ch, hdr, payload);
         return;
     }
-    /* r100-pcie-outbound partition: 0xC0..0xFF. */
-    if (hdr->req_id >= R100_PCIE_OUTBOUND_REQ_ID_BASE) {
-        if (s->outbound_cb) {
-            s->outbound_cb(s->outbound_cb_opaque, hdr, payload);
-            return;
-        }
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "r100-hdma: READ_RESP req_id=0x%x in outbound "
-                      "partition but cb unbound\n", hdr->req_id);
-        return;
-    }
-    /* Only the channel (0x80..0xBF) and outbound (0xC0..0xFF)
-     * partitions round-trip OP_READ_RESP through this device.
-     * req_id=0 is the cfg-mirror OP_CFG_WRITE upstream (no response),
-     * 0x01..0x7F is reserved with no consumer. */
+    /* Only the channel partition (0x80..0xBF) round-trips
+     * OP_READ_RESP through this device today. 0x00..0x7F is reserved
+     * with no consumer (legacy cm7 BD-done at 0x01..0x0F retired in
+     * P7; P1b cfg-mirror reverse-emit at 0x00 retired with the
+     * shm-backed cfg-shadow alias). 0xC0..0xFF was the
+     * r100-pcie-outbound chardev partition; that path was retired
+     * when r100-pcie-outbound switched to a plain MemoryRegion alias
+     * over the shared host-ram backend, so no RESPs should land
+     * there anymore. */
     qemu_log_mask(LOG_GUEST_ERROR,
                   "r100-hdma: READ_RESP req_id=0x%x has no matching "
-                  "partition (channel 0x80..0xBF / outbound 0xC0..0xFF)\n",
+                  "partition (channel 0x80..0xBF)\n",
                   hdr->req_id);
 }
 

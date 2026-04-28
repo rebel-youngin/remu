@@ -67,6 +67,13 @@ QEMU_CONFIGURE_MARKER = QEMU_BUILD / ".remu-configure"
 SHM_ROOT = Path("/dev/shm")
 SHM_SIZE_DEFAULT = 128 * 1024 * 1024
 HOST_MEM_DEFAULT = "512M"
+# P10-fix: 4 KB cfg-shadow buffer shared between the host x86 QEMU's
+# BAR2 cfg-head trap and the NPU r100-cm7 cfg-mirror trap. Eliminates
+# the cfg/doorbell ordering race where q-cp could observe DDH=0
+# because the cfg chardev RX hadn't been drained before the doorbell
+# chardev RX woke `hq_task`. See r100_cm7.c / r100_npu_pci.c banner
+# notes; sized to match REMU_BAR2_CFG_HEAD_SIZE.
+CFG_SHADOW_SIZE = 4096
 
 # M8b Stage 2: x86 guest boot artifacts produced by
 # guest/build-guest-image.sh. When both files exist `./remucli run
@@ -538,7 +545,6 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
                    npu_monitor_sock=None, doorbell_sock=None,
                    doorbell_log=None, msix_sock=None, msix_log=None,
                    issr_sock=None, issr_log=None,
-                   cfg_sock=None, cfg_log=None,
                    hdma_sock=None, hdma_log=None,
                    ):
     """Assemble the aarch64 QEMU cmdline for the R100 NPU side.
@@ -585,35 +591,48 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
     on ISSR[4], reset counters on ISSR[7], and so on). Optional
     `issr_log` file chardev echoes one ASCII line per egress.
 
-    cfg_sock / cfg_log: host→NPU BAR2 cfg-head mirror. The host side
-    traps a 4 KB MMIO window at BAR2 offset FW_LOGBUF_SIZE (where the
-    kmd programs DDH_BASE_{LO,HI}) and forwards every write as an
-    8-byte (cfg-head-offset, value) frame; the NPU-side r100-cm7
-    consumes them into cfg_shadow[]. The same shadow backs the P1b
-    MMIO trap at R100_DEVICE_COMM_SPACE_BASE so q-cp on CP0 reads
-    kmd-published DDH directly. Optional `cfg_log` file chardev
-    echoes one ASCII line per received frame.
-
-    hdma_sock / hdma_log: NPU<->host HDMA executor. Variable-length
+    hdma_sock / hdma_log: NPU→host HDMA executor. Variable-length
     frames (24-byte header + payload, remu_hdma_proto.h):
     `r100-hdma`'s MMIO-driven channels (OP_WRITE / OP_READ_REQ in the
-    0x80..0xBF req_id partition) for q-cp's `cmd_descr_hdma` LL kicks,
-    `r100-pcie-outbound`'s synchronous PF-window reads (0xC0..0xFF)
-    for q-cp's outbound iATU loads, and `r100-cm7`'s cfg-mirror
-    reverse path (untagged OP_CFG_WRITE) for q-cp's
-    `cb_complete → writel(FUNC_SCRATCH)`. The host-side r100-npu-pci
-    decodes each frame, performs the matching pci_dma_{read,write}
-    against the x86 guest, and for OP_READ_REQ emits OP_READ_RESP
-    back to the NPU. Optional `hdma_log` file chardev echoes one
-    ASCII line per frame (either direction) — `dir=tx` is NPU→host,
-    `dir=rx` is the host seeing NPU egress (the NPU-side tail logs
-    both directions too)."""
+    0x80..0xBF req_id partition) for q-cp's `cmd_descr_hdma` LL kicks
+    against the host. The host-side r100-npu-pci decodes each frame,
+    performs the matching pci_dma_{read,write} against the x86 guest,
+    and for OP_READ_REQ emits OP_READ_RESP back to the NPU. Optional
+    `hdma_log` file chardev echoes one ASCII line per frame (either
+    direction) — `dir=tx` is NPU→host, `dir=rx` is the host seeing
+    NPU egress.
+
+    P10-fix retired the prior `cfg` chardev (host→NPU 8-byte
+    (cfg-head-offset, value) frames) and the matching r100-pcie-
+    outbound chardev fallback (req_id 0xC0..0xFF for synchronous
+    PF-window reads + the r100-cm7 cfg-mirror reverse path on
+    req_id 0x00). The cfg-head propagation is now backed by the
+    shared `cfg-shadow` memory-backend-file (4 KB) and the outbound
+    iATU window by the shared `host-ram` memory-backend-file —
+    both aliased identically on the host's r100-npu-pci side, so
+    kmd writes are visible to q-cp on the next read with no
+    chardev queueing and no BQL-stalled cond_wait."""
     uart0_log = run_dir / "uart0.log"
     hils_log = run_dir / "hils.log"
 
     machine_opt = "r100-soc"
     if with_host:
         machine_opt += ",memdev=remushm"
+        # P10-fix: the same `host-ram` shm-backed memory-backend-file
+        # the host x86 QEMU uses for its main RAM is also instantiated
+        # on the NPU side here, so r100-pcie-outbound can install a
+        # MemoryRegion alias over it (size = host RAM, mapped at
+        # R100_PCIE_AXI_SLV_BASE_ADDR). q-cp's outbound iATU loads /
+        # stores then resolve as plain RAM accesses against the same
+        # mmap the kmd polls — no chardev hop, no BQL contention.
+        machine_opt += ",host-ram=hostram"
+        # P10-fix: 4 KB cfg-shadow shm shared with the host's BAR2
+        # cfg-head trap. The r100-cm7 cfg-mirror at
+        # DEVICE_COMMUNICATION_SPACE_BASE installs a
+        # `memory_region_init_alias` over offset 0 of this backend so
+        # kmd writes to FUNC_SCRATCH / DDH_BASE_LO are visible to
+        # q-cp's next read with no chardev hop.
+        machine_opt += ",cfg-shadow=cfgshadow"
     if doorbell_sock is not None:
         machine_opt += ",doorbell=doorbell"
         if doorbell_log is not None:
@@ -626,10 +645,6 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
         machine_opt += ",issr=issr"
         if issr_log is not None:
             machine_opt += ",issr-debug=issr_dbg"
-    if cfg_sock is not None:
-        machine_opt += ",cfg=cfg"
-        if cfg_log is not None:
-            machine_opt += ",cfg-debug=cfg_dbg"
     if hdma_sock is not None:
         machine_opt += ",hdma=hdma"
         if hdma_log is not None:
@@ -688,19 +703,6 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
             cmd += [
                 "-chardev",
                 "file,id=issr_dbg,path=%s,mux=off" % issr_log,
-            ]
-    if cfg_sock is not None:
-        # M8b 3b: host→NPU cfg-head mirror. Same host-as-server pattern
-        # — host-side r100-npu-pci listens and egresses frames, NPU
-        # r100-cm7 connects as client and populates cfg_shadow.
-        cmd += [
-            "-chardev",
-            "socket,id=cfg,path=%s,reconnect=1" % cfg_sock,
-        ]
-        if cfg_log is not None:
-            cmd += [
-                "-chardev",
-                "file,id=cfg_dbg,path=%s,mux=off" % cfg_log,
             ]
     if hdma_sock is not None:
         # M8b 3b/3c: NPU<->host HDMA executor. Host listens; NPU connects
@@ -762,23 +764,51 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
     return cmd, found
 
 
-def _setup_shm(run_name, size):
-    """Create /dev/shm/remu-<run>/remu-shm of exactly `size` bytes.
+def _setup_shm(run_name, size, fname="remu-shm"):
+    """Create /dev/shm/remu-<run>/<fname> of exactly `size` bytes.
     The directory lives on tmpfs to keep large backing files off the
     workspace filesystem. Returns (shm_dir, shm_file).
 
     Idempotent if the file already exists at the correct size; larger
     or smaller files are truncated to size (caller wiped the previous
-    run, or the run name is new)."""
+    run, or the run name is new).
+
+    Used twice per `--host` run: once for `remu-shm` (BAR0 / chiplet-0
+    DRAM splice, M4/M5) and once for `host-ram` (the entire x86 host
+    guest RAM, shared so r100-pcie-outbound can alias the kmd's
+    coherent DMA pages directly — no chardev round trip)."""
     shm_dir = SHM_ROOT / ("remu-" + run_name)
     shm_dir.mkdir(parents=True, exist_ok=True)
-    shm_file = shm_dir / "remu-shm"
+    shm_file = shm_dir / fname
     if shm_file.exists() and shm_file.stat().st_size == size:
         pass
     else:
         with open(shm_file, "wb") as f:
             f.truncate(size)
     return shm_dir, shm_file
+
+
+# Memory-suffix parser for `--host-mem`. QEMU accepts `512M`, `1G`,
+# `0x10000000`, raw bytes, etc. The CLI's existing `--host-mem` is a
+# pass-through to `-m`, but the host-ram memory-backend-file we splice
+# under it needs an exact byte count — both for the file's truncate
+# and for the matching `size=` arg on the `-object memory-backend-file`
+# line (QEMU enforces the two are equal).
+def _parse_qemu_size(s):
+    """Parse a QEMU-style size string (e.g. '512M', '1G', '0x10000000',
+    '12345') into bytes. Mirrors the suffix table QEMU's
+    `qemu_strtosz` accepts; we keep this small list since `--host-mem`
+    is the only consumer."""
+    s = str(s).strip()
+    if not s:
+        raise ValueError("empty size")
+    suffixes = {"k": 1024, "m": 1024 ** 2, "g": 1024 ** 3,
+                "t": 1024 ** 4}
+    if s[-1].lower() in suffixes:
+        return int(float(s[:-1]) * suffixes[s[-1].lower()])
+    if s.startswith(("0x", "0X")):
+        return int(s, 16)
+    return int(s)
 
 
 # ── cleanup helpers ──────────────────────────────────────────────────────────
@@ -906,8 +936,9 @@ def _cleanup_run_trash(run_name, output_root=None, verbose=True):
 def _build_host_cmd(host_dir, shm_file, shm_size, monitor_sock, mem,
                     doorbell_sock=None, msix_sock=None, msix_log=None,
                     issr_sock=None, issr_log=None,
-                    cfg_sock=None, cfg_log=None,
                     hdma_sock=None, hdma_log=None,
+                    host_ram_file=None, host_ram_size=None,
+                    cfg_shadow_file=None,
                     kernel=None, initrd=None, share_dir=None,
                     cmdline_extra=None):
     """Assemble the x86_64 QEMU cmdline for the Phase-2 host side.
@@ -988,21 +1019,6 @@ def _build_host_cmd(host_dir, shm_file, shm_size, monitor_sock, mem,
                 "file,id=issr_dbg,path=%s,mux=off" % issr_log,
             ]
             device_arg += ",issr-debug=issr_dbg"
-    if cfg_sock is not None:
-        # M8b 3b cfg: host owns the listener, egresses (cfg_off, val)
-        # frames on kmd BAR2 cfg-head writes. NPU r100-cm7 joins as
-        # client and updates cfg_shadow[].
-        chardevs += [
-            "-chardev",
-            "socket,id=cfg,path=%s,server=on,wait=off" % cfg_sock,
-        ]
-        device_arg += ",cfg=cfg"
-        if cfg_log is not None:
-            chardevs += [
-                "-chardev",
-                "file,id=cfg_dbg,path=%s,mux=off" % cfg_log,
-            ]
-            device_arg += ",cfg-debug=cfg_dbg"
     if hdma_sock is not None:
         # M8b 3b hdma: host owns the listener, receives
         # HDMA_OP_WRITE frames from the NPU-side CM7 stub and
@@ -1027,9 +1043,21 @@ def _build_host_cmd(host_dir, shm_file, shm_size, monitor_sock, mem,
     # exposes every feature QEMU can emulate so the stock .ko just
     # works without patching the kmd Makefile.
     cpu_model = "max" if kernel is not None else "qemu64"
+    # P10-fix: back the x86 guest's main RAM with a shareable
+    # /dev/shm file so the NPU-side r100-pcie-outbound can alias the
+    # same pages directly (kmd's `dma_alloc_coherent` lands inside this
+    # file). Without this, q-cp's outbound iATU reads were forced to
+    # chardev-RPC over `hdma`, and the host's chardev iothread was
+    # starved while the kmd held BQL inside `readl_poll_timeout_atomic`
+    # waiting for `init_done` — see docs/roadmap.md → P10. With the
+    # shared backend, q-cp loads/stores against the iATU window are a
+    # single TCG instruction against the same mmap the kmd polls.
+    machine_arg = "pc"
+    if host_ram_file is not None:
+        machine_arg += ",memory-backend=hostram"
     cmd = [
         str(QEMU_BIN_X86),
-        "-M", "pc",
+        "-M", machine_arg,
         "-cpu", cpu_model,
         "-m", mem,
         "-display", "none",
@@ -1039,6 +1067,25 @@ def _build_host_cmd(host_dir, shm_file, shm_size, monitor_sock, mem,
         "memory-backend-file,id=remushm,mem-path=%s,size=%d,share=on"
         % (shm_file, shm_size),
     ]
+    if host_ram_file is not None:
+        cmd += [
+            "-object",
+            "memory-backend-file,id=hostram,mem-path=%s,size=%d,share=on"
+            % (host_ram_file, host_ram_size),
+        ]
+    # P10-fix: 4 KB cfg-shadow shm; r100-npu-pci aliases offset 0 over
+    # the BAR2 cfg-head subregion (REMU_BAR2_CFG_HEAD_OFF) and the NPU
+    # r100-cm7 aliases the same file at DEVICE_COMMUNICATION_SPACE_BASE.
+    # Same backing file → kmd writes to FUNC_SCRATCH/DDH_BASE_LO are
+    # immediately visible to q-cp without going through the cfg
+    # chardev queue.
+    if cfg_shadow_file is not None:
+        cmd += [
+            "-object",
+            "memory-backend-file,id=cfgshadow,mem-path=%s,size=%d,share=on"
+            % (cfg_shadow_file, CFG_SHADOW_SIZE),
+        ]
+        device_arg += ",cfg-shadow=cfgshadow"
 
     # Boot a real Linux guest (M8b Stage 2): prebuilt distro kernel +
     # tiny busybox/initramfs (see guest/build-guest-image.sh). Without
@@ -1448,21 +1495,21 @@ def _verify_issr_wired(host_monitor_sock, npu_monitor_sock,
 def _verify_cfg_hdma_wired(host_monitor_sock, npu_monitor_sock,
                            host_qtree_log, npu_qtree_log,
                            poll_timeout=10.0):
-    """Prove the cfg + hdma plumbing is alive on both sides.
+    """Prove the hdma plumbing is alive on both sides.
 
-    Same pattern as `_verify_issr_wired` — the chardevs are
-    CharBackend properties on existing devices (no new MemoryRegion
-    overlay to look for), so we inspect `info qtree` on both sides:
+    P10-fix retired the `cfg` chardev path; cfg-head propagation
+    flows through the shared `cfg-shadow` memory-backend-file alias
+    which is verified separately by `_verify_npu_cfg_shadow_alias`
+    (mtree-based). Only the bidirectional hdma chardev remains as a
+    cross-process CharBackend that needs `info qtree` inspection:
 
     NPU side:
-      r100-cm7 :
-        `cfg-chardev`        = "cfg"      (non-empty CharBackend value)
-      r100-hdma (M9-1c, owns the hdma chardev now that the device
-                 was carved out for q-cp's dw_hdma_v0 MMIO model):
-        device present; `chardev` = "hdma" (non-empty)
+      r100-cm7  : present (no chardev props beyond the doorbell now);
+      r100-hdma : `chardev` = "hdma" (non-empty), since M9-1c carved
+                  the hdma channel onto its own device for q-cp's
+                  dw_hdma_v0 MMIO model.
 
     Host side (r100-npu-pci):
-      `cfg`  = "cfg"
       `hdma` = "hdma"
 
     Raises RuntimeError on failure with actionable detail. The caller
@@ -1507,23 +1554,15 @@ def _verify_cfg_hdma_wired(host_monitor_sock, npu_monitor_sock,
     deadline = time.time() + poll_timeout
     while time.time() < deadline:
         qtree_npu = _hmp_query(npu_monitor_sock, "info qtree", timeout=10.0)
-        if ("cfg-chardev" in qtree_npu and
-                'cfg-chardev ""' not in qtree_npu and
-                "r100-hdma" in qtree_npu):
+        if "r100-hdma" in qtree_npu:
             break
         time.sleep(0.3)
     npu_qtree_log.write_text(qtree_npu + "\n")
 
     npu_lines = [ln.rstrip() for ln in qtree_npu.splitlines()
-                 if "cfg-chardev" in ln
-                 or "r100-hdma" in ln
+                 if "r100-hdma" in ln
                  or "r100-cm7" in ln
                  or ("chardev =" in ln and "hdma" in ln)]
-    if not _has_nonempty(npu_lines, "cfg-chardev"):
-        raise RuntimeError(
-            "NPU-side r100-cm7 'cfg-chardev' property is unset; "
-            "the -machine r100-soc,cfg=<id> option didn't latch. "
-            "See %s" % npu_qtree_log)
     if "r100-hdma" not in qtree_npu:
         raise RuntimeError(
             "NPU-side r100-hdma device not found in info qtree; "
@@ -1535,34 +1574,27 @@ def _verify_cfg_hdma_wired(host_monitor_sock, npu_monitor_sock,
             "NPU-side r100-hdma 'chardev' property is unset; "
             "the -machine r100-soc,hdma=<id> option didn't latch on "
             "the new device. See %s" % npu_qtree_log)
-    npu_snippet = "\n".join(npu_lines) or "(no cfg/hdma lines)"
+    npu_snippet = "\n".join(npu_lines) or "(no hdma lines)"
 
     qtree_host = ""
     deadline = time.time() + poll_timeout
     while time.time() < deadline:
         qtree_host = _hmp_query(host_monitor_sock, "info qtree", timeout=10.0)
         lines = qtree_host.splitlines()
-        if (_has_nonempty(lines, "cfg") and _has_nonempty(lines, "hdma")):
+        if _has_nonempty(lines, "hdma"):
             break
         time.sleep(0.3)
     host_qtree_log.write_text(qtree_host + "\n")
 
     host_lines = [ln.rstrip() for ln in qtree_host.splitlines()
-                  if ln.strip().startswith("cfg ")
-                  or ln.strip().startswith("cfg-debug ")
-                  or ln.strip().startswith("hdma ")
+                  if ln.strip().startswith("hdma ")
                   or ln.strip().startswith("hdma-debug ")]
-    if not _has_nonempty(host_lines, "cfg"):
-        raise RuntimeError(
-            "host-side r100-npu-pci 'cfg' property is unset; "
-            "the -device r100-npu-pci,cfg=<id> option didn't latch. "
-            "See %s" % host_qtree_log)
     if not _has_nonempty(host_lines, "hdma"):
         raise RuntimeError(
             "host-side r100-npu-pci 'hdma' property is unset; "
             "the -device r100-npu-pci,hdma=<id> option didn't latch. "
             "See %s" % host_qtree_log)
-    host_snippet = "\n".join(host_lines) or "(no cfg/hdma lines)"
+    host_snippet = "\n".join(host_lines) or "(no hdma lines)"
 
     return npu_snippet + "\n" + host_snippet
 
@@ -1670,14 +1702,15 @@ def run(name, output_root, gdb, trace, chiplets, memory,
       host/doorbell.sock M6 NPU→host-visible doorbell socket
       host/msix.sock     M7 NPU→host MSI-X reverse-direction socket
       host/issr.sock     M8 NPU→host ISSR shadow-egress socket
-      host/cfg.sock      M8b 3b host→NPU BAR2 cfg-head mirror socket
-      host/hdma.sock     M8b 3b NPU→host HDMA write executor socket
+      host/hdma.sock     M8b 3b NPU↔host HDMA executor socket
       doorbell.log       ASCII tail of doorbell frames received by NPU (M6)
       msix.log           ASCII tail of MSI-X frames emitted by NPU (M7)
       issr.log           ASCII tail of ISSR frames emitted by NPU (M8)
-      cfg.log            ASCII tail of cfg frames received by NPU (M8b 3b)
       hdma.log           ASCII tail of hdma frames (both directions, M8b 3b/3c)
-      cm7.log            ASCII tail of r100-cm7 BD-done state transitions (M8b 3c)
+      shm/cfg-shadow     P10-fix shared 4 KB cfg-head backend (host BAR2
+                         cfg-head trap aliases this; NPU r100-cm7 cfg-mirror
+                         trap aliases the same file — kmd writes are visible
+                         to q-cp with no chardev round trip)
 
     `<output-root>/latest` is updated to point at the most recent run.
     """
@@ -1707,29 +1740,28 @@ def run(name, output_root, gdb, trace, chiplets, memory,
     msix_log = None
     issr_sock = None
     issr_log = None
-    cfg_sock = None
-    cfg_log = None
     hdma_sock = None
     hdma_log = None
     if with_host:
         npu_dir = run_dir / "npu"
         npu_dir.mkdir(exist_ok=True)
         npu_monitor_sock = npu_dir / "monitor.sock"
-        # M6 doorbell, M7 iMSIX, M8 ISSR shadow, and M8b 3b cfg + hdma
-        # all use the same host-as-server + NPU-as-client pattern;
-        # sockets live under host/ so they survive alongside the other
-        # host-owned artifacts. ASCII debug tails sit at run root so
-        # users can tail them without guessing which side "owns" them.
-        # Stale sock paths would make the host bind EADDRINUSE; clean
-        # them all before launch.
+        # M6 doorbell, M7 iMSIX, M8 ISSR shadow, and the M9-1c hdma
+        # executor all use the same host-as-server + NPU-as-client
+        # pattern; sockets live under host/ so they survive alongside
+        # the other host-owned artifacts. ASCII debug tails sit at run
+        # root so users can tail them without guessing which side
+        # "owns" them. Stale sock paths would make the host bind
+        # EADDRINUSE; clean them all before launch. The legacy `cfg`
+        # chardev was retired in P10-fix — cfg-head propagation flows
+        # through the shared `cfg-shadow` memory-backend-file alias.
         host_dir_early = run_dir / "host"
         host_dir_early.mkdir(exist_ok=True)
         doorbell_sock = host_dir_early / "doorbell.sock"
         msix_sock = host_dir_early / "msix.sock"
         issr_sock = host_dir_early / "issr.sock"
-        cfg_sock = host_dir_early / "cfg.sock"
         hdma_sock = host_dir_early / "hdma.sock"
-        for p in (doorbell_sock, msix_sock, issr_sock, cfg_sock, hdma_sock):
+        for p in (doorbell_sock, msix_sock, issr_sock, hdma_sock):
             if p.exists():
                 try:
                     p.unlink()
@@ -1738,7 +1770,6 @@ def run(name, output_root, gdb, trace, chiplets, memory,
         doorbell_log = run_dir / "doorbell.log"
         msix_log = run_dir / "msix.log"
         issr_log = run_dir / "issr.log"
-        cfg_log = run_dir / "cfg.log"
         hdma_log = run_dir / "hdma.log"
 
     npu_cmd, found = _build_npu_cmd(run_dir, gdb, trace,
@@ -1750,8 +1781,6 @@ def run(name, output_root, gdb, trace, chiplets, memory,
                                     msix_log=msix_log,
                                     issr_sock=issr_sock,
                                     issr_log=issr_log,
-                                    cfg_sock=cfg_sock,
-                                    cfg_log=cfg_log,
                                     hdma_sock=hdma_sock,
                                     hdma_log=hdma_log)
 
@@ -1772,17 +1801,55 @@ def run(name, output_root, gdb, trace, chiplets, memory,
         except OSError:
             pass
 
-        # Attach the same backend to the NPU QEMU. M5 also wires it via
-        # `-machine r100-soc,memdev=remushm` (see _build_npu_cmd) so the
-        # backend ends up spliced over chiplet 0's DRAM head — both CA73
-        # cores and the x86 host guest's BAR0 see the same bytes.
+        # P10-fix: a second shm file backs the entire x86 guest's
+        # main RAM. Same /dev/shm directory as remu-shm so cleanup
+        # (`clean --name`) sweeps both with one rmtree. Size is derived
+        # from `--host-mem` so the QEMU-side `-m N -object
+        # memory-backend-file,size=N` invariant holds.
+        host_ram_size = _parse_qemu_size(host_mem)
+        _, host_ram_file = _setup_shm(run_name, host_ram_size,
+                                      fname="host-ram")
+
+        # P10-fix: third shm file backs the 4 KB cfg-shadow shared
+        # between the host's BAR2 cfg-head trap and the NPU's
+        # cfg-mirror trap. Both QEMUs map this file as their backing
+        # store for cfg_mmio_regs[] / cfg_shadow[], so kmd writes to
+        # FUNC_SCRATCH / DDH_BASE_LO are immediately visible to q-cp's
+        # next read — eliminates the cfg/doorbell ordering race that
+        # surfaced once the iATU stopped serialising on `hdma`.
+        _, cfg_shadow_file = _setup_shm(run_name, CFG_SHADOW_SIZE,
+                                        fname="cfg-shadow")
+
+        # Attach all three backends to the NPU QEMU:
+        #  - remushm:    M4/M5 BAR0 ↔ chiplet-0 DRAM splice (128 MB head).
+        #  - hostram:    P10-fix outbound iATU alias (the kmd's coherent
+        #                DMA pages live here; r100-pcie-outbound aliases
+        #                offset 0 of this MR over
+        #                R100_PCIE_AXI_SLV_BASE_ADDR so q-cp's PF-window
+        #                loads/stores resolve as plain RAM, no chardev).
+        #  - cfgshadow: P10-fix cfg-mirror alias (4 KB; both BAR2 cfg-
+        #                head trap and r100-cm7 cfg-mirror trap alias
+        #                offset 0).
+        # The matching `-machine r100-soc,memdev=remushm,
+        # host-ram=hostram,cfg-shadow=cfgshadow` flags are emitted by
+        # _build_npu_cmd above.
         npu_cmd += [
             "-object",
             "memory-backend-file,id=remushm,mem-path=%s,size=%d,share=on"
             % (shm_file, shm_size),
+            "-object",
+            "memory-backend-file,id=hostram,mem-path=%s,size=%d,share=on"
+            % (host_ram_file, host_ram_size),
+            "-object",
+            "memory-backend-file,id=cfgshadow,mem-path=%s,size=%d,share=on"
+            % (cfg_shadow_file, CFG_SHADOW_SIZE),
         ]
         click.echo("  Shared memory -> %s (%d MB)"
                    % (shm_file, shm_size // (1024 * 1024)))
+        click.echo("  Host RAM shm  -> %s (%d MB, x86 guest main memory)"
+                   % (host_ram_file, host_ram_size // (1024 * 1024)))
+        click.echo("  Cfg shadow shm-> %s (%d B)"
+                   % (cfg_shadow_file, CFG_SHADOW_SIZE))
         click.echo("  NPU QEMU    -> monitor: %s" % npu_monitor_sock)
 
         host_dir = run_dir / "host"
@@ -1820,10 +1887,11 @@ def run(name, output_root, gdb, trace, chiplets, memory,
             msix_log=msix_log,
             issr_sock=issr_sock,
             issr_log=issr_log,
-            cfg_sock=cfg_sock,
-            cfg_log=cfg_log,
             hdma_sock=hdma_sock,
             hdma_log=hdma_log,
+            host_ram_file=host_ram_file,
+            host_ram_size=host_ram_size,
+            cfg_shadow_file=cfg_shadow_file,
             kernel=kernel_path,
             initrd=initrd_path,
             share_dir=share_path,
@@ -1845,8 +1913,6 @@ def run(name, output_root, gdb, trace, chiplets, memory,
                    % (msix_sock, msix_log))
         click.echo("  ISSR        -> %s (debug tail: %s)"
                    % (issr_sock, issr_log))
-        click.echo("  CFG         -> %s (debug tail: %s)"
-                   % (cfg_sock, cfg_log))
         click.echo("  HDMA        -> %s (debug tail: %s)"
                    % (hdma_sock, hdma_log))
 
@@ -1918,11 +1984,6 @@ def run(name, output_root, gdb, trace, chiplets, memory,
         if issr_sock and issr_sock.exists():
             try:
                 issr_sock.unlink()
-            except OSError:
-                pass
-        if cfg_sock and cfg_sock.exists():
-            try:
-                cfg_sock.unlink()
             except OSError:
                 pass
         if hdma_sock and hdma_sock.exists():

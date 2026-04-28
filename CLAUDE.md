@@ -73,29 +73,36 @@ q-cp on CP0 owns every interesting bit (queue doorbells wake
 `init_done` over the P1a outbound iATU). No CM7-side special-case
 dispatch on this register post-P7.
 
-BAR2 details (M8b 3b → P1b): kmd writes `DDH_BASE_{LO,HI}` (at
-`FW_LOGBUF_SIZE + 0xC0/0xC4`) to publish the host-RAM
-`rbln_device_desc` to firmware. The host-side `r100-npu-pci` traps the
-4 KB window and emits 8-byte `(cfg_off, val)` frames on the `cfg`
-chardev; the NPU-side `r100-cm7` consumes them into a 1024-entry
-`cfg_shadow[]`. P1b makes that shadow the single source of truth on the
-NPU side: a 4 KB MMIO trap (`r100_cm7_cfg_mirror_ops`, prio 10) overlays
-chiplet-0 DRAM at `R100_DEVICE_COMM_SPACE_BASE = 0x10200000`, so q-sys/
-q-cp loads of `DEVICE_COMMUNICATION_SPACE_BASE + N` read `cfg_shadow[N
->> 2]` directly (the inbound iATU silicon would normally provide).
-NPU-side stores update `cfg_shadow` *and* forward an `OP_CFG_WRITE`
-upstream over `hdma`, closing the loop with the host's
-`cfg_mmio_regs[]` — this is the path that makes q-cp's `cb_complete →
-writel(FUNC_SCRATCH, magic)` round-trip back into the kmd's
-`rebel_cfg_read(FUNC_SCRATCH)` for `rbln_queue_test`. The paired
-**NPU ↔ host DMA executor** is the `hdma` chardev with a 24 B header +
-payload protocol (`src/bridge/remu_hdma_proto.h`).
+BAR2 details (M8b 3b → P1b → P10-fix): kmd writes `DDH_BASE_{LO,HI}`
+(at `FW_LOGBUF_SIZE + 0xC0/0xC4`) to publish the host-RAM
+`rbln_device_desc` to firmware. **P10-fix** carves a 4 KB
+`cfg-shadow` memory-backend-file shared between the two QEMUs; the
+host-side `r100-npu-pci` aliases it over the BAR2 cfg-head subregion
+(prio 10 over BAR2 lazy RAM) and the NPU-side `r100-cm7` aliases the
+same backend over `R100_DEVICE_COMM_SPACE_BASE = 0x10200000` (prio
+10 over chiplet-0 DRAM, the address q-cp's `hil_init_descs` reads
+through `FUNC_READQ(hil_reg_base[PCIE_PF] + DDH_BASE_LO)`). Result:
+kmd writes are visible on q-cp's next read with no chardev queue
+and no ordering race against the doorbell — the bug that the prior
+`cfg`-chardev path exhibited under the kmd's busy-poll. The pre-P10
+plumbing (per-write 8-byte `(cfg_off, val)` frames on a `cfg`
+chardev, NPU-side `cfg_shadow[1024]` u32 array, NPU→host
+`OP_CFG_WRITE` reverse-emit on `hdma`, host-side `cfg_mmio_regs[]`)
+has been retired together with the `cfg` / `cfg-debug` chardevs and
+the `OP_CFG_WRITE` opcode; q-cp's `cb_complete → writel(FUNC_SCRATCH,
+magic)` lands directly in the shared backend through the cfg-mirror
+alias and is observable on the kmd's next `rebel_cfg_read` for
+`rbln_queue_test`. The paired **NPU ↔ host DMA executor** is the
+`hdma` chardev with a 24 B header + payload protocol
+(`src/bridge/remu_hdma_proto.h`).
 
 Opcodes: `OP_READ_REQ` (NPU → host: "please `pci_dma_read` `len` bytes
 at `dst`, tag with `req_id`"), `OP_READ_RESP` (host → NPU: payload for
-a pending `req_id`), `OP_WRITE` (NPU → host: "please `pci_dma_write`
-`len` bytes at `dst`"), and `OP_CFG_WRITE` (NPU → host: "update
-host-local `cfg_mmio_regs[dst>>2]`"). P1c made q-cp's native
+a pending `req_id`), and `OP_WRITE` (NPU → host: "please
+`pci_dma_write` `len` bytes at `dst`"). The historical `OP_CFG_WRITE`
+opcode (NPU → host store into `cfg_mmio_regs[]`) was retired with the
+shm-backed cfg-shadow; opcode 4 stays unallocated. P1c made q-cp's
+native
 `hq_task → cb_task → cb_complete` the single source of truth for the
 BD lifecycle: queue-doorbell `INTGR1` bits relay as SPI 185 to wake
 `hq_task`, which walks BD / packet over the P1a outbound iATU, writes
@@ -111,76 +118,78 @@ write-back, M9-1b `cmd_descr` synth + mbtq push) along with the
 helpers had no callers post-P1c; q-cp owns the equivalent silicon
 paths end-to-end.
 
-#### P1a — chiplet-0 PCIe outbound iATU stub + DDH mirror
+#### P1a / P10-fix — chiplet-0 PCIe outbound iATU stub + DDH mirror
 
 q-cp on CA73 CP0 dereferences PCIe-bus addresses directly (the kmd
 publishes them with `HOST_PHYS_BASE = 0x8000000000ULL` added; real
 silicon's chiplet-0 DesignWare iATU translates the AXI loads into
 PCIe TLPs). REMU has no DW iATU, so until P1a the loads silently
-read garbage from chiplet-0 lazy RAM. **P1a** lands two pieces of
-infrastructure that close that gap (`docs/roadmap.md` → P1):
+read garbage from chiplet-0 lazy RAM. **P1a** introduced
+`r100-pcie-outbound` to close that gap; **P10-fix** then replaced
+its chardev RPC with a direct shared-memory alias after the chardev
+RPC deadlocked under the kmd's busy-poll (the chardev RX iothread
+couldn't acquire BQL while a vCPU was parked in
+`readl_poll_timeout_atomic`).
 
 1. **`r100-pcie-outbound`** (`src/machine/r100_pcie_outbound.c`) —
    sysbus device that traps the 4 GB AXI window at
    `R100_PCIE_AXI_SLV_BASE_ADDR = 0x8000000000ULL` (chiplet 0, PF
-   only). Reads emit `OP_READ_REQ` over the existing `hdma` chardev
-   tagged with a `req_id` in the new `0xC0..0xFF` partition (single
-   in flight; cookie rotates over the low 6 bits) and block on
-   `qemu_cond_wait_bql()` until the matching `OP_READ_RESP` arrives.
-   Writes are fire-and-forget `OP_WRITE` (no kmd fence on these
-   bytes; the doorbells that *do* need ordering go through the
-   `INTGR1`-bit-`qid` → SPI 185 → q-cp's `hq_task` path on CP0,
-   which `r100-pcie-outbound` is just the read backend of).
-   `r100-hdma` demuxes responses to a per-device callback
-   registered via `r100_hdma_set_outbound_callback()`; the legacy
-   `0x01..0x0F` cm7 BD-done partition + its `r100_hdma_set_cm7_callback`
-   plumbing were retired in P7. Host-side `pci_dma_read` failures
-   synthesise a zero-payload `OP_READ_RESP` so the parked vCPU
-   surfaces a guest-visible `0` instead of dead-locking.
+   only). The window is realised as a `MemoryRegion` alias over a
+   shared `host-ram` `memory-backend-file` that the host x86 QEMU
+   uses for its main RAM. Both QEMUs `mmap` the same file, so q-cp's
+   outbound loads/stores are plain TCG accesses against the same
+   pages the kmd allocates with `dma_alloc_coherent`. No chardev,
+   no `qemu_cond_wait_bql()`, no BQL contention. The pre-P10-fix
+   chardev path (per-access `OP_READ_REQ` / `OP_WRITE` in `req_id`
+   partition `0xC0..0xFF`, parked vCPU on a per-device condvar)
+   has been removed; the partition is reserved.
 
 2. **BAR2 cfg-head ↔ NPU MMIO trap** in `r100-cm7`. Real silicon's
    inbound iATU maps host BAR2 onto NPU local memory at
    `FW_LOGBUF_SIZE` so kmd writes show up at
    `DEVICE_COMMUNICATION_SPACE_BASE = 0x10200000` for q-cp's
    `hil_init_descs` (which reads `DDH_BASE_LO/HI/SIZE` via
-   `FUNC_READQ(hil_reg_base[PCIE_PF] + DDH_BASE_LO)`). P1a originally
-   shipped this as a cfg-frame-to-NPU-DRAM write-through; **P1b**
-   (below) replaced that with an MMIO subregion overlay
-   (`r100_cm7_cfg_mirror_ops`, prio 10, 4 KB) so `cfg_shadow[1024]`
-   is the single source of truth on both ends — host writes ingress
-   on the `cfg` chardev and update the shadow, NPU reads/writes hit
-   the trap, and NPU writes additionally egress as `OP_CFG_WRITE`
-   over `hdma` so the host's `cfg_mmio_regs[]` stays consistent.
+   `FUNC_READQ(hil_reg_base[PCIE_PF] + DDH_BASE_LO)`). P10-fix
+   models this as a `MemoryRegion` alias over the shared
+   `cfg-shadow` 4 KB `memory-backend-file` — same file the host
+   x86 QEMU's `r100-npu-pci` aliases over its BAR2 cfg-head
+   subregion. The pre-P10 path (host→NPU `cfg` chardev frames feeding
+   an NPU-side `cfg_shadow[1024]` u32 array + NPU→host `OP_CFG_WRITE`
+   reverse-emit feeding host `cfg_mmio_regs[]`) is gone.
 
 `req_id` partitions on the `hdma` wire (single source of truth in
 `src/include/r100/remu_addrmap.h`):
-`0x00` = `r100-cm7` `OP_CFG_WRITE` upstream from the cfg-mirror
-reverse path (untagged; OP_CFG_WRITE has no matching response on
-the wire), `0x01..0x7F` = reserved (the legacy cm7 BD-done partition
-lived at `0x01..0x0F` until P7 retired the FSM; UMQ multi-queue may
-reclaim this range), `0x80..0xBF` = `r100-hdma` MMIO-driven channel
-ops, `0xC0..0xFF` = `r100-pcie-outbound` synchronous PF-window
-reads.
+`0x00..0x7F` = reserved (legacy cm7 BD-done partition lived at
+`0x01..0x0F` until P7 retired the FSM; the P1b cfg-mirror
+`OP_CFG_WRITE` reverse-emit at `0x00` was retired with the
+shm-backed cfg-shadow alias; UMQ multi-queue may reclaim this
+range), `0x80..0xBF` = `r100-hdma` MMIO-driven channel ops,
+`0xC0..0xFF` = reserved (formerly `r100-pcie-outbound`'s
+synchronous PF-window reads; now serviced by the host-ram alias).
 
 Verified end-to-end on `--host` boot: q-cp logs `Device descriptor
 addr 0x80…, size 286720`, `Queue descriptor addr 0x80…0xec,
 size 32`, `Context descriptor addr 0x80…0x12c, size 1112` — all
-fetched through the new outbound stub against the kmd's coherent
-DMA buffer. m5/m6/m7/m8 bridge regression unaffected.
+satisfied by direct alias accesses against the kmd's coherent DMA
+buffer. m5/m6/m7/m8 bridge regression + p4a/p4b/p5 RBDMA/HDMA
+regression unaffected.
 
 #### P1b/P1c/P7 — honest BD lifecycle on q-cp/CP0
 
-**P1b** (NPU→host cfg reverse mirror) closes the cfg loop both ways
-through the trap above. The NPU-side write helper
-(`r100_cm7_cfg_mirror_write`) updates `cfg_shadow` *and* emits an
-`OP_CFG_WRITE` `(off, val)` over `hdma`, which the host's
-`r100-npu-pci` decodes into `cfg_mmio_regs[off >> 2] = val`. That
-makes q-cp's `cb_complete → writel(FUNC_SCRATCH, magic)` visible
-to the kmd's `rebel_cfg_read(FUNC_SCRATCH)` — the path
-`rbln_queue_test` polls. The trap accepts 1/2/4/8-byte and
-unaligned access (`impl.access_size = 4`) so q-sys CP0's cold-boot
-`memset(DEVICE_COMMUNICATION_SPACE_BASE, 0, CP1_LOGBUF_MAGIC)`
-flows through unmodified.
+**P1b** (NPU→host cfg reverse mirror) closed the cfg loop both ways
+through the trap above. **P10-fix** subsumed it: the host x86 and
+NPU QEMUs alias the same `cfg-shadow` `memory-backend-file` over
+their BAR2 cfg-head and cfg-mirror MMIO traps, so q-cp's
+`cb_complete → writel(FUNC_SCRATCH, magic)` lands directly in the
+shared backend and is observable on the kmd's next
+`rebel_cfg_read(FUNC_SCRATCH)` for `rbln_queue_test` with no chardev
+queue and no ordering race against the doorbell. The cfg-mirror
+alias accepts any access width / alignment that hits TCG RAM (so
+q-sys CP0's cold-boot `memset(DEVICE_COMMUNICATION_SPACE_BASE, 0,
+CP1_LOGBUF_MAGIC)` flows through unmodified). Single-QEMU
+NPU-only tests (m6 / m8) leave the link unset; the alias is
+skipped and chiplet-0 lazy RAM services any incidental access at
+the window.
 
 **P1c** routed every interesting host doorbell to q-cp on CP0 and
 gated the legacy QEMU-side scaffolding off by default. **P7 deleted
@@ -224,16 +233,19 @@ The `hdma` chardev moved from `r100-cm7` onto a new `r100-hdma` device
 chiplet 0). The motivation is that q-cp itself programs a DesignWare
 dw_hdma_v0 register block at that address — REMU now models that
 register block, and the chardev sits on the model's host-side
-counterpart since CharBackends are single-frontend. r100-cm7 reaches
-the chardev through a QOM link (`hdma` link prop) and the public emit
-helpers in `src/machine/r100_hdma.h`. req_id partitioning on the wire
-(documented in `src/bridge/remu_hdma_proto.h`):
-0x00 = `r100-cm7` `OP_CFG_WRITE` upstream from the P1b cfg-mirror
-reverse path (no response on the wire),
-0x01..0x7F = reserved (legacy cm7 BD-done partition lived at
-0x01..0x0F until P7 retired the FSM; available for UMQ multi-queue),
+counterpart since CharBackends are single-frontend. Post-P10-fix
+`r100-hdma` is the sole NPU-side sender on the `hdma` chardev (q-cp
+drives its MMIO directly; no QOM link from `r100-cm7` anymore — the
+cfg reverse path went away with the shm-backed cfg-shadow). req_id
+partitioning on the wire (documented in
+`src/bridge/remu_hdma_proto.h`):
+0x00..0x7F = reserved (legacy cm7 BD-done partition lived at
+0x01..0x0F until P7 retired the FSM; the P1b cfg-mirror reverse-emit
+at 0x00 was retired with the shm-backed cfg-shadow alias; available
+for UMQ multi-queue),
 0x80..0xBF = r100-hdma MMIO-driven channel ops,
-0xC0..0xFF = r100-pcie-outbound synchronous PF-window reads (P1a).
+0xC0..0xFF = reserved (formerly r100-pcie-outbound synchronous
+PF-window reads; the device now aliases shared host-ram instead).
 
 The passive `r100-dnc-cluster` register-file stub (sparse regstore
 seeding IP_INFO / SHM TPG / RDSN bits for boot) gained an active
@@ -303,15 +315,27 @@ chiplet-0 DRAM offsets, gdbstub-driven from outside via the
 on-demand HMP `gdbserver tcp::PORT` + `Qqemu.PhyMemMode:1` packet
 sequence).
 
-Both QEMUs `mmap` the same 128 MB `/dev/shm/remu-<name>/remu-shm` with
-`share=on`. Splice points (same backend, two places):
+Both QEMUs `mmap` three shared `memory-backend-file`s under
+`/dev/shm/remu-<name>/` with `share=on`:
 
-- **x86 host** (M4) — `r100-npu-pci` `memdev` link over BAR0 offset 0.
-- **NPU** (M5) — `r100-soc` machine's `memdev` string property (resolved
-  at machine-init time, after `-object memory-backend-*`) over chiplet-0
-  DRAM offset 0. Tail `0x08000000..0x40000000` stays private lazy RAM
-  so BL31_CP1 / FreeRTOS_CP1 loaded at `0x14100000` / `0x14200000` don't
-  leak to host.
+- **`remu-shm`** (128 MB, M4/M5) — `r100-npu-pci.memdev` over BAR0
+  offset 0 on the host; `r100-soc.memdev` over chiplet-0 DRAM offset
+  0 on the NPU. Tail `0x08000000..0x40000000` stays private lazy
+  RAM so BL31_CP1 / FreeRTOS_CP1 loaded at `0x14100000` / `0x14200000`
+  don't leak to host.
+- **`host-ram`** (`--host-mem`, default 512 MB; P10-fix) — host x86
+  QEMU's main RAM `memory-backend-file`. The NPU's
+  `r100-pcie-outbound` aliases the same backend over the chiplet-0
+  PCIe AXI window at `R100_PCIE_AXI_SLV_BASE_ADDR = 0x8000000000`,
+  so q-cp's outbound iATU loads/stores hit the same pages the kmd
+  allocates with `dma_alloc_coherent`. Replaces the prior chardev
+  RPC (deadlocked under the kmd's busy-poll).
+- **`cfg-shadow`** (4 KB; P10-fix) — host x86 QEMU's BAR2 cfg-head
+  subregion at `FW_LOGBUF_SIZE` aliases this backend; NPU
+  `r100-cm7` cfg-mirror trap at `R100_DEVICE_COMM_SPACE_BASE`
+  aliases the same backend. Replaces the prior `cfg` chardev path
+  (8-byte frames + NPU `cfg_shadow[1024]` + host `cfg_mmio_regs[]`
+  reverse-mirror via `OP_CFG_WRITE`).
 
 HMP monitors: NPU on `output/<name>/npu/monitor.sock` (plus the
 stdio-muxed readline monitor on uart0), host on
@@ -342,11 +366,14 @@ Every `--host` run captures and checks:
   `msix-{table,pba}` overlaying `r100.bar5.msix`.
 - **M8a**: NPU `r100-mailbox` has `issr-chardev = "issr"`; host
   `r100-npu-pci` has `issr = "issr"`.
-- **cfg + hdma + M9-1c**: NPU `r100-cm7` has `cfg-chardev = "cfg"`;
- NPU `r100-hdma` exists with `chardev = "hdma"` (M9-1c moved the
- chardev off cm7 onto the new device); host `r100-npu-pci` has
- `cfg = "cfg"` + `hdma = "hdma"` (logged to
- `{host,npu}/info-qtree-cfg-hdma.log`).
+- **hdma + M9-1c**: NPU `r100-hdma` exists with
+ `chardev = "hdma"` (M9-1c moved the chardev off cm7 onto the new
+ device); host `r100-npu-pci` has `hdma = "hdma"` (logged to
+ `{host,npu}/info-qtree-cfg-hdma.log`). The pre-P10-fix `cfg`
+ chardev verifier (NPU `r100-cm7.cfg-chardev`, host
+ `r100-npu-pci.cfg`) is gone — cfg-head propagation moved off
+ chardev onto a shared `cfg-shadow` `memory-backend-file` aliased
+ by both QEMUs.
 
 All results go to `host/info-*.log` + `npu/info-*.log`. Failures print
 to stdout (non-fatal — NPU still boots for post-mortem poking).
@@ -450,8 +477,9 @@ src/machine/          NPU-side QEMU device models (symlinked into external/qemu/
                                             .h public emit API (M9-1c) +
                                             outbound RX callback hook (P1a)
                         r100_pcie_outbound.c PCIe outbound iATU stub —
-                                            chiplet-0 4 GB AXI window
-                                            tunnelled over `hdma` chardev (P1a)
+                                            chiplet-0 4 GB AXI window aliased
+                                            over the shared host-ram backend
+                                            (P1a + P10-fix)
                         r100_rbdma.{c,h}    RBDMA reg block — sparse regstore +
                                             kick → BH → done IRQ; per-chiplet (P4A)
                         r100_<dev>.c        one file per device (state struct private)
@@ -462,15 +490,15 @@ src/bridge/           Added to -I during QEMU configure — cross-side shared he
                         remu_frame.h          8-byte frame codec (RX accumulator + emit)
                         remu_doorbell_proto.h BAR4 offset classifier + BAR2 cfg-head layout
                         remu_hdma_proto.h     bidirectional HDMA protocol (24 B header + payload,
-                                              OP_WRITE / READ_REQ / READ_RESP / CFG_WRITE);
+                                              OP_WRITE / READ_REQ / READ_RESP);
                                               req_id partitions live in
                                               src/include/r100/remu_addrmap.h:
-                                              0x00 r100-cm7 OP_CFG_WRITE upstream
-                                                   (P1b cfg-mirror reverse path),
-                                              0x01..0x7F reserved (legacy cm7 BD-done
-                                                   partition retired in P7),
+                                              0x00..0x7F reserved (legacy cm7 BD-done
+                                                   partition + P1b cfg-mirror reverse-emit
+                                                   retired by P7 + P10-fix shm cfg-shadow),
                                               0x80..0xBF r100-hdma channels,
-                                              0xC0..0xFF r100-pcie-outbound (P1a)
+                                              0xC0..0xFF reserved (formerly r100-pcie-outbound;
+                                                   now serviced by shm host-ram alias)
                       Header-only `static inline`, so both host-side (system_ss)
                       and NPU-side (arm_ss) TUs pick up the same definitions
                       without introducing a shared object.

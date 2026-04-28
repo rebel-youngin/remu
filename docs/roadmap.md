@@ -79,16 +79,21 @@ auto-verifies its bridge via `info pci/mtree/qtree` — see the checklist in
 
 | Opcode | Direction | Use |
 |---|---|---|
-| `REMU_HDMA_OP_WRITE = 1` | NPU → host | write `len` bytes at guest DMA `dst` (QINIT, BD-done bd+ci) |
+| `REMU_HDMA_OP_WRITE = 1` | NPU → host | write `len` bytes at guest DMA `dst` (P5 HDMA-LL host-leg writes; pre-P10-fix QINIT/BD-done bd+ci) |
 | `REMU_HDMA_OP_READ_REQ = 2` | NPU → host | request `len` bytes from guest DMA `dst`, tagged by `req_id` |
 | `REMU_HDMA_OP_READ_RESP = 3` | host → NPU | response for `req_id`, payload is the bytes read |
-| `REMU_HDMA_OP_CFG_WRITE = 4` | NPU → host | update host-side `cfg_mmio_regs[dst>>2]` (reverse of Stage-3b cfg forwarding) |
+| `REMU_HDMA_OP_CFG_WRITE = 4` (retired) | NPU → host | (retired with P10-fix shm cfg-shadow alias) was: update host-side `cfg_mmio_regs[dst>>2]` |
 
-`req_id` partitioning (M9-1c, `src/include/r100/remu_addrmap.h`):
+`req_id` partitioning (post-P10-fix, canonical map in
+`src/include/r100/remu_addrmap.h`):
 
-- `0x00`: untagged QINIT (`fw_version` + `init_done` from r100-cm7)
-- `0x01..0x0F`: r100-cm7 BD-done (`qid + 1`)
+- `0x00..0x7F`: reserved. Legacy cm7 BD-done partition lived at
+  `0x01..0x0F` until P7 retired the FSM; the P1b cfg-mirror
+  reverse-emit at `0x00` was retired with the shm-backed cfg-shadow
+  alias. Available for UMQ multi-queue scaffolding.
 - `0x80..0xBF`: r100-hdma channel ops (`0x80 | (dir<<5) | ch`)
+- `0xC0..0xFF`: reserved (formerly r100-pcie-outbound synchronous
+  PF-window reads; the device now aliases shared host-ram instead)
 
 #### M9-1 sub-milestones (mailbox / DNC / HDMA infrastructure)
 
@@ -127,28 +132,34 @@ Device models + chardev bridges — see `docs/architecture.md`
 "Source File Map" for per-file behaviour, and `docs/debugging.md`
 for the HMP sanity recipes.
 
-- `src/host/r100_npu_pci.c` — x86-side endpoint. BAR0 splice, BAR2 lazy RAM
-  with a 4 KB cfg-head trap at `FW_LOGBUF_SIZE` (M8b 3b, forwards writes on
-  `cfg` chardev), BAR4 container with 4 KB MMIO head (INTGR + MAILBOX_BASE
-  shadow), BAR5 MSI-X + RAM fill. `hdma` chardev receiver is bidirectional
-  (M8b 3c): `OP_WRITE` → `pci_dma_write`, `OP_READ_REQ` → `pci_dma_read` +
-  `OP_READ_RESP`, `OP_CFG_WRITE` → updates host-local `cfg_mmio_regs`.
-- `src/machine/r100_soc.c` — machine. Splices memdev into chiplet-0 DRAM,
-  instantiates six `r100-mailbox` blocks (PF + VF0 for the host-facing
-  PCIe Samsung-IPM SFRs; plus the four q-cp/CP1 DNC task queues at
-  `R100_PERI0_MAILBOX_M9_BASE` / `M10_BASE` / `R100_PERI1_MAILBOX_M9_BASE`
-  / `M10_BASE` — COMPUTE / UDMA / UDMA_LP / UDMA_ST per
-  `_inst[HW_SPEC_DNC_QUEUE_NUM=4]`, P3), optional
-  `r100-cm7` / `r100-imsix` / `r100-hdma` gated on chardev machine-props.
-  Wires `cfg` chardev onto `r100-cm7`; the `hdma` chardev goes to
-  `r100-hdma` (M9-1c). Links `r100-cm7` to `r100-hdma` (chardev egress
-  for the P1b reverse-cfg `OP_CFG_WRITE` upstream); the prior
-  `r100-cm7` ↔ `r100-imsix` and `r100-cm7` ↔ M9 mailbox links were
-  retired in P7 along with the BD-done FSM and mbtq-push stubs.
+- `src/host/r100_npu_pci.c` — x86-side endpoint. BAR0 splice over the
+  shared `remu-shm` backend, BAR2 lazy RAM with a 4 KB cfg-head subregion
+  at `FW_LOGBUF_SIZE` aliased over the shared `cfg-shadow`
+  `memory-backend-file` (P10-fix; the NPU r100-cm7 aliases the same
+  backend so kmd writes are visible to q-cp with no chardev round trip),
+  BAR4 container with 4 KB MMIO head (INTGR + MAILBOX_BASE shadow), BAR5
+  MSI-X + RAM fill. `hdma` chardev receiver: `OP_WRITE` →
+  `pci_dma_write`, `OP_READ_REQ` → `pci_dma_read` + `OP_READ_RESP`. The
+  pre-P10-fix `cfg`/`cfg-debug` chardevs and `OP_CFG_WRITE` reverse-path
+  retired together with the shadow-array plumbing.
+- `src/machine/r100_soc.c` — machine. Splices the `remu-shm` backend
+  into chiplet-0 DRAM, instantiates six `r100-mailbox` blocks (PF + VF0
+  for the host-facing PCIe Samsung-IPM SFRs; plus the four q-cp/CP1 DNC
+  task queues at `R100_PERI0_MAILBOX_M9_BASE` / `M10_BASE` /
+  `R100_PERI1_MAILBOX_M9_BASE` / `M10_BASE` — COMPUTE / UDMA / UDMA_LP /
+  UDMA_ST per `_inst[HW_SPEC_DNC_QUEUE_NUM=4]`, P3), optional
+  `r100-cm7` / `r100-imsix` / `r100-hdma` / `r100-pcie-outbound` gated
+  on chardev / shared-backend machine-props. Resolves the
+  `cfg-shadow=<id>` and `host-ram=<id>` machine string-props
+  (P10-fix) and threads the resulting `MemoryRegion` links into
+  `r100-cm7.cfg-shadow` (cfg-mirror alias) and
+  `r100-pcie-outbound.host-ram` (chiplet-0 PF-window alias). The
+  prior `r100-cm7` ↔ `r100-imsix`, ↔ M9 mailbox, and ↔ `r100-hdma`
+  (cfg reverse-emit) links were retired in P7 + P10-fix along with
+  the BD-done FSM, mbtq-push stubs, and `OP_CFG_WRITE` reverse path.
   Wires DNC done SPIs from each DCL (8 × 4 lines per DCL) to the
-  chiplet GIC via `r100_dnc_intid()` (M9-1c). Skips lazy-RAM at the
-  M9 slot to avoid overlap. GIC `num-irq` is 992 (was 256 pre-M9-1c)
-  to fit DNC INTIDs.
+  chiplet GIC via `r100_dnc_intid()` (M9-1c). GIC `num-irq` is 992
+  (was 256 pre-M9-1c) to fit DNC INTIDs.
 - `src/machine/r100_mailbox.c` — Samsung IPM SFR (`INTGR/INTCR/INTMR/INTSR/INTMSR/ISSR0..63`),
   two `qemu_irq` outs tracking INTMSR. API: `r100_mailbox_raise_intgr`,
   `r100_mailbox_set_issr`, `r100_mailbox_get_issr`,
@@ -156,22 +167,24 @@ for the HMP sanity recipes.
   `r100_mailbox_set_issr_words` (M9-1b in-process multi-slot write
   for q-cp task-queue pushes; bypasses the issr_store funnel).
 - `src/machine/r100_cm7.c` — reassembles 8-byte `(offset, value)` frames,
-  routes by offset into mailbox INTGR / ISSR / CM7-stub. Post-P7 the
-  file hosts exactly two responsibilities, both honest infrastructure:
-  (1) `INTGR0 bit 0` SOFT_RESET → synthetic `FW_BOOT_DONE` (Stage 3a) —
-  *scaffolding, retired in P8 once a real CA73 cluster reset path
+  routes by offset into mailbox INTGR / ISSR / CM7-stub. Post-P7 +
+  P10-fix the file hosts exactly two responsibilities, both honest
+  infrastructure:
+  (1) `INTGR0 bit 0` SOFT_RESET → synthetic `FW_BOOT_DONE` (Stage 3a)
+  — *scaffolding, retired in P8 once a real CA73 cluster reset path
   exists*;
-  (2) the P1b cfg-mirror MMIO trap at `R100_DEVICE_COMM_SPACE_BASE`
-  — `cfg_shadow[1024]` is the single source of truth on the NPU side
-  (host BAR2 writes ingress on `cfg` chardev → update shadow; NPU
-  reads/writes hit the trap; NPU writes additionally egress as
-  `OP_CFG_WRITE` over `r100-hdma` so the host's `cfg_mmio_regs[]`
-  stays consistent for `rebel_cfg_read(FUNC_SCRATCH)`).
-  The Stage 3b QINIT stub, Stage 3c BD-done FSM, M9-1b mbtq push,
-  and Stage 3c `cmd_descr` synth ring at `R100_CMD_DESCR_SYNTH_BASE`
-  were retired in P7. The hdma chardev lives on `r100-hdma` (M9-1c);
-  cm7 reaches it via a QOM `hdma` link only to emit `OP_CFG_WRITE`
-  upstream — there is no longer a cm7-side `OP_READ_RESP` consumer.
+  (2) the P10-fix cfg-mirror MMIO alias at
+  `R100_DEVICE_COMM_SPACE_BASE` — a 4 KB `MemoryRegion` alias over
+  the shared `cfg-shadow` `memory-backend-file`. The host x86 QEMU's
+  `r100-npu-pci` aliases the same backend over its BAR2 cfg-head
+  subregion, so kmd writes to `FUNC_SCRATCH` / `DDH_BASE_LO` are
+  visible to q-cp's next read with no chardev queue (the alias is the
+  single source of truth on both ends). The pre-P10-fix
+  `cfg_shadow[1024]` u32 array + `cfg`/`cfg-debug` chardev RX +
+  `OP_CFG_WRITE` reverse-emit on `r100-hdma` are gone. The Stage 3b
+  QINIT stub, Stage 3c BD-done FSM, M9-1b mbtq push, and Stage 3c
+  `cmd_descr` synth ring at `R100_CMD_DESCR_SYNTH_BASE` were retired
+  in P7. cm7 no longer holds a QOM link to `r100-hdma`.
 - `src/machine/r100_hdma.{c,h}` — DesignWare dw_hdma_v0 register-block
   model (M9-1c + P5) at `R100_HDMA_BASE` (chiplet 0). Per-channel state
   covers the full `struct hdma_ch_regs` surface from
@@ -218,13 +231,20 @@ for the HMP sanity recipes.
   `r100-cm7` itself. The public `r100_imsix_notify` API is retained
   as a no-current-caller helper that any future post-soft-reset stub
   (P8) could re-use.
-- Six Unix-socket chardevs under `output/<name>/host/`: `doorbell.sock`
+- Four Unix-socket chardevs under `output/<name>/host/`: `doorbell.sock`
   (M6+M8a, host → NPU), `msix.sock` (M7, NPU → host), `issr.sock`
-  (M8a, NPU → host), `cfg.sock` (M8b 3b, host → NPU BAR2 cfg-head),
-  `hdma.sock` (M8b 3b+3c, bidirectional NPU ↔ host DMA).
+  (M8a, NPU → host), `hdma.sock` (M8b 3b+3c, bidirectional NPU ↔ host
+  DMA). The pre-P10-fix `cfg.sock` (host → NPU BAR2 cfg-head) is gone;
+  cfg-head propagation now flows through the shared `cfg-shadow`
+  `memory-backend-file` aliased on both sides. Three shared-memory
+  files under `/dev/shm/remu-<name>/` back the splices: `remu-shm`
+  (128 MB, M4/M5 chiplet-0 DRAM), `host-ram` (`--host-mem`, P10-fix
+  chiplet-0 PCIe outbound iATU), `cfg-shadow` (4 KB, P10-fix BAR2
+  cfg-head).
 - `src/bridge/remu_hdma_proto.h` — 24 B `RemuHdmaHeader` + payload
-  wire format; bidirectional since Stage 3c with `OP_WRITE`,
-  `OP_READ_REQ/RESP` (`req_id`-tagged), and `OP_CFG_WRITE`.
+  wire format; bidirectional with `OP_WRITE` and `OP_READ_REQ/RESP`
+  (`req_id`-tagged). The `OP_CFG_WRITE` opcode (4) was retired with
+  the shm-backed cfg-shadow alias and stays unallocated.
 - `./remucli run --host` orchestrates both QEMUs + auto-verifies bridges;
   M8b Stage 2 adds optional `-kernel/-initrd/-fsdev virtio-9p` wiring when
   `images/x86_guest/{bzImage,initramfs.cpio.gz}` are staged.

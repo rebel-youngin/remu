@@ -1,13 +1,17 @@
 /*
  * R100 NPU host-side PCIe endpoint (Phase 2; M3 BARs, M4 shared DRAM,
- * M6 doorbell, M7 MSI-X, M8a ISSR shadow, M8b Stage 3b cfg/hdma).
+ * M6 doorbell, M7 MSI-X, M8a ISSR shadow, M8b Stage 3b hdma + P10-fix
+ * cfg-shadow / host-ram aliases).
  * Vendor/device = CR03 quad; stock rebellions.ko binds unmodified.
  *
  * BARs (next pow2 >= driver's RBLN_* sizes in rebel.h):
  *   BAR0 64 GB  DDR (lazy RAM; shared /dev/shm head when memdev wired — M4/M5)
  *   BAR2 64 MB  ACP/SRAM (lazy RAM; a 4 KB MMIO head @ FW_LOGBUF_SIZE
- *               traps cfg-head writes and forwards them to the NPU as
- *               (cfg_off, val) frames on the `cfg` chardev — M8b 3b)
+ *               aliases the shared `cfg-shadow` memory-backend-file —
+ *               P10-fix. The NPU r100-cm7 aliases the same backend
+ *               over its cfg-mirror trap at DEVICE_COMMUNICATION_SPACE
+ *               so kmd writes to FUNC_SCRATCH / DDH_BASE_LO are
+ *               observable on q-cp's next read with no chardev hop.)
  *   BAR4 8 MB   Doorbell: 8 MB container; when doorbell or issr chardev
  *               is wired, 4 KB MMIO head (prio 10) intercepts
  *                 - 0x08/0x1c MAILBOX_INTGR{0,1}   → doorbell frame (M6)
@@ -16,25 +20,31 @@
  *               `issr` chardev (M8a NPU→host). Rest of BAR4 = lazy RAM.
  *   BAR5 1 MB   MSI-X table+PBA head; rest lazy RAM.
  *
- * Two cross-process bridges back to the NPU QEMU:
+ * One cross-process bridge back to the NPU QEMU:
  *
- *   cfg  chardev (server): host→NPU — receives BAR2 cfg-head writes
- *                          so the NPU-side cfg-mirror trap exposes
- *                          DDH_BASE_{LO,HI} etc. to q-cp without
- *                          round-tripping to host RAM.
- *   hdma chardev (server): NPU<->host — dispatches on the op field of
+ *   hdma chardev (server): NPU→host — dispatches on the op field of
  *                          each incoming frame (remu_hdma_proto.h):
  *                            OP_WRITE     : pci_dma_write(payload)
  *                            OP_READ_REQ  : pci_dma_read + emit
  *                                           OP_READ_RESP tagged by req_id
- *                            OP_CFG_WRITE : store into local cfg_mmio_regs
- *                                           so kmd's rebel_cfg_read sees
- *                                           the NPU-published value
+ *                          Used by r100-hdma's MMIO-driven channels
+ *                          (req_id 0x80..0xBF) for q-cp's dw_hdma_v0
+ *                          LL kicks. P10-fix retired the prior cfg
+ *                          chardev (host→NPU 8-byte (cfg_off, val)
+ *                          frames) and the OP_CFG_WRITE reverse-path
+ *                          on req_id 0x00 — both replaced by the
+ *                          shared cfg-shadow alias above.
+ *                          P10-fix also retired the r100-pcie-outbound
+ *                          chardev fallback (req_id 0xC0..0xFF
+ *                          synchronous PF-window reads) — the NPU
+ *                          aliases the host x86 QEMU's main RAM
+ *                          (`host-ram` backend) directly so those
+ *                          loads/stores are plain RAM accesses.
  *
  * Wire formats:
- *   doorbell / cfg / issr / msix : 8-byte (off, val) LE frames (remu_frame.h)
- *   hdma                         : 24-byte header + variable payload
- *                                  (remu_hdma_proto.h)
+ *   doorbell / issr / msix : 8-byte (off, val) LE frames (remu_frame.h)
+ *   hdma                   : 24-byte header + variable payload
+ *                            (remu_hdma_proto.h)
  */
 
 #include "qemu/osdep.h"
@@ -74,8 +84,6 @@
 #define R100_MSIX_TABLE_OFF     0x00000
 #define R100_MSIX_PBA_OFF       0x10000
 
-#define R100_CFG_MMIO_REG_COUNT (REMU_BAR2_CFG_HEAD_SIZE / 4u)
-
 #define TYPE_R100_NPU_PCI "r100-npu-pci"
 OBJECT_DECLARE_SIMPLE_TYPE(R100NpuPciState, R100_NPU_PCI)
 
@@ -85,6 +93,16 @@ struct R100NpuPciState {
     /* memdev (M4): backend spliced over BAR0 head; bar0_tail covers the
      * rest so driver's size check passes. Unset = full lazy RAM (M3). */
     HostMemoryBackend *hostmem;
+
+    /* cfg-shadow (P10-fix): 4 KB shareable backend aliased over the
+     * BAR2 cfg-head subregion at REMU_BAR2_CFG_HEAD_OFF. The NPU
+     * r100-cm7 aliases the same backend over its cfg-mirror trap at
+     * R100_DEVICE_COMM_SPACE_BASE, so kmd writes to FUNC_SCRATCH /
+     * DDH_BASE_LO are observable on q-cp's next read with no chardev
+     * round trip — eliminates the cfg/doorbell ordering race exposed
+     * once the outbound iATU stopped serialising on `hdma`. NULL =
+     * fall back to the prior chardev path (cfg + cfg-debug). */
+    HostMemoryBackend *cfg_shadow_be;
 
     /* doorbell (M6+M8a host→NPU): 8-byte (off, val) frames. */
     CharBackend doorbell_chr;
@@ -109,19 +127,11 @@ struct R100NpuPciState {
     /* M8a host→NPU ISSR-payload frames (shared wire with doorbell). */
     uint64_t issr_payload_frames_sent;
 
-    /* cfg (M8b Stage 3b host→NPU): BAR2 cfg-head mirror. Host traps the
-     * 4 KB MMIO head at offset FW_LOGBUF_SIZE; every write lands in
-     * cfg_mmio_regs (for local read-back) AND egresses as a frame. */
-    CharBackend cfg_chr;
-    CharBackend cfg_debug_chr;
-    uint32_t cfg_mmio_regs[R100_CFG_MMIO_REG_COUNT];
-    uint64_t cfg_frames_sent;
-    uint64_t cfg_frames_dropped;
-
-    /* hdma (M8b Stage 3b/3c NPU<->host): variable-length frames decoded
+    /* hdma (M8b Stage 3b/3c NPU→host): variable-length frames decoded
      * by remu_hdma_proto.h. OP_WRITE executed as pci_dma_write,
      * OP_READ_REQ answered with OP_READ_RESP (frames sent counter
-     * tracks the responses), OP_CFG_WRITE stored into cfg_mmio_regs. */
+     * tracks the responses). The OP_CFG_WRITE reverse path was
+     * retired alongside the `cfg` chardev in P10-fix. */
     CharBackend hdma_chr;
     CharBackend hdma_debug_chr;
     RemuHdmaRx  hdma_rx;
@@ -153,75 +163,11 @@ struct R100NpuPciState {
     MemoryRegion bar5_msix;
 };
 
-/* ----- BAR2 cfg-head MMIO trap (M8b Stage 3b host→NPU) ---------------- */
-
-static uint64_t r100_bar2_cfg_read(void *opaque, hwaddr addr, unsigned size)
-{
-    R100NpuPciState *s = opaque;
-    uint32_t idx = (uint32_t)(addr >> 2);
-
-    if (idx >= ARRAY_SIZE(s->cfg_mmio_regs)) {
-        return 0;
-    }
-    return s->cfg_mmio_regs[idx];
-}
-
-static void r100_cfg_emit_debug(R100NpuPciState *s, uint32_t off,
-                                uint32_t val, const char *status)
-{
-    char line[96];
-    int n;
-
-    if (!qemu_chr_fe_backend_connected(&s->cfg_debug_chr)) {
-        return;
-    }
-    n = snprintf(line, sizeof(line),
-                 "cfg off=0x%x val=0x%x status=%s sent=%" PRIu64 "\n",
-                 off, val, status, s->cfg_frames_sent);
-    if (n > 0) {
-        qemu_chr_fe_write(&s->cfg_debug_chr, (const uint8_t *)line, n);
-    }
-}
-
-static void r100_bar2_cfg_write(void *opaque, hwaddr addr, uint64_t val,
-                                unsigned size)
-{
-    R100NpuPciState *s = opaque;
-    uint32_t idx = (uint32_t)(addr >> 2);
-    uint32_t v32 = (uint32_t)val;
-
-    if (idx >= ARRAY_SIZE(s->cfg_mmio_regs)) {
-        return;
-    }
-    s->cfg_mmio_regs[idx] = v32;
-    qemu_log_mask(LOG_TRACE,
-                  "r100-npu-pci: cfg write off=0x%x val=0x%x\n",
-                  (uint32_t)addr, v32);
-
-    if (remu_frame_emit(&s->cfg_chr, "r100-npu-pci cfg",
-                        (uint32_t)addr, v32) == REMU_FRAME_EMIT_OK) {
-        s->cfg_frames_sent++;
-        r100_cfg_emit_debug(s, (uint32_t)addr, v32, "ok");
-    } else {
-        s->cfg_frames_dropped++;
-        r100_cfg_emit_debug(s, (uint32_t)addr, v32, "drop");
-    }
-}
-
-static const MemoryRegionOps r100_bar2_cfg_ops = {
-    .read       = r100_bar2_cfg_read,
-    .write      = r100_bar2_cfg_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = {
-        .min_access_size = 4,
-        .max_access_size = 4,
-        .unaligned = false,
-    },
-    .impl = {
-        .min_access_size = 4,
-        .max_access_size = 4,
-    },
-};
+/* P10-fix: BAR2 cfg-head subregion is a MemoryRegion alias over the
+ * shared `cfg-shadow` memory-backend-file. The pre-P10-fix io-ops
+ * trap (r100_bar2_cfg_{read,write} + matching debug emit + cfg
+ * chardev frame egress) is gone — the alias is the single source of
+ * truth and the NPU r100-cm7 aliases the same backend on its side. */
 
 /* ----- BAR4 doorbell ingress trap (unchanged from M6/M8a) ------------- */
 
@@ -512,23 +458,6 @@ static void r100_hdma_handle_read_req(R100NpuPciState *s,
                       hdr->dst, hdr->len, res, hdr->req_id);
         s->hdma_frames_dropped++;
         r100_hdma_emit_debug(s, "rx", hdr, "dma-fail");
-        /* r100-pcie-outbound parks a vCPU on a per-device cond until
-         * the matching READ_RESP arrives. If we silently dropped the
-         * failed read, that vCPU would deadlock for the rest of the
-         * run. Emit a zero-payload reply (with the same req_id) so
-         * the NPU side surfaces the failure as a guest-visible read
-         * of 0x0 — loud enough to trip q-cp's NULL-deref guard but
-         * recoverable. Only synthesise the fail-stub for the
-         * outbound partition (0xC0..0xFF); the reserved 0x01..0x7F
-         * range has no live consumer that expects one. */
-        if (hdr->req_id >= R100_PCIE_OUTBOUND_REQ_ID_BASE) {
-            uint8_t zero[REMU_HDMA_MAX_PAYLOAD] = {0};
-            uint32_t reply_len = MIN(hdr->len, sizeof(zero));
-            (void)remu_hdma_emit_read_resp(&s->hdma_chr,
-                                           "r100-npu-pci hdma fail-stub",
-                                           hdr->req_id, hdr->dst,
-                                           zero, reply_len);
-        }
         return;
     }
     s->hdma_frames_received++;
@@ -565,48 +494,6 @@ static void r100_hdma_handle_read_req(R100NpuPciState *s,
                   hdr->dst, hdr->len, hdr->req_id);
 }
 
-/*
- * OP_CFG_WRITE handler — the NPU-side CM7 stub publishes a u32 into
- * our BAR2 cfg-head shadow at offset `dst`. The kmd reads the same
- * location via rebel_cfg_read() (FUNC_SCRATCH = 0xFFC for rbln_queue_test).
- * No chardev echo — this is the reverse direction of the host->NPU
- * cfg forwarding; spraying another frame back would loop.
- */
-static void r100_hdma_handle_cfg_write(R100NpuPciState *s,
-                                       const RemuHdmaHeader *hdr,
-                                       const uint8_t *payload)
-{
-    uint32_t cfg_off = (uint32_t)hdr->dst;
-    uint32_t idx = cfg_off >> 2;
-    uint32_t v32;
-
-    if (hdr->len != sizeof(uint32_t)) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "r100-npu-pci: hdma CFG_WRITE len=%u (expected 4) "
-                      "off=0x%x req_id=%u\n",
-                      hdr->len, cfg_off, hdr->req_id);
-        s->hdma_frames_dropped++;
-        r100_hdma_emit_debug(s, "rx", hdr, "len-range");
-        return;
-    }
-    if (cfg_off >= REMU_BAR2_CFG_HEAD_SIZE || (cfg_off & 0x3u)) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "r100-npu-pci: hdma CFG_WRITE off=0x%x out of "
-                      "cfg head / unaligned req_id=%u\n",
-                      cfg_off, hdr->req_id);
-        s->hdma_frames_dropped++;
-        r100_hdma_emit_debug(s, "rx", hdr, "bad-offset");
-        return;
-    }
-    v32 = ldl_le_p(payload);
-    s->cfg_mmio_regs[idx] = v32;
-    s->hdma_frames_received++;
-    r100_hdma_emit_debug(s, "rx", hdr, "ok");
-    qemu_log_mask(LOG_TRACE,
-                  "r100-npu-pci: hdma CFG_WRITE off=0x%x val=0x%x "
-                  "req_id=%u\n", cfg_off, v32, hdr->req_id);
-}
-
 static void r100_hdma_deliver(R100NpuPciState *s,
                               const RemuHdmaHeader *hdr,
                               const uint8_t *payload)
@@ -640,9 +527,6 @@ static void r100_hdma_deliver(R100NpuPciState *s,
         break;
     case REMU_HDMA_OP_READ_REQ:
         r100_hdma_handle_read_req(s, hdr);
-        break;
-    case REMU_HDMA_OP_CFG_WRITE:
-        r100_hdma_handle_cfg_write(s, hdr, payload);
         break;
     case REMU_HDMA_OP_READ_RESP:
         /* READ_RESP is host->NPU only; the NPU side should never send
@@ -729,9 +613,12 @@ static void r100_npu_pci_realize(PCIDevice *pdev, Error **errp)
                      PCI_BASE_ADDRESS_MEM_PREFETCH,
                      &s->bar0_ddr);
 
-    /* BAR2 ACP/SRAM: lazy RAM container; when `cfg` chardev is wired,
-     * overlay a 4 KB MMIO trap at FW_LOGBUF_SIZE so kmd writes to
-     * DDH_BASE_{LO,HI} cross the cfg chardev to the NPU. */
+    /* BAR2 ACP/SRAM: lazy RAM container; the 4 KB cfg-head subregion at
+     * FW_LOGBUF_SIZE is a MemoryRegion alias over the shared `cfg-shadow`
+     * memory-backend-file. The NPU r100-cm7 aliases the same backend
+     * over its cfg-mirror trap, so kmd writes are visible on q-cp's
+     * next read with zero round-trip latency (single source of truth;
+     * no chardev queueing, no ordering race against the doorbell). */
     memory_region_init(&s->bar2_container, OBJECT(s),
                        "r100.bar2.container", R100_BAR2_ACP_SIZE);
     memory_region_init_ram(&s->bar2_ram, OBJECT(s), "r100.bar2.ram",
@@ -742,13 +629,18 @@ static void r100_npu_pci_realize(PCIDevice *pdev, Error **errp)
     }
     memory_region_add_subregion_overlap(&s->bar2_container, 0,
                                         &s->bar2_ram, 0);
-    if (qemu_chr_fe_backend_connected(&s->cfg_chr)) {
-        memory_region_init_io(&s->bar2_cfg_mmio, OBJECT(s),
-                              &r100_bar2_cfg_ops, s,
-                              "r100.bar2.cfg", REMU_BAR2_CFG_HEAD_SIZE);
+    if (s->cfg_shadow_be) {
+        MemoryRegion *cfg_mr = host_memory_backend_get_memory(s->cfg_shadow_be);
+        uint64_t alias_size = MIN((uint64_t)memory_region_size(cfg_mr),
+                                  (uint64_t)REMU_BAR2_CFG_HEAD_SIZE);
+
+        memory_region_init_alias(&s->bar2_cfg_mmio, OBJECT(s),
+                                 "r100.bar2.cfg.alias",
+                                 cfg_mr, 0, alias_size);
         memory_region_add_subregion_overlap(&s->bar2_container,
                                             REMU_BAR2_CFG_HEAD_OFF,
                                             &s->bar2_cfg_mmio, 10);
+        host_memory_backend_set_mapped(s->cfg_shadow_be, true);
     }
     pci_register_bar(pdev, 2,
                      PCI_BASE_ADDRESS_SPACE_MEMORY |
@@ -847,8 +739,6 @@ static void r100_npu_pci_exit(PCIDevice *pdev)
     qemu_chr_fe_deinit(&s->msix_debug_chr, false);
     qemu_chr_fe_deinit(&s->issr_chr, false);
     qemu_chr_fe_deinit(&s->issr_debug_chr, false);
-    qemu_chr_fe_deinit(&s->cfg_chr, false);
-    qemu_chr_fe_deinit(&s->cfg_debug_chr, false);
     qemu_chr_fe_deinit(&s->hdma_chr, false);
     qemu_chr_fe_deinit(&s->hdma_debug_chr, false);
 }
@@ -856,13 +746,13 @@ static void r100_npu_pci_exit(PCIDevice *pdev)
 static Property r100_npu_pci_properties[] = {
     DEFINE_PROP_LINK("memdev", R100NpuPciState, hostmem,
                      TYPE_MEMORY_BACKEND, HostMemoryBackend *),
+    DEFINE_PROP_LINK("cfg-shadow", R100NpuPciState, cfg_shadow_be,
+                     TYPE_MEMORY_BACKEND, HostMemoryBackend *),
     DEFINE_PROP_CHR("doorbell", R100NpuPciState, doorbell_chr),
     DEFINE_PROP_CHR("msix", R100NpuPciState, msix_chr),
     DEFINE_PROP_CHR("msix-debug", R100NpuPciState, msix_debug_chr),
     DEFINE_PROP_CHR("issr", R100NpuPciState, issr_chr),
     DEFINE_PROP_CHR("issr-debug", R100NpuPciState, issr_debug_chr),
-    DEFINE_PROP_CHR("cfg", R100NpuPciState, cfg_chr),
-    DEFINE_PROP_CHR("cfg-debug", R100NpuPciState, cfg_debug_chr),
     DEFINE_PROP_CHR("hdma", R100NpuPciState, hdma_chr),
     DEFINE_PROP_CHR("hdma-debug", R100NpuPciState, hdma_debug_chr),
     DEFINE_PROP_END_OF_LIST(),

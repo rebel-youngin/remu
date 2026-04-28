@@ -25,20 +25,29 @@
  *                     special-case dispatch.
  *     0x80..0x180   — M8a ISSR payload (r100_mailbox_set_issr).
  *
- *   cfg chardev      (host→NPU, 8-byte (cfg_off, val) frames)
- *                   BAR2 cfg-head writes ingress here and update
- *                   cfg_shadow[]. The 4 KB MMIO trap installed at
- *                   R100_DEVICE_COMM_SPACE_BASE serves NPU reads
- *                   from the same shadow (P1b inbound iATU model)
- *                   and forwards NPU writes back upstream over the
- *                   hdma chardev as OP_CFG_WRITE so the host's
- *                   r100-npu-pci cfg_mmio_regs[] stays in sync.
+ * BAR2 cfg-head propagation lives off-device entirely: when the
+ * `cfg-shadow` link is wired (i.e. dual-QEMU `--host` mode), the
+ * 4 KB window at R100_DEVICE_COMM_SPACE_BASE is realised as a
+ * memory_region_init_alias over a shared `cfg-shadow`
+ * memory-backend-file (P10-fix). The host's r100-npu-pci aliases the
+ * same backend over its BAR2 cfg-head subregion, so kmd writes to
+ * FUNC_SCRATCH / DDH_BASE_LO are visible on q-cp's next read with no
+ * chardev queue and no OP_CFG_WRITE round trip. NPU-only tests that
+ * don't drive the cfg path (m6 / m8 doorbell+ISSR bridges) leave the
+ * link unset; the alias is skipped and chiplet-0 lazy RAM services
+ * any incidental access at that window — same as pre-P1b silicon.
+ * The pre-P10-fix `cfg` chardev path
+ * (8-byte frames + R100_CFG_SHADOW_COUNT u32 array + io-ops trap +
+ * OP_CFG_WRITE reverse-emit on hdma) was retired alongside the
+ * outbound iATU chardev fallback because the alias has been the only
+ * path used by the regression suite for several builds; check
+ * `git log src/machine/r100_cm7.c` for the historical implementation
+ * if a chardev-style reproducer is needed.
  *
  * The hdma chardev itself is owned by `r100-hdma` since M9-1c
- * (CharBackend is single-frontend). cm7 reaches it through a QOM
- * link and uses the public emit API in src/machine/r100_hdma.h
- * for the OP_CFG_WRITE upstream forward; everything else goes
- * through r100-pcie-outbound (P1a) or q-cp directly.
+ * (CharBackend is single-frontend). cm7 no longer reaches it after
+ * the cfg reverse-path retirement; the link prop is gone and the
+ * UMQ multi-queue scaffolding can reclaim req_id 0x00.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -55,15 +64,10 @@
 #include "exec/address-spaces.h"
 #include "migration/vmstate.h"
 #include "r100_soc.h"
-#include "r100_hdma.h"
 #include "remu_frame.h"
 #include "remu_doorbell_proto.h"
-#include "remu_hdma_proto.h"
 
 OBJECT_DECLARE_SIMPLE_TYPE(R100Cm7State, R100_CM7)
-
-/* Number of u32 slots in the BAR2 cfg-head shadow (4 KB / 4). */
-#define R100_CFG_SHADOW_COUNT (REMU_BAR2_CFG_HEAD_SIZE / 4u)
 
 /* FW_BOOT_DONE value written into PF.ISSR[4] by the CM7 stub on
  * SOFT_RESET (M8b 3a re-handshake; cold boot travels the real path
@@ -75,48 +79,29 @@ struct R100Cm7State {
 
     CharBackend chr;              /* doorbell ingress (host→NPU) */
     CharBackend debug_chr;        /* doorbell ASCII tail */
-    CharBackend cfg_chr;          /* cfg ingress (host→NPU) */
-    CharBackend cfg_debug_chr;    /* cfg ASCII tail */
 
     /*
-     * P1b reverse-mirror trap: 4 KB MMIO overlay on chiplet-0 DRAM at
-     * R100_DEVICE_COMM_SPACE_BASE (0x10200000). Models silicon's
-     * inbound iATU that maps host BAR2 cfg-head onto NPU local memory
-     * — host writes (cfg chardev) and NPU writes (q-cp / q-sys MMIO)
-     * both terminate in cfg_shadow, and NPU writes additionally push
-     * an OP_CFG_WRITE upstream so the kmd's BAR2 cfg-head shadow stays
-     * in sync (FUNC_SCRATCH completion path: q-cp's
-     * `cb_complete → writel(scratchpad)` round-trips back into
-     * `rebel_cfg_read(FUNC_SCRATCH)` on the host without an explicit
-     * DMA transaction).
+     * P10-fix: 4 KB MMIO alias overlay on chiplet-0 DRAM at
+     * R100_DEVICE_COMM_SPACE_BASE (0x10200000) over the shared
+     * `cfg-shadow` memory-backend-file. The host's r100-npu-pci
+     * aliases the same backend over its BAR2 cfg-head subregion,
+     * so kmd writes to FUNC_SCRATCH / DDH_BASE_LO are visible on
+     * q-cp's next read with no chardev queue. Replaces the prior
+     * io-ops trap + cfg-chardev RX + OP_CFG_WRITE reverse-emit.
      */
     MemoryRegion cfg_mirror_mmio;
+    MemoryRegion *cfg_shadow_mr;
 
     R100MailboxState *mailbox;      /* VF0: M6 INTGR sink + M8a ISSR sink */
     R100MailboxState *pf_mailbox;   /* PF: CM7-stub FW_BOOT_DONE source */
-    R100HDMAState    *hdma;         /* M9-1c: shared chardev owner */
 
     /* Chardev byte stream may split a frame across callbacks. */
     RemuFrameRx rx;
-    RemuFrameRx cfg_rx;
 
     /* Doorbell-stream counters. */
     uint64_t frames_received;
     uint32_t last_offset;
     uint32_t last_value;
-
-    /* Cfg-shadow mirror of host BAR2 cfg head (4 KB worth of u32s).
-     * Host-initiated writes land here via the cfg chardev; NPU writes
-     * (P1b) update the same shadow and forward as OP_CFG_WRITE. */
-    uint32_t cfg_shadow[R100_CFG_SHADOW_COUNT];
-    uint64_t cfg_frames_received;
-    uint64_t cfg_frames_dropped;
-    uint32_t cfg_last_offset;
-    uint32_t cfg_last_value;
-
-    /* HDMA egress counters for the cfg-mirror reverse path. */
-    uint64_t hdma_frames_sent;
-    uint64_t hdma_frames_dropped;
 };
 
 /* ------------------------------------------------------------------ */
@@ -141,24 +126,6 @@ static void r100_cm7_emit_debug(R100Cm7State *s,
     }
 }
 
-static void r100_cm7_cfg_emit_debug(R100Cm7State *s,
-                                    uint32_t off, uint32_t val,
-                                    const char *status)
-{
-    char line[96];
-    int n;
-
-    if (!qemu_chr_fe_backend_connected(&s->cfg_debug_chr)) {
-        return;
-    }
-    n = snprintf(line, sizeof(line),
-                 "cfg off=0x%x val=0x%x status=%s count=%" PRIu64 "\n",
-                 off, val, status, s->cfg_frames_received);
-    if (n > 0) {
-        qemu_chr_fe_write(&s->cfg_debug_chr, (const uint8_t *)line, n);
-    }
-}
-
 /* ------------------------------------------------------------------ */
 /* Doorbell (host→NPU) frame ingress                                   */
 /* ------------------------------------------------------------------ */
@@ -167,12 +134,6 @@ static int r100_cm7_can_receive(void *opaque)
 {
     R100Cm7State *s = opaque;
     return remu_frame_rx_headroom(&s->rx);
-}
-
-static int r100_cm7_cfg_can_receive(void *opaque)
-{
-    R100Cm7State *s = opaque;
-    return remu_frame_rx_headroom(&s->cfg_rx);
 }
 
 static void r100_cm7_deliver(R100Cm7State *s, uint32_t off, uint32_t val)
@@ -270,157 +231,6 @@ static void r100_cm7_receive(void *opaque, const uint8_t *buf, int size)
 }
 
 /* ------------------------------------------------------------------ */
-/* cfg chardev ingress (host→NPU BAR2 cfg-head shadow)                 */
-/* ------------------------------------------------------------------ */
-
-static void r100_cm7_cfg_deliver(R100Cm7State *s, uint32_t off, uint32_t val)
-{
-    s->cfg_last_offset = off;
-    s->cfg_last_value = val;
-
-    /* Reject anything outside the 4 KB cfg head window or unaligned —
-     * host side only forwards the head, this is a safety net. */
-    if (off >= REMU_BAR2_CFG_HEAD_SIZE || (off & 0x3u)) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "r100-cm7: cfg frame off=0x%x out of cfg head / "
-                      "unaligned\n", off);
-        s->cfg_frames_dropped++;
-        r100_cm7_cfg_emit_debug(s, off, val, "bad-offset");
-        return;
-    }
-    /*
-     * Single source of truth: cfg_shadow. The 4 KB MMIO trap installed
-     * at R100_DEVICE_COMM_SPACE_BASE (see r100_cm7_realize) overlays
-     * chiplet-0 DRAM, so NPU reads of e.g. DDH_BASE_{LO,HI} land in
-     * cfg_mirror_read which returns the slot below — there is no
-     * separate DRAM mirror to keep in sync. NPU-side writes round-trip
-     * back to the host's cfg_mmio_regs through the same trap
-     * (OP_CFG_WRITE), closing the loop without a feedback path here.
-     */
-    s->cfg_shadow[off >> 2] = val;
-    s->cfg_frames_received++;
-    r100_cm7_cfg_emit_debug(s, off, val, "ok");
-    qemu_log_mask(LOG_TRACE,
-                  "r100-cm7: cfg deliver off=0x%x val=0x%x received=%"
-                  PRIu64 "\n", off, val, s->cfg_frames_received);
-}
-
-static void r100_cm7_cfg_receive(void *opaque, const uint8_t *buf, int size)
-{
-    R100Cm7State *s = opaque;
-    uint32_t off, val;
-
-    while (size > 0) {
-        if (remu_frame_rx_feed(&s->cfg_rx, &buf, &size, &off, &val)) {
-            r100_cm7_cfg_deliver(s, off, val);
-        }
-    }
-}
-
-/* ------------------------------------------------------------------ */
-/* P1b — DEVICE_COMMUNICATION_SPACE reverse-mirror trap                */
-/*                                                                     */
-/* Overlay at NPU PA R100_DEVICE_COMM_SPACE_BASE (0x10200000, 4 KB)    */
-/* installed in r100_cm7_realize at priority 10 over chiplet-0 DRAM    */
-/* (priority 0). Reads from any NPU CPU return the cfg_shadow slot;    */
-/* writes update cfg_shadow + emit an OP_CFG_WRITE on the hdma         */
-/* chardev so the host's r100-npu-pci cfg-head shadow stays in sync.   */
-/* ------------------------------------------------------------------ */
-
-/*
- * The 4 KB cfg head sees a much wider mix of access widths than the
- * 8-byte (cfg_off, val) wire frame suggests:
- *
- *   - q-sys main() on CP0 does
- *       memset(DEVICE_COMMUNICATION_SPACE_BASE, 0, CP1_LOGBUF_MAGIC)
- *     on cold boot (osl/FreeRTOS/Source/main.c:250). The compiler
- *     lowers this to a mix of `dc zva` cache-line zeros and 1/8-byte
- *     stores depending on the MMU attributes the FW has installed
- *     for this region.
- *   - hil_init_descs reads DDH_BASE_LO/HI as a 64-bit FUNC_READQ.
- *   - cb_complete writes FUNC_SCRATCH as a 32-bit `writel`.
- *
- * Set `impl` to the 32-bit slot stride so the read/write helpers
- * stay simple, and let QEMU's accepts_io_with_size() machinery pack /
- * unpack wider or narrower accesses on top. `valid.unaligned = true`
- * isn't strictly needed — every q-sys / q-cp access is naturally
- * aligned — but it costs nothing and matches the silicon semantics
- * (the inbound iATU has no alignment trap).
- */
-static uint64_t r100_cm7_cfg_mirror_read(void *opaque, hwaddr off,
-                                         unsigned size)
-{
-    R100Cm7State *s = opaque;
-    uint32_t v32;
-
-    if (off + size > REMU_BAR2_CFG_HEAD_SIZE) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "r100-cm7: cfg-mirror read off=0x%" HWADDR_PRIx
-                      " size=%u out of bounds (0..0x%x)\n",
-                      off, size, REMU_BAR2_CFG_HEAD_SIZE);
-        return 0;
-    }
-    v32 = s->cfg_shadow[off >> 2];
-    qemu_log_mask(LOG_TRACE,
-                  "r100-cm7: cfg-mirror read off=0x%" HWADDR_PRIx
-                  " size=%u val=0x%x\n", off, size, v32);
-    return v32;
-}
-
-static void r100_cm7_cfg_mirror_write(void *opaque, hwaddr off,
-                                      uint64_t val, unsigned size)
-{
-    R100Cm7State *s = opaque;
-    uint32_t v32;
-
-    if (off + size > REMU_BAR2_CFG_HEAD_SIZE) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "r100-cm7: cfg-mirror write off=0x%" HWADDR_PRIx
-                      " size=%u val=0x%" PRIx64
-                      " out of bounds (0..0x%x)\n",
-                      off, size, val, REMU_BAR2_CFG_HEAD_SIZE);
-        return;
-    }
-    v32 = (uint32_t)val;
-    s->cfg_shadow[off >> 2] = v32;
-    qemu_log_mask(LOG_TRACE,
-                  "r100-cm7: cfg-mirror write off=0x%" HWADDR_PRIx
-                  " size=%u val=0x%x\n", off, size, v32);
-    /*
-     * Forward to host BAR2 cfg-head shadow over the hdma chardev.
-     * The kmd reads FUNC_SCRATCH (and other DDH fields) via
-     * `rebel_cfg_read`, which dereferences `cfg_mmio_regs[idx]` on
-     * the host side. The OP_CFG_WRITE handler in r100-npu-pci
-     * stores the value there with no further egress, so the loop
-     * terminates: NPU-write → cfg_shadow + hdma → host cfg_mmio_regs.
-     *
-     * req_id is unused on the host side for OP_CFG_WRITE (the dst
-     * field carries the cfg offset), so use 0 — we don't need to
-     * disambiguate concurrent in-flight requests.
-     */
-    if (s->hdma) {
-        if (r100_hdma_emit_cfg_write(s->hdma, 0u, (uint32_t)(off & ~0x3u),
-                                     v32, "cfg-mirror")) {
-            s->hdma_frames_sent++;
-        } else {
-            s->hdma_frames_dropped++;
-            qemu_log_mask(LOG_GUEST_ERROR,
-                          "r100-cm7: cfg-mirror write off=0x%" HWADDR_PRIx
-                          " HDMA emit failed\n", off);
-        }
-    }
-}
-
-static const MemoryRegionOps r100_cm7_cfg_mirror_ops = {
-    .read       = r100_cm7_cfg_mirror_read,
-    .write      = r100_cm7_cfg_mirror_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid      = { .min_access_size = 1, .max_access_size = 8,
-                    .unaligned = true },
-    .impl       = { .min_access_size = 4, .max_access_size = 4 },
-};
-
-/* ------------------------------------------------------------------ */
 /* Realize / reset / vmstate / properties                              */
 /* ------------------------------------------------------------------ */
 
@@ -443,33 +253,30 @@ static void r100_cm7_realize(DeviceState *dev, Error **errp)
                              r100_cm7_can_receive,
                              r100_cm7_receive,
                              NULL, NULL, s, NULL, true);
-    /* cfg is optional — when unset the cfg-mirror trap still installs
-     * but reads always return zero (no kmd has published DDH_BASE) and
-     * NPU writes simply update the local shadow. The OP_CFG_WRITE
-     * upstream is similarly a no-op when the hdma link is unbound. */
-    if (qemu_chr_fe_backend_connected(&s->cfg_chr)) {
-        qemu_chr_fe_set_handlers(&s->cfg_chr,
-                                 r100_cm7_cfg_can_receive,
-                                 r100_cm7_cfg_receive,
-                                 NULL, NULL, s, NULL, true);
-    }
 
     /*
-     * P1b reverse-mirror trap: install the 4 KB cfg-shadow MMIO over
-     * chiplet-0 DRAM at R100_DEVICE_COMM_SPACE_BASE. Priority 10 is
-     * higher than the bare DRAM (priority 0), so every NPU access in
-     * this window goes through cfg_mirror_ops instead of leaking into
-     * the underlying RAM region. Always installed when cm7 is
-     * created (i.e. dual-QEMU --host runs); single-QEMU configs don't
-     * instantiate cm7 at all so the trap is implicitly absent there.
+     * Install a 4 KB MemoryRegion alias over the shared `cfg-shadow`
+     * backend at R100_DEVICE_COMM_SPACE_BASE (priority 10 over the
+     * priority-0 chiplet-0 DRAM, so NPU CPU accesses in this window
+     * land here instead of leaking into bare RAM). The host x86
+     * QEMU's r100-npu-pci aliases the same backend over its BAR2
+     * cfg-head subregion (REMU_BAR2_CFG_HEAD_OFF), so kmd writes to
+     * FUNC_SCRATCH / DDH_BASE_LO are observable on q-cp's next read
+     * with no chardev queue. Optional — single-QEMU NPU-only tests
+     * (m6 / m8) skip the alias and let chiplet-0 lazy RAM service
+     * any incidental access at the window, matching pre-P1b silicon.
      */
-    memory_region_init_io(&s->cfg_mirror_mmio, OBJECT(dev),
-                          &r100_cm7_cfg_mirror_ops, s,
-                          "r100.cm7.cfg-mirror",
-                          R100_DEVICE_COMM_SPACE_SIZE);
-    memory_region_add_subregion_overlap(get_system_memory(),
-                                        R100_DEVICE_COMM_SPACE_BASE,
-                                        &s->cfg_mirror_mmio, 10);
+    if (s->cfg_shadow_mr) {
+        uint64_t alias_size =
+            MIN((uint64_t)memory_region_size(s->cfg_shadow_mr),
+                (uint64_t)R100_DEVICE_COMM_SPACE_SIZE);
+        memory_region_init_alias(&s->cfg_mirror_mmio, OBJECT(dev),
+                                 "r100.cm7.cfg-mirror.alias",
+                                 s->cfg_shadow_mr, 0, alias_size);
+        memory_region_add_subregion_overlap(get_system_memory(),
+                                            R100_DEVICE_COMM_SPACE_BASE,
+                                            &s->cfg_mirror_mmio, 10);
+    }
 }
 
 static void r100_cm7_unrealize(DeviceState *dev)
@@ -478,8 +285,6 @@ static void r100_cm7_unrealize(DeviceState *dev)
 
     qemu_chr_fe_deinit(&s->chr, false);
     qemu_chr_fe_deinit(&s->debug_chr, false);
-    qemu_chr_fe_deinit(&s->cfg_chr, false);
-    qemu_chr_fe_deinit(&s->cfg_debug_chr, false);
 }
 
 static void r100_cm7_reset(DeviceState *dev)
@@ -487,29 +292,18 @@ static void r100_cm7_reset(DeviceState *dev)
     R100Cm7State *s = R100_CM7(dev);
 
     remu_frame_rx_reset(&s->rx);
-    remu_frame_rx_reset(&s->cfg_rx);
 }
 
 static const VMStateDescription r100_cm7_vmstate = {
     .name = "r100-cm7",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (VMStateField[]) {
         VMSTATE_UINT32(rx.len, R100Cm7State),
         VMSTATE_UINT8_ARRAY(rx.buf, R100Cm7State, REMU_FRAME_SIZE),
-        VMSTATE_UINT32(cfg_rx.len, R100Cm7State),
-        VMSTATE_UINT8_ARRAY(cfg_rx.buf, R100Cm7State, REMU_FRAME_SIZE),
         VMSTATE_UINT64(frames_received, R100Cm7State),
         VMSTATE_UINT32(last_offset, R100Cm7State),
         VMSTATE_UINT32(last_value, R100Cm7State),
-        VMSTATE_UINT32_ARRAY(cfg_shadow, R100Cm7State,
-                             R100_CFG_SHADOW_COUNT),
-        VMSTATE_UINT64(cfg_frames_received, R100Cm7State),
-        VMSTATE_UINT64(cfg_frames_dropped, R100Cm7State),
-        VMSTATE_UINT32(cfg_last_offset, R100Cm7State),
-        VMSTATE_UINT32(cfg_last_value, R100Cm7State),
-        VMSTATE_UINT64(hdma_frames_sent, R100Cm7State),
-        VMSTATE_UINT64(hdma_frames_dropped, R100Cm7State),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -517,14 +311,12 @@ static const VMStateDescription r100_cm7_vmstate = {
 static Property r100_cm7_properties[] = {
     DEFINE_PROP_CHR("chardev", R100Cm7State, chr),
     DEFINE_PROP_CHR("debug-chardev", R100Cm7State, debug_chr),
-    DEFINE_PROP_CHR("cfg-chardev", R100Cm7State, cfg_chr),
-    DEFINE_PROP_CHR("cfg-debug-chardev", R100Cm7State, cfg_debug_chr),
     DEFINE_PROP_LINK("mailbox", R100Cm7State, mailbox,
                      TYPE_R100_MAILBOX, R100MailboxState *),
     DEFINE_PROP_LINK("pf-mailbox", R100Cm7State, pf_mailbox,
                      TYPE_R100_MAILBOX, R100MailboxState *),
-    DEFINE_PROP_LINK("hdma", R100Cm7State, hdma,
-                     TYPE_R100_HDMA, R100HDMAState *),
+    DEFINE_PROP_LINK("cfg-shadow", R100Cm7State, cfg_shadow_mr,
+                     TYPE_MEMORY_REGION, MemoryRegion *),
     DEFINE_PROP_END_OF_LIST(),
 };
 

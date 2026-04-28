@@ -35,6 +35,8 @@
 #include "r100_soc.h"
 
 static HostMemoryBackend *r100_soc_resolve_memdev(R100SoCMachineState *r100m);
+static MemoryRegion *r100_soc_resolve_host_ram(R100SoCMachineState *r100m);
+static MemoryRegion *r100_soc_resolve_cfg_shadow(R100SoCMachineState *r100m);
 static Chardev *r100_soc_resolve_chr(const char *id, const char *role);
 
 /*
@@ -432,7 +434,9 @@ static void r100_create_flash(MemoryRegion *sysmem)
  * only) splices a shared backend over DRAM head for host/NPU sharing —
  * M5, commit 72c98f0. `gic_dev` is the chiplet's own GICv3 — already
  * realized by r100_soc_init, used here to wire per-DCL DNC completion
- * SPIs (M9-1c) into q-cp's CP1.cpu0.
+ * SPIs (M9-1c) into q-cp's CP1.cpu0. The P10-fix host-ram alias is
+ * installed at r100_soc_init level (not per-chiplet) since it only
+ * makes sense for chiplet 0's PCIe outbound iATU stub.
  */
 static void r100_chiplet_init(MachineState *machine, int chiplet_id,
                               MemoryRegion *sysmem,
@@ -797,6 +801,17 @@ static void r100_soc_init(MachineState *machine)
     int chiplet, cluster, core, cpu_idx;
     int num_cpus = R100_NUM_CORES_TOTAL;
     const int cpus_per_gic = R100_NUM_CORES_PER_CHIPLET; /* 8 */
+    R100SoCMachineState *r100m = R100_SOC_MACHINE(machine);
+    /* P10-fix: resolve once up-front so both the chiplet_init loop
+     * (chiplet 0 DRAM splice via memdev) and the later peripheral
+     * block (chiplet 0 PCIe outbound iATU alias via host_ram_mr)
+     * share the same MemoryRegion / HostMemoryBackend pointers. */
+    HostMemoryBackend *memdev = r100_soc_resolve_memdev(r100m);
+    MemoryRegion *host_ram_mr = r100_soc_resolve_host_ram(r100m);
+    /* P10-fix: 4 KB cfg-shadow shared backend; aliased on the NPU side
+     * by r100-cm7's cfg-mirror trap. Resolved here so the chiplet 0
+     * peripheral block can pass the link. */
+    MemoryRegion *cfg_shadow_mr = r100_soc_resolve_cfg_shadow(r100m);
 
     if (machine->smp.cpus != num_cpus && machine->smp.cpus != 0) {
         error_report("R100 SoC requires exactly %d CPUs (got %d)",
@@ -937,15 +952,12 @@ static void r100_soc_init(MachineState *machine)
      * r100_create_flash. */
     r100_create_flash(sysmem);
 
-    /* Init all 4 chiplets. */
-    {
-        R100SoCMachineState *r100m = R100_SOC_MACHINE(machine);
-        HostMemoryBackend *memdev = r100_soc_resolve_memdev(r100m);
-        for (chiplet = 0; chiplet < R100_NUM_CHIPLETS; chiplet++) {
-            r100_chiplet_init(machine, chiplet, sysmem,
-                              chiplet == 0 ? memdev : NULL,
-                              gic_dev[chiplet]);
-        }
+    /* Init all 4 chiplets. memdev / host_ram_mr were resolved at
+     * function scope above; only chiplet 0 cares about the splices. */
+    for (chiplet = 0; chiplet < R100_NUM_CHIPLETS; chiplet++) {
+        r100_chiplet_init(machine, chiplet, sysmem,
+                          chiplet == 0 ? memdev : NULL,
+                          gic_dev[chiplet]);
     }
 
     /*
@@ -1024,7 +1036,9 @@ static void r100_soc_init(MachineState *machine)
      * see none of the devices.
      */
     {
-        R100SoCMachineState *r100m = R100_SOC_MACHINE(machine);
+        /* r100m is in scope from the function head (P10-fix hoisted
+         * the resolve so memdev / host_ram_mr can be shared across
+         * the chiplet-init loop and the cm7/pcie-outbound block). */
         DeviceState *mbx_vf0_dev;
         DeviceState *mbx_pf_dev;
         /* P3: q-cp's `_inst[HW_SPEC_DNC_QUEUE_NUM=4]` task-queue
@@ -1152,24 +1166,18 @@ static void r100_soc_init(MachineState *machine)
                 Chardev *dbg = r100_soc_resolve_chr(
                                    r100m->doorbell_debug_chardev_id,
                                    "doorbell debug");
-                /* M8b 3b: cfg (host→NPU) + hdma (NPU<->host). All
-                 * optional — missing any demotes the corresponding
-                 * CM7 behaviour to a no-op but doesn't break the
-                 * M6/M8a paths. */
-                Chardev *cfg_chr = r100_soc_resolve_chr(
-                                       r100m->cfg_chardev_id, "cfg");
-                Chardev *cfg_dbg = NULL;
+                /* M8b 3b → P10-fix: only `hdma` remains as a CM7
+                 * peer chardev. The legacy `cfg` chardev path was
+                 * retired alongside the outbound iATU chardev
+                 * fallback; cfg-head propagation now flows through
+                 * the shared `cfg-shadow` memory-backend-file alias
+                 * (see r100_cm7.c banner + r100_soc_resolve_cfg_shadow). */
                 Chardev *hdma_chr = r100_soc_resolve_chr(
                                        r100m->hdma_chardev_id, "hdma");
                 Chardev *hdma_dbg = NULL;
                 DeviceState *cm7 = qdev_new(TYPE_R100_CM7);
                 DeviceState *hdma_dev = NULL;
 
-                if (cfg_chr) {
-                    cfg_dbg = r100_soc_resolve_chr(
-                                  r100m->cfg_debug_chardev_id,
-                                  "cfg debug");
-                }
                 if (hdma_chr) {
                     hdma_dbg = r100_soc_resolve_chr(
                                   r100m->hdma_debug_chardev_id,
@@ -1199,18 +1207,26 @@ static void r100_soc_init(MachineState *machine)
                                        R100_INTID_TO_GIC_SPI_GPIO(
                                            R100_INT_ID_HDMA)));
 
-                /* P1: PCIe outbound iATU stub. Only meaningful when
-                 * the host chardev is present (otherwise there's
-                 * nowhere to send OP_READ_REQ frames); single-QEMU
-                 * runs leave the 4 GB AXI window unmapped just like
-                 * before, so any q-cp BD-read attempt still surfaces
-                 * as an unassigned-region access in the log. */
-                if (hdma_chr) {
+                /* P1 + P10-fix: PCIe outbound iATU stub. Created only
+                 * in --host mode (where one of the two splice paths is
+                 * available — single-QEMU runs leave the 4 GB AXI
+                 * window unmapped just like before, so any q-cp
+                 * BD-read attempt still surfaces as an
+                 * unassigned-region access in the log).
+                 *
+                 * Backed by a MemoryRegion alias over the shared host
+                 * x86 main-memory backend (`host-ram` link wired from
+                 * `-machine r100-soc,host-ram=<id>`). Reads/writes are
+                 * plain TCG RAM accesses against the same mmap the
+                 * kmd polls — no chardev hop, no BQL contention with
+                 * the kmd's `readl_poll_timeout_atomic`. */
+                if (host_ram_mr) {
                     DeviceState *outbound = qdev_new(TYPE_R100_PCIE_OUTBOUND);
 
                     qdev_prop_set_uint32(outbound, "chiplet-id", 0);
-                    object_property_set_link(OBJECT(outbound), "hdma",
-                                             OBJECT(hdma_dev),
+                    object_property_set_link(OBJECT(outbound),
+                                             "host-ram",
+                                             OBJECT(host_ram_mr),
                                              &error_fatal);
                     sysbus_realize_and_unref(SYS_BUS_DEVICE(outbound),
                                              &error_fatal);
@@ -1222,29 +1238,26 @@ static void r100_soc_init(MachineState *machine)
                 if (dbg) {
                     qdev_prop_set_chr(cm7, "debug-chardev", dbg);
                 }
-                if (cfg_chr) {
-                    qdev_prop_set_chr(cm7, "cfg-chardev", cfg_chr);
-                }
-                if (cfg_dbg) {
-                    qdev_prop_set_chr(cm7, "cfg-debug-chardev", cfg_dbg);
-                }
                 /* mailbox=VF0 (shortcut PCIE_CM7 relay — INTGR bits
                  * raise INTID 185 q-sys services). pf-mailbox=PF so
                  * SOFT_RESET can re-synthesise FW_BOOT_DONE→PF.ISSR[4]
                  * (CM7 stub, a01d2b5; narrowed post GIC wiring fix —
                  * cold boot is real, see docs/debugging.md
-                 * Post-mortems). hdma is the cfg-mirror reverse-path
-                 * sink for OP_CFG_WRITE so q-cp's NPU-side
-                 * FUNC_SCRATCH writes round-trip back to the kmd. */
+                 * Post-mortems). cfg-shadow is the shared 4 KB
+                 * memory-backend-file aliased over the cfg-mirror
+                 * trap so kmd writes are visible to q-cp without a
+                 * chardev round trip (P10-fix). */
                 object_property_set_link(OBJECT(cm7), "mailbox",
                                          OBJECT(mbx_vf0_dev),
                                          &error_fatal);
                 object_property_set_link(OBJECT(cm7), "pf-mailbox",
                                          OBJECT(mbx_pf_dev),
                                          &error_fatal);
-                object_property_set_link(OBJECT(cm7), "hdma",
-                                         OBJECT(hdma_dev),
-                                         &error_fatal);
+                if (cfg_shadow_mr) {
+                    object_property_set_link(OBJECT(cm7), "cfg-shadow",
+                                             OBJECT(cfg_shadow_mr),
+                                             &error_fatal);
+                }
                 sysbus_realize_and_unref(SYS_BUS_DEVICE(cm7),
                                          &error_fatal);
                 (void)mbx_mbtq_dev;
@@ -1351,14 +1364,14 @@ static void r100_soc_init(MachineState *machine)
     }
 
 R100_SOC_DEF_STRPROP(memdev,         memdev_id)
+R100_SOC_DEF_STRPROP(host_ram,       host_ram_id)
+R100_SOC_DEF_STRPROP(cfg_shadow,     cfg_shadow_id)
 R100_SOC_DEF_STRPROP(doorbell,       doorbell_chardev_id)
 R100_SOC_DEF_STRPROP(doorbell_debug, doorbell_debug_chardev_id)
 R100_SOC_DEF_STRPROP(msix,           msix_chardev_id)
 R100_SOC_DEF_STRPROP(msix_debug,     msix_debug_chardev_id)
 R100_SOC_DEF_STRPROP(issr,           issr_chardev_id)
 R100_SOC_DEF_STRPROP(issr_debug,     issr_debug_chardev_id)
-R100_SOC_DEF_STRPROP(cfg,            cfg_chardev_id)
-R100_SOC_DEF_STRPROP(cfg_debug,      cfg_debug_chardev_id)
 R100_SOC_DEF_STRPROP(hdma,           hdma_chardev_id)
 R100_SOC_DEF_STRPROP(hdma_debug,     hdma_debug_chardev_id)
 
@@ -1384,6 +1397,18 @@ static const R100SoCStrProp r100_soc_str_props[] = {
     R100_SOC_STR_PROP("memdev", memdev, memdev_id,
         "memory-backend-* id spliced over chiplet-0 DRAM head "
         "(Phase 2 M5)."),
+    R100_SOC_STR_PROP("host-ram", host_ram, host_ram_id,
+        "memory-backend-* id aliased over the chiplet-0 PCIe outbound "
+        "iATU window (P10-fix). Same backend the host x86 QEMU uses "
+        "for its main RAM, so q-cp's outbound loads/stores resolve "
+        "directly into the kmd's coherent DMA pages without a chardev "
+        "round trip."),
+    R100_SOC_STR_PROP("cfg-shadow", cfg_shadow, cfg_shadow_id,
+        "memory-backend-* id (4 KB) aliased over the r100-cm7 cfg-mirror "
+        "trap at DEVICE_COMMUNICATION_SPACE_BASE (P10-fix). Same backend "
+        "the host's r100-npu-pci aliases over its BAR2 cfg-head subregion, "
+        "so kmd writes to FUNC_SCRATCH / DDH_BASE_LO are observable on "
+        "q-cp's next read with no cfg-chardev round trip."),
     R100_SOC_STR_PROP("doorbell", doorbell, doorbell_chardev_id,
         "chardev id: host→NPU 8-byte (BAR4 off, val) frames into "
         "INTGR/ISSR (M6/M8a)."),
@@ -1399,11 +1424,6 @@ static const R100SoCStrProp r100_soc_str_props[] = {
         "(M8a)."),
     R100_SOC_STR_PROP("issr-debug", issr_debug, issr_debug_chardev_id,
         "chardev id for an ASCII trace of every ISSR frame emitted."),
-    R100_SOC_STR_PROP("cfg", cfg, cfg_chardev_id,
-        "chardev id: host→NPU 8-byte (BAR2 cfg-head off, val) frames "
-        "that populate cfg_shadow[] for the CM7 QINIT stub (M8b 3b)."),
-    R100_SOC_STR_PROP("cfg-debug", cfg_debug, cfg_debug_chardev_id,
-        "chardev id for an ASCII trace of every cfg frame received."),
     R100_SOC_STR_PROP("hdma", hdma, hdma_chardev_id,
         "chardev id: NPU→host variable-length HDMA_OP_WRITE frames "
         "that the host executes as pci_dma_write (M8b 3b, M9 BD-done)."),
@@ -1454,6 +1474,89 @@ static HostMemoryBackend *r100_soc_resolve_memdev(R100SoCMachineState *r100m)
         exit(1);
     }
     return MEMORY_BACKEND(obj);
+}
+
+/*
+ * Resolve host-ram=<id> to its MemoryRegion. NULL if unset (single-QEMU
+ * runs and pre-P10-fix --host runs both legitimately have no host-ram
+ * splice). The caller marks the backend as `mapped` so QEMU doesn't
+ * complain at exit-time about an unused memdev — same dance memdev does.
+ */
+static MemoryRegion *r100_soc_resolve_host_ram(R100SoCMachineState *r100m)
+{
+    Object *obj;
+    HostMemoryBackend *be;
+    MemoryRegion *mr;
+
+    if (r100m->host_ram_id == NULL || *r100m->host_ram_id == '\0') {
+        return NULL;
+    }
+    obj = object_resolve_path_component(object_get_objects_root(),
+                                        r100m->host_ram_id);
+    if (obj == NULL) {
+        error_report("r100-soc: host-ram '%s' not found under /objects",
+                     r100m->host_ram_id);
+        exit(1);
+    }
+    if (!object_dynamic_cast(obj, TYPE_MEMORY_BACKEND)) {
+        error_report("r100-soc: object '%s' is not a memory-backend",
+                     r100m->host_ram_id);
+        exit(1);
+    }
+    be = MEMORY_BACKEND(obj);
+    mr = host_memory_backend_get_memory(be);
+    if (mr == NULL || memory_region_size(mr) == 0) {
+        error_report("r100-soc: host-ram '%s' has no backing region",
+                     r100m->host_ram_id);
+        exit(1);
+    }
+    /* Mark mapped so the host_memory_backend_is_mapped() check at
+     * QEMU exit doesn't yell about an unused backend. The mapping
+     * itself is performed inside r100-pcie-outbound's realize via
+     * memory_region_init_alias(); we don't add it as a subregion of
+     * sysmem at machine level. */
+    host_memory_backend_set_mapped(be, true);
+    return mr;
+}
+
+/*
+ * Resolve cfg-shadow=<id> to its MemoryRegion. NULL if unset (single-
+ * QEMU runs and pre-P10-fix --host runs both legitimately have no
+ * cfg-shadow splice). Mirrors the host-ram resolver above; the
+ * returned MR is aliased over the r100-cm7 cfg-mirror trap so kmd
+ * writes to FUNC_SCRATCH / DDH_BASE_LO are observable on q-cp's next
+ * read with no chardev round trip.
+ */
+static MemoryRegion *r100_soc_resolve_cfg_shadow(R100SoCMachineState *r100m)
+{
+    Object *obj;
+    HostMemoryBackend *be;
+    MemoryRegion *mr;
+
+    if (r100m->cfg_shadow_id == NULL || *r100m->cfg_shadow_id == '\0') {
+        return NULL;
+    }
+    obj = object_resolve_path_component(object_get_objects_root(),
+                                        r100m->cfg_shadow_id);
+    if (obj == NULL) {
+        error_report("r100-soc: cfg-shadow '%s' not found under /objects",
+                     r100m->cfg_shadow_id);
+        exit(1);
+    }
+    if (!object_dynamic_cast(obj, TYPE_MEMORY_BACKEND)) {
+        error_report("r100-soc: object '%s' is not a memory-backend",
+                     r100m->cfg_shadow_id);
+        exit(1);
+    }
+    be = MEMORY_BACKEND(obj);
+    mr = host_memory_backend_get_memory(be);
+    if (mr == NULL || memory_region_size(mr) == 0) {
+        error_report("r100-soc: cfg-shadow '%s' has no backing region",
+                     r100m->cfg_shadow_id);
+        exit(1);
+    }
+    host_memory_backend_set_mapped(be, true);
+    return mr;
 }
 
 /*
