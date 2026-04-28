@@ -261,7 +261,7 @@ DNC1=422…) and latches a synthesised `dnc_reg_done_passage` at
 slot+0xA00 so q-cp's `dnc_X_done_handler` reads a coherent record.
 GIC `num-irq` was bumped 256 → 992 so the wider DNC INTID set fits.
 
-#### r100-rbdma (P4A — DDMA / DDMA_HIGHP cmd_types)
+#### r100-rbdma (P4A reg-block + P4B OTO byte-mover — DDMA / DDMA_HIGHP cmd_types)
 
 Per-chiplet `r100-rbdma` device (QOM type `r100-rbdma`, MMIO at
 `R100_NBUS_L_RBDMA_CFG_BASE = 0x1FF3700000`, 1 MB) extracted from the
@@ -288,6 +288,36 @@ ring head and returns `ptid_init`). `intr_disable=1` (q-cp's
 `dump_shm` / `shm_clear` paths) still pushes the FIFO entry but
 skips the GIC pulse. ERR slot (`INT_ID_RBDMA0_ERR = 977`, idx 0) is
 reserved for symmetry — never pulsed today.
+
+P4B layers an OTO byte-mover on top of the same RUN_CONF1 trigger:
+the kickoff handler reads `SRCADDRESS_OR_CONST`, `DESTADDRESS`,
+`SIZEOF128BLOCK`, and `RUN_CONF0` from the regstore, decodes
+`RUN_CONF0.task_type`, and for `RBDMA_TASK_TYPE_OTO=0` reconstructs
+the full 41-bit byte SAR/DAR (lower 32 bits in the address registers,
+top 2 bits in `RUN_CONF0.{src,dst}_addr_msb`, both shifted left by 7
+to convert 128 B-units → bytes). **SAR / DAR carry DVAs on real
+silicon** — RBDMA's AXI burst would normally traverse the per-chiplet
+SMMU-600 (S1 + S2 walk) before hitting DDR. REMU's `r100_smmu.c` is a
+register-only stub (no STE / CD / page-table walk), so the engine
+operates as if FW had set SMMU to identity (`S1 ∘ S2 = identity`),
+the same regime `r100-hdma` and `r100-dnc-cluster` already assume.
+The chiplet base (`chiplet_id * R100_CHIPLET_OFFSET`) is added on top
+to translate chiplet-local NoC addresses into QEMU's flat global
+`&address_space_memory` — that's REMU plumbing, not an SMMU stand-in.
+Then `address_space_read` SAR → temp buf → `address_space_write` DAR.
+Capped at `RBDMA_OTO_MAX_BYTES = 32 MiB`. Other task_types (CST/DAS/
+PTL/IVL/DUM/VCM/OTM/GTH/SCT/GTHR/SCTR) fall through to a `LOG_UNIMP`
++ `unimp_task_kicks++` no-op so q-cp's done handler still drains the
+FNSH FIFO. Stats counters survive reset: `oto_kicks`, `oto_bytes`,
+`oto_dma_errors`, `unimp_task_kicks`. Honouring real FW page tables
+is tracked as a long-term follow-on
+(`docs/roadmap.md` → "SMMU honour FW page tables") — the natural
+plug point is a `r100_smmu_translate(asid, dva, …, &pa)` hook just
+before the `address_space_*` call here (and in `r100-hdma`). Verified
+end-to-end via `./remucli test p4b` (4 KB byte move between
+chiplet-0 DRAM offsets, gdbstub-driven from outside via the
+on-demand HMP `gdbserver tcp::PORT` + `Qqemu.PhyMemMode:1` packet
+sequence).
 
 Both QEMUs `mmap` the same 128 MB `/dev/shm/remu-<name>/remu-shm` with
 `share=on`. Splice points (same backend, two places):
@@ -355,10 +385,18 @@ cleanup so SIGKILL'd prior state never poisons the next:
 - `tests/p4a_rbdma_stub_test.py` — `--host` smoke; HMP `xp` against
   chiplet-0 `r100-rbdma` at `0x1FF3700000` asserts `IP_INFO3.num_of_executer = 8`,
   `NORMALTQUEUE_STATUS = 32`, `PTQUEUE_STATUS = 32`, `INTR_FIFO_NUM = 0`
-  (idle). Kick path is exercised end-to-end once a real workload reaches
-  P10 — there's no synthetic injector because the silicon trigger
-  sequence (8-word descriptor with PTID_INIT then RUN_CONF1) is awkward
-  to drive purely via HMP.
+  (idle). Reads-only — the kick path is covered by `p4b` (gdbstub-driven
+  RUN_CONF1 burst) and end-to-end through real q-cp once P10's umd
+  workload lands.
+- `tests/p4b_rbdma_oto_test.py` — `--host` boot, then `mmap` the
+  chiplet-0 DRAM head (the shm splice) to seed a 4 KB pseudo-random
+  pattern at offset `0x07000000` and zero offset `0x07800000`. Spawns
+  the NPU's gdbstub on demand via HMP `gdbserver tcp::4567`, switches
+  to physical-memory mode (`Qqemu.PhyMemMode:1`), then `M<addr>,4:<hex>`
+  packets drive the 6-word OTO descriptor against `r100-rbdma`'s
+  RUN_CONF1 trigger. Asserts byte-for-byte equality at the destination
+  via the same shm mmap. Exercises the full P4B byte-mover path end-to-end
+  in a single test process (no umd/kmd/x86 boot stack on the critical path).
 
 All `./remucli run` invocations write into `output/<name>/` (or
 `output/run-<timestamp>/` if `--name` omitted). Never pass `/tmp/`

@@ -2376,6 +2376,12 @@ TEST_REGISTRY = {
         "desc": "P4A r100-rbdma stub: IP_INFO seeds + queue-credit + idle FIFO",
         "needs": ("aarch64", "x86_64"),
     },
+    "p4b": {
+        "script": "tests/p4b_rbdma_oto_test.py",
+        "run_name": "p4b-rbdma",
+        "desc": "P4B r100-rbdma OTO: gdbstub-driven 4 KB byte-move via shm splice",
+        "needs": ("aarch64", "x86_64"),
+    },
 }
 
 TEST_KEYS = list(TEST_REGISTRY.keys())

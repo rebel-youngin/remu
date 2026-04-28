@@ -1,6 +1,17 @@
 /*
  * REMU - R100 NPU System Emulator
- * r100-rbdma — RBDMA (Rebel Block DMA) functional stub.
+ * r100-rbdma — RBDMA (Rebel Block DMA) reg block + OTO byte-mover.
+ *
+ * Two-layer device:
+ *   - P4A: register block + kick → FNSH FIFO → done-IRQ ack path.
+ *     q-cp's RMW init sequences round-trip; the kickoff trigger
+ *     completes synchronously with no real data movement.
+ *   - P4B: layered on top of the same RUN_CONF1 trigger,
+ *     `r100_rbdma_do_oto` performs an actual byte-for-byte copy from
+ *     SAR → DAR via address_space_{read,write} for `task_type=OTO`
+ *     (the only flavour umd's `simple_copy` emits today). Other
+ *     task_types still ack the kick via LOG_UNIMP so q-cp's done
+ *     loop unwinds.
  *
  * Maps the 1 MB RBDMA configuration window (NBUS_L_RBDMA_CFG @
  * 0x1FF3700000) per chiplet. Implements:
@@ -66,6 +77,7 @@
 #include "hw/sysbus.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
+#include "exec/address-spaces.h"
 #include "r100_soc.h"
 
 /* ========================================================================
@@ -105,8 +117,58 @@
  * eight 32-bit words ascending from PTID_INIT (0x200) to RUN_CONF1
  * (0x21C). The latter store is the kickoff trigger. */
 #define RBDMA_TASK_PTID_INIT_OFF        (RBDMA_CDMA_TASK_BASE_OFF + 0x000)
+#define RBDMA_TASK_SRCADDRESS_OFF       (RBDMA_CDMA_TASK_BASE_OFF + 0x004)
+#define RBDMA_TASK_DESTADDRESS_OFF      (RBDMA_CDMA_TASK_BASE_OFF + 0x008)
+#define RBDMA_TASK_SIZEOF128BLK_OFF     (RBDMA_CDMA_TASK_BASE_OFF + 0x00C)
+#define RBDMA_TASK_RUN_CONF0_OFF        (RBDMA_CDMA_TASK_BASE_OFF + 0x018)
 #define RBDMA_TASK_RUN_CONF1_OFF        (RBDMA_CDMA_TASK_BASE_OFF + 0x01C)
 #define RBDMA_TASK_RUN_CONF1_INTR_DISABLE_BIT   (1U << 0)
+
+/* RUN_CONF0 bit layout (union rbdma_td_run_conf0,
+ * g_cdma_task_registers.h):
+ *   task_type:4 | split_granule_l2:4 | ext_num_of_chunk:12 |
+ *   src_addr_msb:2 | dst_addr_msb:2  | tsync_dnc_code:4    |
+ *   ext_dnc_mask:3 | fid_max:1
+ *
+ * P4B's OTO byte-mover only needs task_type and the two
+ * {src,dst}_addr_msb fields. The other bits are honoured by silicon's
+ * full RBDMA but are functionally inert at a byte-copy level — q-cp's
+ * existing test framework hits OTO with most of these zero. */
+#define RBDMA_RUN_CONF0_TASK_TYPE_SHIFT   0
+#define RBDMA_RUN_CONF0_TASK_TYPE_MASK    0xFu
+#define RBDMA_RUN_CONF0_SRC_ADDR_MSB_SHIFT  20
+#define RBDMA_RUN_CONF0_SRC_ADDR_MSB_MASK   0x3u
+#define RBDMA_RUN_CONF0_DST_ADDR_MSB_SHIFT  22
+#define RBDMA_RUN_CONF0_DST_ADDR_MSB_MASK   0x3u
+
+/* enum rbdma_task_type (g_cmd_descr_rbdma_rebel.h). Only OTO is
+ * behaviourally implemented today; other task_types fall through to
+ * the kick-acknowledge stub so q-cp's done loop doesn't deadlock
+ * (LOG_UNIMP fires once per kick to surface the gap). */
+#define RBDMA_TASK_TYPE_OTO     0u
+#define RBDMA_TASK_TYPE_CST     1u
+#define RBDMA_TASK_TYPE_GTH     2u
+#define RBDMA_TASK_TYPE_SCT     3u
+#define RBDMA_TASK_TYPE_OTM     4u
+#define RBDMA_TASK_TYPE_GTHR    6u
+#define RBDMA_TASK_TYPE_SCTR    7u
+#define RBDMA_TASK_TYPE_PTL     8u
+#define RBDMA_TASK_TYPE_IVL     9u
+#define RBDMA_TASK_TYPE_VCM    10u
+#define RBDMA_TASK_TYPE_DUM    11u
+#define RBDMA_TASK_TYPE_DAS    12u
+
+/* Address encoding. Both src and dst are stored as 128 B-units split
+ * across two registers: low-32 bits in SRCADDRESS_OR_CONST /
+ * DESTADDRESS, high 2 bits in RUN_CONF0.{src,dst}_addr_msb. The
+ * device's outgoing AXI traffic shifts left by 7 to produce a 41-bit
+ * byte address. */
+#define RBDMA_ADDR_GRAIN_SHIFT  7      /* 128 B blocks */
+
+/* Outer cap on a single OTO byte-move. Mirrors umd cmdgen's
+ * `args->size > SZ_32M` guard. Anything larger is q-cp scatter (CST /
+ * GTH / SCTR / ...) which we defer to a later P4B-extension. */
+#define RBDMA_OTO_MAX_BYTES     (32u * 1024u * 1024u)
 
 /* Synthetic IP_INFO seeds. q-cp logs ip_info0/1 verbatim, decodes
  * info3.num_of_executer for TE iteration, and decodes info4/info5 for
@@ -232,6 +294,14 @@ struct R100RBDMAState {
     uint64_t completes;
     uint64_t pulses_fired;
     uint64_t fifo_overflows;
+
+    /* P4B — RBDMA OTO byte-mover stats. `oto_bytes` accumulates the
+     * total bytes physically moved between SAR/DAR via
+     * address_space_{read,write}; useful in tests + post-mortem. */
+    uint64_t oto_kicks;
+    uint64_t oto_bytes;
+    uint64_t oto_dma_errors;
+    uint64_t unimp_task_kicks;
 };
 typedef struct R100RBDMAState R100RBDMAState;
 
@@ -342,10 +412,137 @@ static void r100_rbdma_done_bh(void *opaque)
      * because we recompute walk from the current head each time. */
 }
 
+/* P4B — OTO byte mover. Runs inline on RUN_CONF1 store, before the
+ * FNSH push, so q-cp's done-handler always observes the data already
+ * landed at DAR by the time it walks the cb completion logic.
+ *
+ * Address handling — read this carefully, the silicon path differs:
+ *
+ *   On real silicon, SAR / DAR carry **device virtual addresses (DVAs)**
+ *   programmed by q-cp from kmd-allocated cb_descr fields. The RBDMA
+ *   engine emits AXI bursts that traverse the per-chiplet SMMU-600
+ *   (`r100_smmu.c`'s real counterpart), which performs the S1 + S2
+ *   page-table walk to translate DVA → output PA before the DDR
+ *   controller / iATU sees the request.
+ *
+ *   REMU does NOT model SMMU translation. `r100_smmu.c` is a
+ *   register-only stub — it acks `CR0→CR0ACK`, auto-advances
+ *   `CMDQ_CONS=PROD`, and never walks the STE / CD / page tables FW
+ *   sets up in DRAM. The SMMU's effective transform in REMU is
+ *   therefore `S1 ∘ S2 = identity`. This matches how `r100-hdma`,
+ *   `r100-dnc-cluster`, and the rest of the engine fleet already
+ *   handle DVAs (see `r100_hdma.c:r100_hdma_kick_wr` — same shape).
+ *   Honouring real FW page tables is tracked separately as a
+ *   long-term follow-on (`docs/roadmap.md` → "SMMU honour FW page
+ *   tables"); the natural plug point would be a translation hook
+ *   here just before the address_space_{read,write} call.
+ *
+ *   The `chiplet_base += chiplet_id * R100_CHIPLET_OFFSET` step below
+ *   is **not** a substitute for SMMU translation. It's REMU's flat
+ *   global-vs-chiplet-local plumbing: every chiplet's DRAM is mounted
+ *   at its own offset in `&address_space_memory`, and engines on
+ *   chiplet N see chiplet-local addresses on their NoC. Without the
+ *   add, a SAR like 0x100600000 from chiplet-2 RBDMA would land in
+ *   chiplet 0's DRAM instead of chiplet 2's. r100-hdma uses the same
+ *   convention.
+ *
+ * Returns true on success. On address_space failure we log GUEST_ERROR
+ * but still let the caller push the FNSH entry so q-cp doesn't
+ * deadlock waiting for a completion that will never arrive — the
+ * post-mortem log + the stale dst memory together signal the error. */
+static bool r100_rbdma_do_oto(R100RBDMAState *s)
+{
+    uint32_t src_lo = 0;
+    uint32_t dst_lo = 0;
+    uint32_t blk128 = 0;
+    uint32_t run_conf0 = 0;
+    uint64_t src, dst, size;
+    uint64_t chiplet_base;
+    uint8_t *buf;
+    MemTxResult mr;
+
+    (void)rbdma_regstore_lookup(&s->store,
+                                RBDMA_TASK_SRCADDRESS_OFF, &src_lo);
+    (void)rbdma_regstore_lookup(&s->store,
+                                RBDMA_TASK_DESTADDRESS_OFF, &dst_lo);
+    (void)rbdma_regstore_lookup(&s->store,
+                                RBDMA_TASK_SIZEOF128BLK_OFF, &blk128);
+    (void)rbdma_regstore_lookup(&s->store,
+                                RBDMA_TASK_RUN_CONF0_OFF, &run_conf0);
+
+    {
+        uint32_t src_msb = (run_conf0 >> RBDMA_RUN_CONF0_SRC_ADDR_MSB_SHIFT)
+                           & RBDMA_RUN_CONF0_SRC_ADDR_MSB_MASK;
+        uint32_t dst_msb = (run_conf0 >> RBDMA_RUN_CONF0_DST_ADDR_MSB_SHIFT)
+                           & RBDMA_RUN_CONF0_DST_ADDR_MSB_MASK;
+
+        src = ((((uint64_t)src_msb) << 32) | src_lo)
+              << RBDMA_ADDR_GRAIN_SHIFT;
+        dst = ((((uint64_t)dst_msb) << 32) | dst_lo)
+              << RBDMA_ADDR_GRAIN_SHIFT;
+    }
+    size = (uint64_t)blk128 << RBDMA_ADDR_GRAIN_SHIFT;
+
+    if (size == 0) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "r100-rbdma cl=%u OTO: zero-sized kick "
+                      "(src=0x%" PRIx64 " dst=0x%" PRIx64 ")\n",
+                      s->chiplet_id, src, dst);
+        return false;
+    }
+    if (size > RBDMA_OTO_MAX_BYTES) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "r100-rbdma cl=%u OTO: size 0x%" PRIx64
+                      " > cap 0x%x — clamping\n",
+                      s->chiplet_id, size, RBDMA_OTO_MAX_BYTES);
+        size = RBDMA_OTO_MAX_BYTES;
+    }
+
+    chiplet_base = (uint64_t)s->chiplet_id * R100_CHIPLET_OFFSET;
+    src += chiplet_base;
+    dst += chiplet_base;
+
+    buf = g_malloc(size);
+    mr = address_space_read(&address_space_memory, src,
+                            MEMTXATTRS_UNSPECIFIED, buf, size);
+    if (mr != MEMTX_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "r100-rbdma cl=%u OTO: src read failed @ 0x%"
+                      PRIx64 " size=0x%" PRIx64 "\n",
+                      s->chiplet_id, src, size);
+        s->oto_dma_errors++;
+        g_free(buf);
+        return false;
+    }
+    mr = address_space_write(&address_space_memory, dst,
+                             MEMTXATTRS_UNSPECIFIED, buf, size);
+    if (mr != MEMTX_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "r100-rbdma cl=%u OTO: dst write failed @ 0x%"
+                      PRIx64 " size=0x%" PRIx64 "\n",
+                      s->chiplet_id, dst, size);
+        s->oto_dma_errors++;
+        g_free(buf);
+        return false;
+    }
+    g_free(buf);
+
+    s->oto_kicks++;
+    s->oto_bytes += size;
+    qemu_log_mask(LOG_TRACE,
+                  "r100-rbdma cl=%u OTO: %" PRIu64 " B "
+                  "src=0x%" PRIx64 " → dst=0x%" PRIx64
+                  " (oto_kicks=%" PRIu64 ")\n",
+                  s->chiplet_id, size, src, dst, s->oto_kicks);
+    return true;
+}
+
 static void r100_rbdma_kickoff(R100RBDMAState *s, uint32_t run_conf1)
 {
     R100RBDMAFnshEntry e;
     uint32_t ptid_init = 0;
+    uint32_t run_conf0 = 0;
+    uint32_t task_type;
 
     /* PTID_INIT (offset 0x200) was the first descriptor word q-cp
      * wrote — regstore has it. Missing entry means a stray RUN_CONF1
@@ -355,6 +552,29 @@ static void r100_rbdma_kickoff(R100RBDMAState *s, uint32_t run_conf1)
      * behaviour, the FW bug is upstream). */
     (void)rbdma_regstore_lookup(&s->store, RBDMA_TASK_PTID_INIT_OFF,
                                 &ptid_init);
+
+    /* P4B — dispatch on task_type. OTO does the real byte move; every
+     * other task_type falls through to the kick-acknowledge stub so
+     * q-cp's done loop unwinds (umd's `simple_copy` only emits OTO,
+     * but q-sys unit_test/rbdma_test.c walks the full enum). */
+    (void)rbdma_regstore_lookup(&s->store, RBDMA_TASK_RUN_CONF0_OFF,
+                                &run_conf0);
+    task_type = (run_conf0 >> RBDMA_RUN_CONF0_TASK_TYPE_SHIFT)
+                & RBDMA_RUN_CONF0_TASK_TYPE_MASK;
+
+    switch (task_type) {
+    case RBDMA_TASK_TYPE_OTO:
+        (void)r100_rbdma_do_oto(s);
+        break;
+    default:
+        s->unimp_task_kicks++;
+        qemu_log_mask(LOG_UNIMP,
+                      "r100-rbdma cl=%u: task_type=%u not yet "
+                      "behavioural — completing kick without byte "
+                      "move (ptid=0x%08x)\n",
+                      s->chiplet_id, task_type, ptid_init);
+        break;
+    }
 
     e.ptid_init = ptid_init;
     e.intr_enabled =
@@ -476,6 +696,10 @@ static void r100_rbdma_realize(DeviceState *dev, Error **errp)
     s->completes = 0;
     s->pulses_fired = 0;
     s->fifo_overflows = 0;
+    s->oto_kicks = 0;
+    s->oto_bytes = 0;
+    s->oto_dma_errors = 0;
+    s->unimp_task_kicks = 0;
 }
 
 static void r100_rbdma_reset(DeviceState *dev)
