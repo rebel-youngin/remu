@@ -788,6 +788,133 @@ grep '0x90.*0xfb0d' output/gic-fix-smoke/issr.log
 in `--host` mode; post-fix the real firmware emits one frame, then
 the CM7 stub covers any subsequent soft-reset re-handshakes.
 
+### P10 cb[1] non-completion (open)
+
+**Status.** Open. `./remucli test p10` times out at 180 s on every
+run. The diagnosis below was assembled from `tests/p10_qcp_gdb_probe.py`
+captures + log forensics; it is recorded here so the next person
+picking up P10 starts from a known map of the failure modes rather
+than from `LOG_LEVEL` archaeology.
+
+**Symptom.** `command_submission -y 5` (the umd integration test
+staged into the guest by `guest/build-umd.sh`) submits two command
+buffers (`cb[0]`, `cb[1]`) and waits for two MSI-X completions on
+vector 0. Only one fires. The kmd's TDR (`RBLN_REBEL_TASK_DONE_US`
+expansion bug aside, see "Side bug 3" below) eventually times out,
+sends `URG_EVENT_UNLOAD`, and the host kernel logs:
+
+```
+watchdog: BUG: soft lockup - CPU#0 stuck for ...s! [insmod or command_submission]
+RIP: ... rebel_hw_init+0x439 (= rebel_queue_init busy-poll)
+```
+
+**Pinning the hang.** `tests/p10_qcp_gdb_probe.py` snapshots q-cp
+state ~1.5 s after the second CQ doorbell, before TDR fires:
+
+```
+hq_mgr.cb_run_cnt   = 1                # cb_task pulled cb[1] off, never decremented
+hq_mgr.cq[0].pi     = 2
+hq_mgr.cq[0].ci     = 2                # hq_task fully drained both BDs
+hq_mgr.req_funcs    = 0
+cb_mgr.ready_list  empty (next == &ready_list)
+cb_mgr.wait_list   empty (next == &wait_list)
+```
+
+`cb_run_cnt = 1` plus both lists empty means: `cb_task` started
+processing cb[1], dispatched its packets to RBDMA / HDMA, and
+parked on `xTaskNotifyWait` for the engine done IRQ. That IRQ
+never fires. `host/msix.log` reads `count=1` for the entire run.
+
+cb[0]'s completion goes through cleanly (one MSI-X observed, host
+sees `RBLN_MAGIC_CODE` in `FUNC_SCRATCH`). cb[1] picks up state
+that cb[0] did not fully restore — *which* engine's done line
+never fires is the live unknown. `output/<name>/hdma.log` is
+empty across the whole run, which suggests both CB workloads use
+NPU-local addresses (RBDMA OTO between two chiplet-0 DRAM
+offsets) and never cross the chardev — i.e. the missing IRQ is
+likely RBDMA's GIC SPI 978 (`INT_ID_RBDMA1`) on the second kick,
+not an HDMA wire ordering issue. Confirmation requires GDB on
+`r100_rbdma_kickoff` / `r100_rbdma_fnsh_bh` between cb[0] and
+cb[1] — open work.
+
+**Diagnostic recipe.**
+
+```
+./remucli fw-build                          # ELFs needed by the gdb probe
+REMU_P10_DEBUG_TAG=cb1 \
+REMU_P10_DEBUG_DELAY_S=1.5 \
+python3 tests/p10_qcp_gdb_probe.py
+ls -la output/p10-debug/qcp-bt-cb1.txt      # the artifact
+```
+
+The probe is a diagnostic, not a regression test — it always exits
+0 if it produced an artifact. Read the file to see the actual q-cp
+state. Two interesting settle points to compare are documented in
+the script header (~1.5 s = pre-TDR; ~8 s = mid `handle_unload_event`
+register dump cascade).
+
+**Side bug 1 — TDR `URG_EVENT_UNLOAD` register-dump cascade.**
+Once cb[1] hangs, the kmd's TDR fires and sends
+`URG_EVENT_UNLOAD` over the doorbell wire. q-cp's
+`hq_proc_urg_event` calls `handle_unload_event`, which in turn
+calls `DNC_DUMP_ESSENTIAL`, `RBDMA_DUMP_CDMA`, and
+`rbcm_dump_chiplet_incomplete_ttreg` — a ~700-line register dump
+peppered with `mdelay(500000)` busy-waits. Those `mdelay`s execute
+*synchronously inside the doorbell ISR on CP0.cpu0* under TCG and
+block the CA73 from servicing any other interrupt for many seconds.
+The host kernel's `watchdog` then prints `soft lockup` for
+`rebel_hw_init+0x439` (the `readl_poll_timeout_atomic` busy-poll).
+This is a downstream symptom of the cb[1] hang, **not** the root
+cause — fixing cb[1] removes it. Logged here so future hangs that
+look like a `rebel_hw_init` lockup are not mis-attributed to the
+queue_init handshake (which the P10-fix shm cfg-shadow alias
+already resolved; see commit `d986302`).
+
+**Side bug 2 — intermittent `cfg-shadow` NULL-deref at boot
+(~30% of runs).** A subset of `--host` boots fault inside q-cp's
+`hil_init_descs` at `hil.c:519` dereferencing
+`dev_desc[func_id]->qd_addr_lo` (offset `+0x0c` of NULL). The
+direct-shm and HMP `xp` reads from `tests/p10_cfgshadow_probe.py`
+all show the kmd-published DDH at `0x80_04800000` *was* mirrored
+into the cfg-shadow file before the QUEUE_INIT doorbell — yet
+q-cp's `FUNC_READQ(PCIE_PF, DDH_BASE_LO)` returns 0 on the
+faulting run. The smell is a TCG TLB caching race: q-cp's MMU
+translation for `R100_DEVICE_COMM_SPACE_BASE` was filled before
+the `r100_cm7_init` MMIO subregion overlay landed, leaving the
+cached translation pointing at the underlying chiplet-0 DRAM
+zero-fill rather than the cfg-shadow alias. Worth checking with
+`-d in_asm,exec,page,mmu -singlestep` next time the run reproduces
+on the first try; until then, just retry the run. Recipe:
+
+```
+python3 tests/p10_cfgshadow_probe.py    # prints all three views
+                                        # of the DDH publish
+```
+
+**Side bug 3 — KMD `readl_poll_timeout_atomic` argument unit
+mismatch.** `rebel.c:700` calls
+`readl_poll_timeout_atomic(..., 10, jiffies_to_usecs(RBLN_REBEL_TASK_DONE_US))`
+where `RBLN_REBEL_TASK_DONE_US = 3 * 1000000` is **already in
+microseconds** but the macro is being run through
+`jiffies_to_usecs()` again. With HZ=250 the inner conversion
+expands to ~12000 s, so the kmd's "3 s queue_init timeout" is
+actually a ~3-hour busy-loop on TCG. This is a stock-KMD bug,
+upstream — not REMU. It does not cause the cb[1] hang but does
+mean the soft lockup runs for the full 180 s test budget instead
+of the 6 s wall the kmd was meant to wait. Tracked here so future
+people picking up P10 don't try to "fix" the timeout from the REMU
+side.
+
+**Where things stand.** queue_init handshake is fixed (P10-fix /
+`d986302`). cb[0] passes. cb[1] hangs in q-cp's `cb_task` waiting
+for an engine done IRQ — most likely RBDMA SPI 978 not firing on
+the second kick, given `hdma.log` stays empty. Next step is a
+gdb session on `r100-rbdma`'s kick → BH → fnsh_pulse path with
+breakpoints on `r100_rbdma_kickoff` (`src/machine/r100_rbdma.c`)
+straddling cb[0] and cb[1] to compare the FNSH FIFO depth + GIC
+pulse counts. Until cb[1] clears, P10 stays excluded from
+`./remucli test` defaults (`in_default=False` in `TEST_REGISTRY`).
+
 ## Cleanup
 
 ```

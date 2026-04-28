@@ -83,7 +83,9 @@ done
 
 dmesg > "$DMESG_AFTER" 2>/dev/null || true
 cp "$DMESG_AFTER" "$OUT/dmesg.log"
-[ -r /proc/interrupts ] && cp /proc/interrupts "$OUT/interrupts.txt"
+if [ -r /proc/interrupts ]; then
+    cat /proc/interrupts > "$OUT/interrupts.txt"
+fi
 
 if ! grep -q 'FW_BOOT_DONE' "$DMESG_AFTER"; then
     log "FAIL: FW_BOOT_DONE never showed up in dmesg"
