@@ -3,10 +3,10 @@
  *
  * Host-side r100-npu-pci has to decide which BAR4 MMIO writes get
  * forwarded to the NPU over the doorbell chardev, and NPU-side
- * r100-cm7 (formerly r100-doorbell pre-Stage-3c) has to route received
- * frames to the matching mailbox action. Both sides asked the same
- * question of the same offset before this header existed; now they
- * use one classifier so the wire protocol stays single-sourced.
+ * r100-cm7 has to route received frames to the matching mailbox
+ * action. Both sides ask the same question of the same offset, so
+ * they use one classifier here to keep the wire protocol
+ * single-sourced.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -28,16 +28,6 @@ typedef enum {
     REMU_DB_KIND_INTGR1,     /* M6 host→NPU mailbox INTGR1 (SPI) */
     REMU_DB_KIND_ISSR,       /* M8a host→NPU ISSR scratch payload */
 } RemuDoorbellKind;
-
-/* INTGR1 bit 7 = REBEL_DOORBELL_QUEUE_INIT
- * (rebellions/rebel/rebel.h:123). kmd rings it right after staging the
- * rbln_device_desc via dma_alloc_coherent; on silicon PCIE_CM7
- * responds by DMA-ing init_done=1 back into host RAM. Used by both
- * the NPU-side CM7 stub (M8b Stage 3b/3c — r100_cm7.c emits the HDMA
- * write-backs, the BD-done state machine, and the reverse ISSR /
- * cfg-shadow paths) and by test harness code that impersonates the
- * kmd side. */
-#define REMU_DB_QUEUE_INIT_INTGR1_BIT  7u
 
 /* Host-side BAR2 cfg-head MMIO trap layout.
  *
@@ -68,44 +58,11 @@ typedef enum {
 /* FUNC_SCRATCH = DRAM_CFG_SIZE_VF - 4 = 0x1000 - 4 (rebel.c).
  * The kmd uses rebel_{read,write}_queue_scratch to talk to FW via
  * rebel_cfg_{read,write} — i.e. it's a plain u32 inside the BAR2
- * cfg region. M8b Stage 3c routes NPU-side writes back through the
- * HDMA OP_CFG_WRITE channel so the host's cfg-head shadow stays
- * in sync with the FUNC_SCRATCH value the kmd reads on test
- * completion. */
+ * cfg region. q-cp on CP0 writes FUNC_SCRATCH from `cb_complete`
+ * via the P1b cfg-mirror trap, which routes the store through
+ * HDMA OP_CFG_WRITE so the host's cfg-head shadow stays in sync
+ * with the FUNC_SCRATCH value the kmd reads on test completion. */
 #define REMU_CFG_FUNC_SCRATCH_OFF 0x00000FFCu
-
-/* Fields inside rbln_device_desc (headers/fw/rbln/ddh.h). */
-#define REMU_DDH_DRIVER_VERSION_OFF 0x00000024u
-#define REMU_DDH_INIT_DONE_OFF      0x00000058u
-#define REMU_DDH_FW_VERSION_OFF     0x0000005Cu
-#define REMU_DDH_VERSION_MAX        52u
-
-/* Byte offset of rbln_device_desc::queue_desc[] (first command-queue
- * descriptor). Placed after 4+4+4+4+4+4+4+4+4 header u32s (36),
- * driver_version[52] (88), init_done (92), fw_version[52] (144),
- * uuid{1..4} (160), sid{1,2} (168), bsid (172), reserved (176),
- * smc_version[52] (228), pci_speed (232), pci_width (236). Derived
- * from struct rbln_device_desc in kmd/rebel/rebel.h; static_assert
- * in r100_cm7.c would require pulling that header in, so keep the
- * literal here and bump it explicitly if the kmd layout ever shifts. */
-#define REMU_DDH_QUEUE_DESC_OFF     0x000000ECu  /* 236 */
-
-/* sizeof(struct rbln_queue_desc) — 8 u32s. */
-#define REMU_QDESC_STRIDE           0x00000020u  /* 32 */
-/* Fields inside rbln_queue_desc. */
-#define REMU_QDESC_SIZE_OFF         0x00000008u  /* log2(ring entries) */
-#define REMU_QDESC_ADDR_LO_OFF      0x0000000Cu
-#define REMU_QDESC_ADDR_HI_OFF      0x00000010u
-#define REMU_QDESC_CI_OFF           0x00000014u
-#define REMU_QDESC_PI_OFF           0x00000018u
-
-/* sizeof(struct rbln_bd) — header(u32) + size(u32) + addr(u64) +
- * cb_jd_addr(u64) = 24. Offsets match qman_if_common.h. */
-#define REMU_BD_STRIDE              0x00000018u  /* 24 */
-#define REMU_BD_HEADER_OFF          0x00000000u
-#define REMU_BD_SIZE_OFF            0x00000004u
-#define REMU_BD_ADDR_OFF            0x00000008u
-#define REMU_BD_FLAGS_DONE_MASK     0x80000000u
 
 /* kmd iATU fallback: rbln_dma_host_convert adds this to every DMA
  * address the kmd publishes to the NPU (rebellions/rebel/rebel.h

@@ -140,13 +140,15 @@ for the HMP sanity recipes.
   / `M10_BASE` — COMPUTE / UDMA / UDMA_LP / UDMA_ST per
   `_inst[HW_SPEC_DNC_QUEUE_NUM=4]`, P3), optional
   `r100-cm7` / `r100-imsix` / `r100-hdma` gated on chardev machine-props.
-  Wires `cfg` + `cm7-debug` chardevs onto `r100-cm7`; the `hdma` chardev
-  goes to `r100-hdma` (M9-1c). Links `r100-cm7` to `r100-imsix` (Stage 3c
-  scaffolding MSI-X — retired in P7), to `r100-hdma` (chardev egress),
-  and to the M9 mailbox (M9-1b mbtq pushes). Wires DNC done SPIs from
-  each DCL (8 × 4 lines per DCL) to the chiplet GIC via
-  `r100_dnc_intid()` (M9-1c). Skips lazy-RAM at the M9 slot to avoid
-  overlap. GIC `num-irq` is 992 (was 256 pre-M9-1c) to fit DNC INTIDs.
+  Wires `cfg` chardev onto `r100-cm7`; the `hdma` chardev goes to
+  `r100-hdma` (M9-1c). Links `r100-cm7` to `r100-hdma` (chardev egress
+  for the P1b reverse-cfg `OP_CFG_WRITE` upstream); the prior
+  `r100-cm7` ↔ `r100-imsix` and `r100-cm7` ↔ M9 mailbox links were
+  retired in P7 along with the BD-done FSM and mbtq-push stubs.
+  Wires DNC done SPIs from each DCL (8 × 4 lines per DCL) to the
+  chiplet GIC via `r100_dnc_intid()` (M9-1c). Skips lazy-RAM at the
+  M9 slot to avoid overlap. GIC `num-irq` is 992 (was 256 pre-M9-1c)
+  to fit DNC INTIDs.
 - `src/machine/r100_mailbox.c` — Samsung IPM SFR (`INTGR/INTCR/INTMR/INTSR/INTMSR/ISSR0..63`),
   two `qemu_irq` outs tracking INTMSR. API: `r100_mailbox_raise_intgr`,
   `r100_mailbox_set_issr`, `r100_mailbox_get_issr`,
@@ -154,25 +156,22 @@ for the HMP sanity recipes.
   `r100_mailbox_set_issr_words` (M9-1b in-process multi-slot write
   for q-cp task-queue pushes; bypasses the issr_store funnel).
 - `src/machine/r100_cm7.c` — reassembles 8-byte `(offset, value)` frames,
-  routes by offset into mailbox INTGR / ISSR / CM7-stub. Today the file
-  hosts five PCIE_CM7 stubs; three are honest infrastructure that stays,
-  two are regression scaffolding that the P-plan retires:
+  routes by offset into mailbox INTGR / ISSR / CM7-stub. Post-P7 the
+  file hosts exactly two responsibilities, both honest infrastructure:
   (1) `INTGR0 bit 0` SOFT_RESET → synthetic `FW_BOOT_DONE` (Stage 3a) —
-  *scaffolding, retired in P8*;
-  (2) `cfg_shadow[1024]` mirror of host BAR2 cfg-head and the QINIT
-  stub on `INTGR1 bit 7` (Stage 3b) — *real PCIE_CM7 work, kept*;
-  (3) the BD-done state machine on `INTGR1 bits 0..N` that drives
-  `rbln_queue_test` (Stage 3c) — *scaffolding, retired in P7*;
-  (4) `r100_cm7_mbtq_push` on the same INTGR1 queue-doorbell —
-  *kept, but P1 replaces synthesised payload with real BD-derived
-  cmd_descr + per-cmd_type routing*;
-  (5) cmd_descr synthesis at `R100_CMD_DESCR_SYNTH_BASE` —
-  *kept as a ring buffer, but populated by the P1 packet walker
-  rather than a constant COMPUTE template*.
-  The hdma chardev moved to `r100-hdma` in M9-1c — cm7 still drives the
-  same wire-level traffic via `r100_hdma_emit_*` helpers and registers
-  an RX callback via `r100_hdma_set_cm7_callback()` for OP_READ_RESP
-  responses tagged `req_id = qid + 1`.
+  *scaffolding, retired in P8 once a real CA73 cluster reset path
+  exists*;
+  (2) the P1b cfg-mirror MMIO trap at `R100_DEVICE_COMM_SPACE_BASE`
+  — `cfg_shadow[1024]` is the single source of truth on the NPU side
+  (host BAR2 writes ingress on `cfg` chardev → update shadow; NPU
+  reads/writes hit the trap; NPU writes additionally egress as
+  `OP_CFG_WRITE` over `r100-hdma` so the host's `cfg_mmio_regs[]`
+  stays consistent for `rebel_cfg_read(FUNC_SCRATCH)`).
+  The Stage 3b QINIT stub, Stage 3c BD-done FSM, M9-1b mbtq push,
+  and Stage 3c `cmd_descr` synth ring at `R100_CMD_DESCR_SYNTH_BASE`
+  were retired in P7. The hdma chardev lives on `r100-hdma` (M9-1c);
+  cm7 reaches it via a QOM `hdma` link only to emit `OP_CFG_WRITE`
+  upstream — there is no longer a cm7-side `OP_READ_RESP` consumer.
 - `src/machine/r100_hdma.{c,h}` — DesignWare dw_hdma_v0 register-block
   model (M9-1c + P5) at `R100_HDMA_BASE` (chiplet 0). Per-channel state
   covers the full `struct hdma_ch_regs` surface from
@@ -213,12 +212,12 @@ for the HMP sanity recipes.
   emits `(offset, db_data)` frames on write to `0xFFC`. Driven by
   q-cp's `cb_complete` on CA73 CP0, whose `pcie_msix_trigger` is
   already linked from upstream `q/sys/osl/FreeRTOS/Source/rbln/msix.c`
-  (no FW-side glue required). P2 deleted the only other caller — the
-  `r100_imsix_notify(s->imsix, j->qid)` call inside `r100-cm7`'s Stage
-  3c BD-done FSM — so even with `-global r100-cm7.bd-done-stub=on`
-  there is no duplicate fire. P7 deletes the rest of Stage 3c. The
-  public `r100_imsix_notify` API is retained only as a no-current-caller
-  helper that any future post-soft-reset stub (P8) could re-use.
+  (no FW-side glue required). P2 deleted the call from `r100-cm7`'s
+  Stage 3c BD-done FSM; P7 deleted the rest of Stage 3c (BD-done FSM,
+  QINIT, mbtq push) and along with it the `imsix` QOM link from
+  `r100-cm7` itself. The public `r100_imsix_notify` API is retained
+  as a no-current-caller helper that any future post-soft-reset stub
+  (P8) could re-use.
 - Six Unix-socket chardevs under `output/<name>/host/`: `doorbell.sock`
   (M6+M8a, host → NPU), `msix.sock` (M7, NPU → host), `issr.sock`
   (M8a, NPU → host), `cfg.sock` (M8b 3b, host → NPU BAR2 cfg-head),
@@ -340,7 +339,7 @@ Naming neutral — the M9-* labels are retired in favour of P*.
 | P4B | `r100-rbdma` behavioural OTO byte-mover — extends `r100_rbdma_kickoff` (the RUN_CONF1 store handler from P4A) with a `task_type` switch. **OTO path:** reconstruct the full 41-bit byte addresses from `SRCADDRESS_OR_CONST` / `DESTADDRESS` (low 32 bits of the 128 B-unit address) ⊕ `RUN_CONF0.{src,dst}_addr_msb` (high 2 bits each) shifted left by 7, add `chiplet_id * R100_CHIPLET_OFFSET` to translate q-cp's chiplet-local view into QEMU global (same convention `r100-hdma` uses for SAR), then `address_space_read` SAR → temp buffer → `address_space_write` DAR via `&address_space_memory`. Capped at `RBDMA_OTO_MAX_BYTES = 32 MiB` (mirrors umd cmdgen's `args->size > SZ_32M` guard). On `address_space` failure: log `LOG_GUEST_ERROR`, bump `oto_dma_errors`, and still fall through to the FNSH push so q-cp's done loop unwinds (post-mortem log + the stale dst memory together signal the error). On success: bump `oto_kicks` + `oto_bytes` (observability counters survive reset). **Address translation scope — read carefully:** SAR / DAR are *device virtual addresses* (DVAs) on real silicon — kmd allocates them, and on the wire RBDMA's AXI burst traverses the per-chiplet SMMU-600 (S1 + S2 page-table walk) before hitting DDR. P4B does **not** model that translation. `r100_smmu.c` is a register-only stub (auto-acks `CR0→CR0ACK`, advances `CMDQ_CONS=PROD`, never walks STE / CD / page tables that FW sets up in DRAM), so REMU's effective transform is `S1 ∘ S2 = identity` — i.e. the regime where FW runs SMMU in pure-bypass / identity-mapped mode. The `chiplet_id * R100_CHIPLET_OFFSET` add is **not** an SMMU substitute; it's REMU's flat-global-vs-chiplet-local plumbing (every chiplet's DRAM is mounted at its own offset in `&address_space_memory`, and engines on chiplet N see chiplet-local addresses on their NoC). `r100-hdma` / `r100-dnc-cluster` use the same convention — DVA-equals-PA is REMU's cross-fleet baseline. Honouring real FW page tables is tracked separately as the long-term "SMMU honour FW page tables" follow-on (see § Long-term follow-ons); the natural plug point is a translation hook in `r100_rbdma_do_oto` just before the `address_space_{read,write}` call (and a sibling hook in `r100_hdma_kick_{wr,rd}`). **Other task_types** (CST/DAS/PTL/IVL/DUM/VCM/OTM/GTH/SCT/GTHR/SCTR) fall through to the kick-acknowledge stub (`unimp_task_kicks++` + `LOG_UNIMP` once per kick) — q-cp's done handler still observes the FNSH FIFO entry, but no real bytes move. Deferred to a P4B-extension once a workload that needs them lands (umd's `simple_copy` only emits OTO, but `q-sys/unit_test/rbdma_test.c` walks the full enum). **Verified:** `./remucli build` clean; m5/m6/m7/m8/p4a regression green; new `tests/p4b_rbdma_oto_test.py` (registered as `./remucli test p4b`) boots `--host`, mmap-pre-fills a 4 KB pseudo-random pattern at chiplet-0 DRAM offset `0x07000000` via the shm splice, drives the 6-word OTO descriptor (PTID_INIT, SRCADDRESS, DESTADDRESS, SIZEOF128BLK, RUN_CONF0=task_type=OTO, RUN_CONF1=intr_disable=1) through the NPU's gdbstub in physical-memory mode (`Qqemu.PhyMemMode:1` → `M<addr>,4:<hex>` packets, gdbstub spawned on demand via the HMP `gdbserver tcp::4567` command — no `--gdb*` flag needed), and asserts byte-for-byte equality at the destination offset `0x07800000`. SMMU is bypassed throughout (the test writes raw chiplet-local offsets straight into SRC / DST, exercising the same identity-mapped regime FW operates under). The full umd `command_buffer` integration test stays gated on P5 (host↔device staging via `rblnCmdCopy` → HDMA). | done | covers `task_type=OTO` (the only flavour umd `simple_copy` emits) under SMMU-bypass; other task_types are LOG_UNIMP fall-through; full umd `test_command_buffer` exercise lands with P5; SMMU honour is a separate long-term follow-on |
 | P5 | `r100-hdma` linked-list mode — extends the M9-1c device's MMIO surface so q-cp's `cmd_descr_hdma` / `hdma_ll_trigger` path runs unmodified. Distilled the Notion HDMA / SMMU pages into `docs/hdma-notion-notes.md` first to pin down LL-element shape, channel separation (`ch_sep=3` → 0x800 stride), and the SMMU bypass-region rule (HDMA-SID LUT all-bypass means `S1 ∘ S2 = identity`, matching `r100_smmu.c`'s register-only stub). **Missing per-channel registers**: added `ELEM_PF` / `HANDSHAKE` / `LLP_LO|HI` / `CYCLE` / `WATERMARK` / `CTRL1` / `FUNC_NUM` / `QOS` / `INT_SETUP` / `MSI_{STOP,WATERMARK,ABORT}_LO|HI` / `MSI_MSGD` to the regstore; `LLP` and `CTRL1.LLEN` are load-bearing for the kick path, the rest are RAZ-or-RW persistence so q-cp's HAL init / dump-regs sequences round-trip. **LL walk**: when `CTRL1.LLEN=1`, the doorbell handler walks the chain rooted at `LLP_LO|HI` synchronously inside the MMIO write — `dw_hdma_v0_lli` (24 B: ctrl/transfer_size/sar.reg/dar.reg) and `dw_hdma_v0_llp` (16 B jump records) are pre-read as a 24 B blob and discriminated on `control & DW_HDMA_V0_LLP`; `LIE` on the last LLI signals end-of-chain (matching q-cp's `record_lli(..., is_last)`). **Per-LLI routing** by SAR/DAR ≷ `REMU_HOST_PHYS_BASE`: WR && DAR≥host → NPU→host (chunked OP_WRITE over the existing `hdma` chardev with stripped DAR); RD && SAR≥host → host→NPU (chunked OP_READ_REQ + parked `qemu_cond_wait_bql()` on a per-channel `resp_cond` until OP_READ_RESP arrives, then `address_space_write` at DAR); both NPU → D2D in-process loop (`address_space_read` → `address_space_write`, 64 KB scratch chunks). The existing 0x80..0xBF `req_id` partition is unchanged — only one OP_READ_REQ is in flight per RD channel at a time, matching the partition's one-tag-per-channel layout. **MSI fan-out** (write to `MSI_MSGD` at the `MSI_{STOP,WATERMARK,ABORT}` addresses) is deferred since q-cp's local-IRQ path (SPI 186 + `SUBCTRL_EDMA_INT_CA73` per-channel pending bit) is already wired and `cb_complete → pcie_msix_trigger` covers BD MSI-X via `r100-imsix`. The full long-form rationale + CTRL1 bit table + LL-chunk size choice live in the `r100_hdma.c` file banner so future readers don't need this row. **Verified**: `./remucli build` clean; existing M9-1c non-LL kick (`r100_hdma_kick_wr/rd`) untouched + still drives M9-1c regression; new `tests/p5_hdma_ll_test.py` (registered as `./remucli test p5`) seeds a single dw_hdma_v0_lli+terminator at chiplet-0 DRAM offset `0x07900000` (SRC=0x07000000, DST=0x07800000, both NPU-local DRAM exercising the D2D path), drives `CTRL1=LLEN; LLP_LO|HI=desc; ENABLE=1; DOORBELL=START` through the NPU's gdbstub in physical-memory mode (same harness as p4b), and asserts byte-for-byte equality at the destination via the shm splice — the host-leg paths fall out of P10's umd `simple_copy` (one address_space ↔ chardev swap from D2D). `--host` cold-boot still reaches `rbln0 probed, id=0x0 (0:0)` and `xp/1wx 0xf000200ffc → 0xcafedead` (q-cp's `cb_complete → writel(FUNC_SCRATCH)` round-trip via P1b), confirming P1c's BD lifecycle is unaffected by the widened MMIO surface. m5/m6/m7/m8/p4a/p4b regression green. | done | Notion-distilled into `docs/hdma-notion-notes.md`; LL chain + bypass SMMU. The cm7 QINIT / BD-done shim that used to drive the chardev was retired by P1c. |
 | P6 | `r100-dnc` behavioural — parse `cmd_descr_dnc`, run a host-CPU kernel against input tensors, write outputs, then fire `itdone` BH. Defer until P1 + P4A land and a real workload exists to drive it. | pending | gated by umd workload |
-| P7 | Retire the gated cm7 stubs — after P1 + P2, all three default-off paths in `r100-cm7` (Stage 3c BD-done state machine: `OP_READ_REQ` walk + `OP_CFG_WRITE FUNC_SCRATCH` + `OP_WRITE bd.header \|= DONE` + `OP_WRITE queue_desc.ci++` with the `r100_imsix_notify` already gone in P2; Stage 3b QINIT stub: `r100_cm7_qinit_stub` + `REMU_FW_VERSION_STR`; M9-1b mbtq push: `r100_cm7_mbtq_push` + `r100_cm7_synth_cmd_descr` + the synth ring at `R100_CMD_DESCR_SYNTH_BASE`) have no reason to exist. Delete them, along with the three bool properties (`bd-done-stub` / `qinit-stub` / `mbtq-stub`) and the now-orphaned `r100_hdma_set_cm7_callback` + `0x01..0x0F` `req_id` partition. Single source of truth for BD lifecycle: q-cp's `cb_complete`. The HDMA bidirectional protocol stays — `r100-pcie-outbound` from P1 keeps the `0xC0..0xFF` partition (and may continue to use `OP_READ_REQ`/`OP_READ_RESP` as the byte-fetch backend if that proves simpler than spinning up a separate hdma backend channel). | pending | requires P1 + P2; gated paths default off since P1c |
+| P7 | Retire the gated cm7 stubs — after P1 + P2, all three default-off paths in `r100-cm7` (Stage 3c BD-done state machine: `OP_READ_REQ` walk + `OP_CFG_WRITE FUNC_SCRATCH` + `OP_WRITE bd.header \|= DONE` + `OP_WRITE queue_desc.ci++` with the `r100_imsix_notify` already gone in P2; Stage 3b QINIT stub: `r100_cm7_qinit_stub` + `REMU_FW_VERSION_STR`; M9-1b mbtq push: `r100_cm7_mbtq_push` + `r100_cm7_synth_cmd_descr` + the synth ring at `R100_CMD_DESCR_SYNTH_BASE`) had no reason to exist. Deleted, along with the three bool properties (`bd-done-stub` / `qinit-stub` / `mbtq-stub`), the `r100_hdma_set_cm7_callback` plumbing + its `0x01..0x0F` `req_id` partition (now reserved up to `0x7F` for future UMQ multi-queue use), the `imsix` / `mbtq-mailbox` QOM links and `R100IMSIXState *` / `R100MailboxState *` fields on `R100Cm7State`, the `cm7-debug-chardev` debug knob (the `cm7_log` plumbing in `cli/remu_cli.py` and the matching `cm7-debug` chardev wiring in `r100_soc.c`), and the `R100_CMD_TYPE_COMPUTE` / `R100_CMD_DESCR_SYNTH_*` macros + `R100_BD_FLAGS_DONE_MASK` / `REMU_DB_QUEUE_INIT_INTGR1_BIT` / `REMU_BD_*` / `REMU_QDESC_*` / `REMU_DDH_*` constants from `src/include/r100/remu_addrmap.h` + `src/bridge/remu_doorbell_proto.h`. `r100-cm7` now does exactly two things: (1) forward host BAR4 doorbells (INTGR0 bit 0 → `r100_imsix_notify`-free synthetic FW_BOOT_DONE re-handshake via the existing mailbox path; INTGR1 bit `qid` → SPI 185 wake for q-cp's `hq_task`); (2) host the P1b cfg-mirror MMIO trap at `R100_DEVICE_COMM_SPACE_BASE` and emit `OP_CFG_WRITE` upstream over `r100-hdma`. Single source of truth for BD lifecycle: q-cp's `cb_complete`. The HDMA bidirectional protocol stays — `r100-pcie-outbound` from P1 keeps the `0xC0..0xFF` partition; q-cp on CP0 owns `OP_READ_REQ`/`OP_READ_RESP` end-to-end through that backend. **Verified:** `./remucli build` clean (aarch64 + x86_64); m5/m6/m7/m8 + p4a/p4b/p5 regression green; `--host` smoke run reaches `rbln0 probed, id=0x0 (0:0)` with `xp/1wx 0xf000200ffc → 0xcafedead` (q-cp `cb_complete → FUNC_SCRATCH` round-trip via P1b unaffected); `cm7.log` no longer produced (matches the deleted debug chardev). | done | required P1 + P2; replaces ~700 LOC of gated scaffolding with the silicon path |
 | P8 | Real CA73 soft-reset — replace M8b 3a's synthetic `0xFB0D` from `INTGR0 bit 0` with a bracketed reset of CP0/CP1 cluster CPUs + their GIC redistributor state + the PCIe mailbox regs (preserve DRAM/SRAM/cfg-head/any kmd-loaded firmware images), restart from BL1; q-sys `bootdone_task` re-emits `0xFB0D` through the existing `issr` chardev path naturally. Removes the last QEMU-side cold-boot lie. Candidate hooks: a `DeviceReset` on an aggregated "r100-ca73-cluster" QOM wrapper, or `qemu_system_reset_request` with a fine-grained `ShutdownCause` so the x86 host QEMU is unaffected. | pending | independent of P1..P7 |
 | P9 | UMQ multi-queue — `NUMBER_OF_CMD_QUEUES > 1`. Falls out of P1's per-queue parser; q-cp's `hq_task` already loops over `qid` in `host_queue_manager.c`, so the work is mostly host-side allocation + per-queue MSI-X vector wiring. Includes BD-done qid=1 (kmd "message ring") which Stage 3c's `qdesc ring_log2 range` guard used to skip; q-cp handles it natively post-P1c. | pending | depends on P1 |
 | P10 | umd smoke test in `guest/` — `rblnCreateContext` → submit → wait → exit 0. After P1 + P2 + P3 + P4A + P5 + P7, this exercises the full silicon-accurate path. | pending | absorbs the old M9-3 |
@@ -367,8 +366,8 @@ Shortest path to honest end-to-end:
    bisection results misleading. P2 makes `cb_complete` the sole
    MSI-X source structurally, not just by default config. The
    `imsix` QOM link / `R100IMSIXState *` field / `r100_imsix.h`
-   include all stay wired so P7 retires them with the rest of the
-   gated Stage 3c FSM in one diff.
+   include were left wired in P2 and retired alongside the rest of
+   the gated Stage 3c FSM in P7 (one diff).
 3. **P3 (done)** — All four DNC task-queue mailboxes live as real
    Samsung-IPM SFRs on chiplet 0 (COMPUTE / UDMA / UDMA_LP / UDMA_ST,
    matching q-cp's `_inst[HW_SPEC_DNC_QUEUE_NUM=4]`). Every cmd_type
@@ -386,15 +385,18 @@ Shortest path to honest end-to-end:
    task_types log unimp + fall through. Real tensor bytes move
    between any two chiplet-local DRAM offsets that fit the 41-bit
    encoding. Verified via `./remucli test p4b`.
-6. **P7** — delete the rest of Stage 3c (BD reads + DONE writeback
-   + ci advance + mbtq push). Single source of truth for BD lifecycle.
+6. **P7 (done)** — deleted the rest of Stage 3c (BD reads + DONE
+   writeback + ci advance + mbtq push) + the QINIT stub + the
+   `cm7-debug` chardev. Single source of truth for BD lifecycle is
+   now q-cp's `cb_complete`. `r100-cm7` is reduced to its two real
+   responsibilities: BAR4 doorbell forward + P1b cfg-mirror trap.
 7. **P10** — umd smoke test on the now-silicon-accurate path.
 8. **P6 + P9** — behavioural DNC + multi-queue, gated by workload
    need.
 9. **P8** — orthogonal; tackle whenever the synthetic `FW_BOOT_DONE`
    blocks something concrete (e.g. driver re-bind testing).
 
-After P1..P3 + P4A + P4B + P5 (done) + P7 + P10 (eight milestones),
+After P1..P3 + P4A + P4B + P5 + P7 (done) + P10 (eight milestones),
 every BD the host submits flows through the silicon-accurate path:
 `r100-cm7` forwards the doorbell → q-cp on CA73 CP0 reads the BD,
 walks the CB, programs the engines, pushes DNC tasks to CP1, and

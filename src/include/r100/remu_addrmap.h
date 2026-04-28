@@ -228,11 +228,8 @@
  * through the auto-fetch DDMA_AF path, not these mailboxes.)
  *
  * On silicon PCIE_CM7 firmware writes 24 B dnc_one_task entries +
- * bumps PI to dispatch work; REMU has no Cortex-M7 vCPU, so
- * r100-cm7 takes that role via r100_mailbox_set_issr_words() — but
- * only for the COMPUTE slot today (the cm7 mbtq stub is default off
- * post-P1c and only ever pushed COMPUTE entries; q-cp on CP0 owns
- * the real per-cmd_type push). All four are nevertheless
+ * bumps PI to dispatch work; q-cp on CP0 owns this push natively
+ * post-P1c via mtq_push_task. All four mailboxes are nevertheless
  * instantiated as real r100-mailbox blocks on chiplet 0 (P3) so
  * mtq_init's writes to MBTQ_PI_IDX/CI_IDX persist correctly across
  * cmd_types. */
@@ -612,36 +609,18 @@ static inline uint32_t r100_dnc_intid(uint32_t dnc_id, uint32_t cmd_type)
  * loop in 64 KB strides to keep the on-stack scratch reasonable. */
 #define R100_HDMA_D2D_CHUNK             (64u * 1024u)
 
-/* Common cmd_type value the M9-1c r100-cm7 cmd_descr synth seeds into
- * cmd_descr_common.cmd_type so q-cp's worker dispatches into the
- * COMPUTE path. Source: g_cmd_descr_common_rebel.h enum common_cmd_type
- * (COMMON_CMD_TYPE_COMPUTE = 0). Mirrored here so we don't need the
- * bundle header during compilation of r100_cm7.c. */
-#define R100_CMD_TYPE_COMPUTE           0u
-
-/* Reserved chiplet-0 private DRAM window holding synthesised
- * cmd_descr blobs r100-cm7 publishes into MBTQ entries. Sits inside
- * the BAR0-private lazy-RAM tail (CLAUDE.md BAR0 details:
- * 0x08000000..0x40000000), well clear of:
- *   - shared shm head (0..0x08000000),
- *   - kmd-loaded firmware images (BL31_CP1 0x14100000, FreeRTOS_CP1
- *     0x14200000),
- *   - .logbuf at 0x10000000.
- * 16 entries × 256 B each = one slot per MBTQ_ENTRY_MAX. */
-#define R100_CMD_DESCR_SYNTH_BASE       0x20000000ULL
-#define R100_CMD_DESCR_SYNTH_STRIDE     0x100ULL    /* 256 B per slot */
-#define R100_CMD_DESCR_SYNTH_COUNT      R100_MBTQ_ENTRY_MAX
-
 /* req_id partitioning on the `hdma` chardev (remu_hdma_proto.h).
- *   0x00         — untagged QINIT writes (r100-cm7).
- *   0x01..0x0F   — r100-cm7 BD-done per-queue (req_id = qid + 1).
- *   0x40..0x7F   — reserved (UMQ multi-queue, future).
+ *   0x00         — r100-cm7 OP_CFG_WRITE upstream from the cfg-mirror
+ *                  reverse path (untagged; OP_CFG_WRITE has no
+ *                  matching response on the wire).
+ *   0x01..0x7F   — reserved for future subscribers (UMQ multi-queue
+ *                  may reclaim this range).
  *   0x80..0xBF   — r100-hdma MMIO-driven channel ops (encoded as
  *                  0x80 | (type<<5) | ch with type=0 WR, type=1 RD,
  *                  ch in 0..15).
  *   0xC0..0xFF   — r100-pcie-outbound synchronous PF-window reads
- *                  (P1; cookie = req_id & 0x3F, rotates on each
- *                  request, only one in flight at a time). */
+ *                  (cookie = req_id & 0x3F, rotates on each request,
+ *                  only one in flight at a time). */
 #define R100_HDMA_REQ_ID_CH_MASK_BASE   0x80u
 #define R100_HDMA_REQ_ID_CH_DIR_RD      0x20u    /* 1<<5 */
 #define R100_HDMA_REQ_ID_CH_NUM_MASK    0x1Fu    /* fits 0..15 */

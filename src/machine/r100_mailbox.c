@@ -223,11 +223,9 @@ void r100_mailbox_set_issr(R100MailboxState *s, uint32_t idx, uint32_t val)
 
 /*
  * Peek at ISSR[idx] without the MMIO traversal (and without any of
- * the egress-emit plumbing). Callers are NPU-side devices that need
- * the current scratch value — in practice the r100-cm7 BD-done state
- * machine reading the kmd-published producer index on an INTGR1
- * doorbell fire. Keep this strictly read-only so the three-way source
- * bookkeeping in r100_mailbox_issr_store() stays authoritative.
+ * the egress-emit plumbing). Strictly read-only so the three-way
+ * source bookkeeping in r100_mailbox_issr_store() stays
+ * authoritative.
  */
 uint32_t r100_mailbox_get_issr(R100MailboxState *s, uint32_t idx)
 {
@@ -242,8 +240,7 @@ uint32_t r100_mailbox_get_issr(R100MailboxState *s, uint32_t idx)
  * because this path has no host-visible side effects — the targets
  * are NPU-internal mailboxes (PERI0_M9_CPU1 etc.) that q-cp polls
  * directly from CA73, so there is no egress chardev to emit on and
- * the host-relay/MMIO/CM7-stub bookkeeping doesn't apply. Caller
- * (r100-cm7) owns its own counters for these pushes.
+ * the host-relay/MMIO/CM7-stub bookkeeping doesn't apply.
  */
 void r100_mailbox_set_issr_words(R100MailboxState *s, uint32_t idx,
                                  const uint32_t *vals, uint32_t count)

@@ -45,12 +45,9 @@ struct R100SoCMachineState {
      * doorbell ingress from the x86 host guest's BAR4. Resolved to a
      * Chardev at machine-init time for the same reason memdev is
      * deferred. When unset, the r100-cm7 device is not created
-     * (single-QEMU runs are unaffected). Named "doorbell" for
-     * historical reasons — it's the single ingress chardev the
-     * device's doorbell RX handler reads; the device itself was
-     * renamed from r100-doorbell to r100-cm7 in M8b Stage 3c when
-     * BD-done joined the other four CM7 responsibilities (SOFT_RESET
-     * stub, ISSR payload sink, cfg-shadow, QINIT). */
+     * (single-QEMU runs are unaffected). Named "doorbell" because
+     * it's the single ingress chardev the device's doorbell RX
+     * handler reads. */
     char *doorbell_chardev_id;
     /* Optional: debug tail chardev id that the r100-cm7 device
      * echoes each received frame to as an ASCII line. Used by the
@@ -92,23 +89,25 @@ struct R100SoCMachineState {
      * frame emitted). Mirror of doorbell_debug_chardev_id. */
     char *issr_debug_chardev_id;
 
-    /* `-machine r100-soc,cfg=<chardev-id>` : M8b Stage 3b host→NPU BAR2
-     * cfg-head mirror. When set, host-side r100-npu-pci installs a
-     * 4 KB MMIO trap at BAR2 offset FW_LOGBUF_SIZE and forwards every
-     * write to this chardev as an 8-byte (cfg_off, val) frame; NPU-side
-     * r100-cm7 consumes them into cfg_shadow[] so the CM7 stub
-     * can read DDH_BASE_{LO,HI} when synthesising HDMA writes. Same
-     * late-binding rule as memdev / doorbell / msix / issr. */
+    /* `-machine r100-soc,cfg=<chardev-id>` : host→NPU BAR2 cfg-head
+     * mirror. When set, host-side r100-npu-pci installs a 4 KB MMIO
+     * trap at BAR2 offset FW_LOGBUF_SIZE and forwards every write to
+     * this chardev as an 8-byte (cfg_off, val) frame; NPU-side
+     * r100-cm7 consumes them into cfg_shadow[] which is exposed to
+     * q-cp via the P1b cfg-mirror MMIO trap at
+     * R100_DEVICE_COMM_SPACE_BASE. Same late-binding rule as memdev /
+     * doorbell / msix / issr. */
     char *cfg_chardev_id;
     /* Optional debug tail for cfg ingress (one ASCII line per
      * received frame). Mirror of doorbell_debug_chardev_id. */
     char *cfg_debug_chardev_id;
 
-    /* `-machine r100-soc,hdma=<chardev-id>` : M8b Stage 3b/3c NPU<->host
-     * HDMA executor. Bidirectional channel: r100-cm7 emits variable-
-     * length frames (remu_hdma_proto.h) — OP_WRITE (QINIT + BD-done
-     * writebacks), OP_READ_REQ (3c, queue_desc/BD/packet fetches),
-     * OP_CFG_WRITE (3c, FUNC_SCRATCH update). Host-side r100-npu-pci
+    /* `-machine r100-soc,hdma=<chardev-id>` : NPU<->host HDMA executor.
+     * Bidirectional variable-length frames (remu_hdma_proto.h):
+     * r100-hdma's MMIO-driven channels (OP_WRITE / OP_READ_REQ in the
+     * 0x80..0xBF req_id partition), r100-pcie-outbound's synchronous
+     * PF-window reads (0xC0..0xFF), and r100-cm7's cfg-mirror
+     * reverse-path OP_CFG_WRITE (req_id 0). Host-side r100-npu-pci
      * decodes and executes them as pci_dma_{read,write} plus local
      * cfg-head shadow stores, and emits OP_READ_RESP back. Same
      * late-binding rule as memdev / doorbell / msix / issr / cfg. */
@@ -116,15 +115,6 @@ struct R100SoCMachineState {
     /* Optional debug tail for hdma (one ASCII line per frame sent or
      * received). Mirror of doorbell_debug_chardev_id. */
     char *hdma_debug_chardev_id;
-
-    /* `-machine r100-soc,cm7-debug=<chardev-id>` : M8b Stage 3c CM7
-     * BD-done state machine ASCII tail. When set, the r100-cm7
-     * device writes one line per BD-job phase transition to this
-     * chardev so tests can assert the IDLE -> WAIT_QDESC -> WAIT_BD
-     * -> WAIT_PKT -> IDLE walk end-to-end. Independent from the
-     * doorbell/cfg/hdma debug tails (those trace wire-level frames;
-     * this one traces the higher-level state machine). */
-    char *cm7_debug_chardev_id;
 };
 
 typedef struct R100SoCMachineState R100SoCMachineState;

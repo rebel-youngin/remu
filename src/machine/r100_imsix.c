@@ -78,13 +78,16 @@ static void r100_imsix_emit(R100IMSIXState *s, uint32_t off, uint32_t db_data)
 }
 
 /*
- * Public: invoked by the r100-cm7 BD-done state machine (M8b 3c) when
- * a command-queue completes. Wraps r100_imsix_emit so the chardev
- * stays single-owner — the wire format the host sees is the same
- * "off=R100_PCIE_IMSIX_DB_OFFSET, db_data=<vector>" an FW store would
- * have produced. Vector goes through R100_PCIE_IMSIX_VECTOR_MASK to
- * stay within the 11-bit field the silicon format allows (CR03 tops
- * out at 32 vectors == 5 bits, but we mask defensively anyway).
+ * Public helper: emit an MSI-X notification on the chardev as if FW
+ * had written `vector` to R100_PCIE_IMSIX_DB_OFFSET. The wire format
+ * the host sees is identical to a normal FW MMIO store. Vector goes
+ * through R100_PCIE_IMSIX_VECTOR_MASK to stay within the 11-bit
+ * field the silicon format allows (CR03 tops out at 32 vectors ==
+ * 5 bits, but we mask defensively anyway). Today MSI-X is driven
+ * exclusively by q-cp's `cb_complete → pcie_msix_trigger` through
+ * the device's MMIO trap; this helper is a hook for any future
+ * QEMU-internal stub that needs to synthesise an MSI-X without a
+ * real CA73 vCPU.
  */
 void r100_imsix_notify(R100IMSIXState *s, uint32_t vector)
 {

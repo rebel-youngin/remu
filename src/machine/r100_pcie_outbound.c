@@ -38,8 +38,9 @@
  *
  *   - writes are fire-and-forget OP_WRITEs (kmd doesn't fence on
  *     completion of these specific writes; the doorbells that *do*
- *     need ordering already use the BD-done state machine in r100-cm7
- *     or r100-hdma's MMIO channels).
+ *     need ordering go through r100-hdma's MMIO channels or the
+ *     INTGR1-bit → SPI 185 → q-cp `hq_task` path that this device
+ *     is just the read backend of).
  *
  * The MMIO `addr` parameter inside read()/write() is the offset into
  * the MR (= AXI address - PCIE_AXI_SLV_BASE_ADDR), which by the iATU
@@ -47,16 +48,6 @@
  * stripped automatically by QEMU's MR base subtraction. The host-side
  * pci_dma_{read,write} (in r100-npu-pci) then resolves that bus
  * address against the x86 guest's IOMMU.
- *
- * Stage-3c retirement plan
- * ------------------------
- * r100-cm7's BD-done state machine (Stage 3c, src/machine/r100_cm7.c)
- * is QEMU-side scaffolding that walks the BD ring on q-cp's behalf
- * via OP_READ_REQ/RESP. Once the q-cp/CP0 load path lands genuine
- * traffic through this device, the cm7 BD-done state machine can be
- * progressively dismantled (P1's verification step: see
- * docs/roadmap.md). r100-cm7 keeps cfg-shadow, QINIT, and SOFT_RESET
- * for now since those don't need a real CA73 vCPU to drive them.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */

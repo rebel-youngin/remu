@@ -72,7 +72,7 @@
  * The chardev backend is single-frontend (CharBackend), so r100-hdma
  * is the sole host-side counterpart and r100-cm7 reaches it through
  * a QOM link + the public helpers in r100_hdma.h. Disjoint req_id
- * partitions keep cm7's BD-done responses (1..R100_CM7_MAX_QUEUES)
+ * partitions keep r100-pcie-outbound's PF-window reads (0xC0..0xFF)
  * from colliding with this device's channel-driven 0x80..0xBF range.
  *
  * SMMU note: this engine consumes SAR/DAR as device PAs in the
@@ -183,12 +183,6 @@ struct R100HDMAState {
     R100HdmaChan ch[2 /* WR/RD */][R100_HDMA_CH_COUNT];
 
     RemuHdmaRx rx;
-
-    /* Optional cm7 RX callback for OP_READ_RESPs in the cm7 req_id
-     * partition (1..R100_CM7_MAX_QUEUES). r100-cm7 sets this at
-     * realize time via r100_hdma_set_cm7_callback. */
-    R100HDMARespCb cm7_cb;
-    void *cm7_cb_opaque;
 
     /* Optional outbound RX callback for OP_READ_RESPs in the
      * r100-pcie-outbound req_id partition (0xC0..0xFF). Bound at
@@ -307,13 +301,6 @@ bool r100_hdma_emit_cfg_write(R100HDMAState *s, uint32_t req_id,
                   "req_id=0x%x rc=%d\n", tag, cfg_off, val, req_id,
                   (int)rc);
     return false;
-}
-
-void r100_hdma_set_cm7_callback(R100HDMAState *s, R100HDMARespCb cb,
-                                void *opaque)
-{
-    s->cm7_cb = cb;
-    s->cm7_cb_opaque = opaque;
 }
 
 void r100_hdma_set_outbound_callback(R100HDMAState *s, R100HDMARespCb cb,
@@ -1062,15 +1049,14 @@ static void r100_hdma_dispatch(R100HDMAState *s,
                       "partition but cb unbound\n", hdr->req_id);
         return;
     }
-    /* Otherwise route to the cm7 partition (1..R100_CM7_MAX_QUEUES).
-     * BD-done jobs use req_id = qid + 1. */
-    if (s->cm7_cb) {
-        s->cm7_cb(s->cm7_cb_opaque, hdr, payload);
-        return;
-    }
+    /* Only the channel (0x80..0xBF) and outbound (0xC0..0xFF)
+     * partitions round-trip OP_READ_RESP through this device.
+     * req_id=0 is the cfg-mirror OP_CFG_WRITE upstream (no response),
+     * 0x01..0x7F is reserved with no consumer. */
     qemu_log_mask(LOG_GUEST_ERROR,
-                  "r100-hdma: READ_RESP req_id=0x%x has no handler "
-                  "(cm7 cb unbound)\n", hdr->req_id);
+                  "r100-hdma: READ_RESP req_id=0x%x has no matching "
+                  "partition (channel 0x80..0xBF / outbound 0xC0..0xFF)\n",
+                  hdr->req_id);
 }
 
 static void r100_hdma_receive(void *opaque, const uint8_t *buf, int size)

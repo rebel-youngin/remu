@@ -66,9 +66,12 @@ frames (NPU → host). Cold-boot `FW_BOOT_DONE` is **real**: q-sys
 bit 0 (`SOFT_RESET`) triggers a narrow QEMU-side CM7-stub that
 *re-synthesises* `0xFB0D` on the kmd's post-probe soft-reset
 handshake, because REMU does not yet model a real CA73 cluster reset
-(`docs/roadmap.md` → P8).
-`INTGR1` bit 7 (`QUEUE_INIT`) triggers the Stage 3b QINIT stub (see
-below).
+(`docs/roadmap.md` → P8). All `INTGR1` bits relay verbatim as SPI 185;
+q-cp on CP0 owns every interesting bit (queue doorbells wake
+`hq_task → cb_task → cb_complete`; `QUEUE_INIT` bit 7 wakes
+`hq_init / rl_cq_init` to publish the QINIT descriptor and write back
+`init_done` over the P1a outbound iATU). No CM7-side special-case
+dispatch on this register post-P7.
 
 BAR2 details (M8b 3b → P1b): kmd writes `DDH_BASE_{LO,HI}` (at
 `FW_LOGBUF_SIZE + 0xC0/0xC4`) to publish the host-RAM
@@ -86,37 +89,27 @@ upstream over `hdma`, closing the loop with the host's
 writel(FUNC_SCRATCH, magic)` round-trip back into the kmd's
 `rebel_cfg_read(FUNC_SCRATCH)` for `rbln_queue_test`. The paired
 **NPU ↔ host DMA executor** is the `hdma` chardev with a 24 B header +
-payload protocol (`src/bridge/remu_hdma_proto.h`). The legacy
-`INTGR1` bit 7 stub (`r100_cm7_qinit_stub`) that read `DDH_BASE` from
-`cfg_shadow[]` and emitted two `HDMA_OP_WRITE` frames (fw_version,
-init_done) is now off by default post-P1c — q-cp on CP0 owns the QINIT
-write-back natively over the P1a outbound iATU. The stub is still
-linked in behind `-global r100-cm7.qinit-stub=on` for bisects.
+payload protocol (`src/bridge/remu_hdma_proto.h`).
 
-Stage 3c turned the single-opcode `hdma` pipe into a bidirectional
-protocol so the NPU can drive BD completion without a second chardev.
 Opcodes: `OP_READ_REQ` (NPU → host: "please `pci_dma_read` `len` bytes
 at `dst`, tag with `req_id`"), `OP_READ_RESP` (host → NPU: payload for
-a pending `req_id`), and `OP_CFG_WRITE` (NPU → host: "update host-local
-`cfg_mmio_regs[dst>>2]`"). The `flags` header byte is renamed `req_id`.
-P1c retired the `r100-cm7`-side BD-done state machine: `INTGR1` bits
-`0..N-1` still relay as SPI 185 to wake q-cp's `hq_task` on CP0, but the
-QEMU-side per-queue `R100Cm7BdJob` walk (`IDLE → WAIT_QDESC → WAIT_BD →
-WAIT_PKT → IDLE complete` issuing `OP_READ_REQ` pairs and committing
-`OP_CFG_WRITE FUNC_SCRATCH` / `OP_WRITE bd.header |= DONE` /
-`OP_WRITE queue_desc.ci++`) is off by default — q-cp's native
-`hq_task → cb_task → cb_complete` does the same walk over the P1a
-outbound iATU + the P1b cfg-mirror trap, with `pcie_msix_trigger`
-(q-sys `osl/FreeRTOS/.../msix.c`) firing MSI-X through the existing
-`r100-imsix` MMIO. P2 made `cb_complete` the structural single
-source of truth for MSI-X by deleting the FSM's trailing
-`r100_imsix_notify(vec=qid)` call — turning bisect mode on no longer
-double-fires MSI-X (just walks the BD silently and lets `cb_complete`
-do the notify). To re-enable the QEMU-side state machine for
-bisecting, pass `-global r100-cm7.bd-done-stub=on`
-(or the matching `mbtq-stub` / `qinit-stub` knob); see
-`docs/debugging.md` → "Stage 3c — BD-done state machine" for the log
-signatures.
+a pending `req_id`), `OP_WRITE` (NPU → host: "please `pci_dma_write`
+`len` bytes at `dst`"), and `OP_CFG_WRITE` (NPU → host: "update
+host-local `cfg_mmio_regs[dst>>2]`"). P1c made q-cp's native
+`hq_task → cb_task → cb_complete` the single source of truth for the
+BD lifecycle: queue-doorbell `INTGR1` bits relay as SPI 185 to wake
+`hq_task`, which walks BD / packet over the P1a outbound iATU, writes
+back `BD_FLAGS_DONE_MASK` + advances `queue_desc.ci`, publishes
+`FUNC_SCRATCH` through the P1b cfg-mirror trap, and calls
+`pcie_msix_trigger` (q-sys `osl/FreeRTOS/.../msix.c`) which fires
+MSI-X through the `r100-imsix` MMIO. **P7 deleted** the gated
+QEMU-side scaffolding that used to live under
+`-global r100-cm7.{bd-done,qinit,mbtq}-stub=on` (Stage 3c per-queue
+`R100Cm7BdJob` walker, Stage 3b `qinit` `fw_version` / `init_done=1`
+write-back, M9-1b `cmd_descr` synth + mbtq push) along with the
+`0x01..0x0F` `req_id` partition on the `hdma` wire that fed it. The
+helpers had no callers post-P1c; q-cp owns the equivalent silicon
+paths end-to-end.
 
 #### P1a — chiplet-0 PCIe outbound iATU stub + DDH mirror
 
@@ -140,11 +133,10 @@ infrastructure that close that gap (`docs/roadmap.md` → P1):
    which `r100-pcie-outbound` is just the read backend of).
    `r100-hdma` demuxes responses to a per-device callback
    registered via `r100_hdma_set_outbound_callback()`; the legacy
-   cm7 callback (`r100_hdma_set_cm7_callback`) keeps the
-   `0x01..0x0F` partition reachable when `bd-done-stub=on` is used
-   for bisecting. Host-side `pci_dma_read` failures synthesise a
-   zero-payload `OP_READ_RESP` so the parked vCPU surfaces a
-   guest-visible `0` instead of dead-locking.
+   `0x01..0x0F` cm7 BD-done partition + its `r100_hdma_set_cm7_callback`
+   plumbing were retired in P7. Host-side `pci_dma_read` failures
+   synthesise a zero-payload `OP_READ_RESP` so the parked vCPU
+   surfaces a guest-visible `0` instead of dead-locking.
 
 2. **BAR2 cfg-head ↔ NPU MMIO trap** in `r100-cm7`. Real silicon's
    inbound iATU maps host BAR2 onto NPU local memory at
@@ -162,10 +154,13 @@ infrastructure that close that gap (`docs/roadmap.md` → P1):
 
 `req_id` partitions on the `hdma` wire (single source of truth in
 `src/include/r100/remu_addrmap.h`):
-`0x00` = QINIT untagged, `0x01..0x0F` = cm7 BD-done per qid+1
-(post-P1c default off), `0x80..0xBF` = `r100-hdma` MMIO-driven
-channel ops, `0xC0..0xFF` = `r100-pcie-outbound` synchronous
-PF-window reads.
+`0x00` = `r100-cm7` `OP_CFG_WRITE` upstream from the cfg-mirror
+reverse path (untagged; OP_CFG_WRITE has no matching response on
+the wire), `0x01..0x7F` = reserved (the legacy cm7 BD-done partition
+lived at `0x01..0x0F` until P7 retired the FSM; UMQ multi-queue may
+reclaim this range), `0x80..0xBF` = `r100-hdma` MMIO-driven channel
+ops, `0xC0..0xFF` = `r100-pcie-outbound` synchronous PF-window
+reads.
 
 Verified end-to-end on `--host` boot: q-cp logs `Device descriptor
 addr 0x80…, size 286720`, `Queue descriptor addr 0x80…0xec,
@@ -173,7 +168,7 @@ size 32`, `Context descriptor addr 0x80…0x12c, size 1112` — all
 fetched through the new outbound stub against the kmd's coherent
 DMA buffer. m5/m6/m7/m8 bridge regression unaffected.
 
-#### P1b/P1c — honest BD lifecycle on q-cp/CP0
+#### P1b/P1c/P7 — honest BD lifecycle on q-cp/CP0
 
 **P1b** (NPU→host cfg reverse mirror) closes the cfg loop both ways
 through the trap above. The NPU-side write helper
@@ -187,24 +182,21 @@ unaligned access (`impl.access_size = 4`) so q-sys CP0's cold-boot
 `memset(DEVICE_COMMUNICATION_SPACE_BASE, 0, CP1_LOGBUF_MAGIC)`
 flows through unmodified.
 
-**P1c** (retire `r100-cm7` BD-done + mbtq-push stubs) — q-cp on
-CP0 now owns the entire BD lifecycle natively:
-`hq_task → cb_task → cb_complete` walks queue_desc / BD / packet
-over the P1a outbound iATU, writes `FUNC_SCRATCH` through the P1b
-trap, sets `BD_FLAGS_DONE_MASK` + advances `queue_desc.ci`, and
-calls `pcie_msix_trigger` on the `r100-imsix` MMIO. The legacy
-QEMU-side state machines in `r100-cm7` are still compiled in but
-default off:
-
-| `-global` | Re-enables |
-|---|---|
-| `r100-cm7.bd-done-stub=on` | Stage 3c BD-done state machine on `INTGR1` bits `0..N-1` |
-| `r100-cm7.mbtq-stub=on` | M9-1c `cmd_descr` synth + mailbox push |
-| `r100-cm7.qinit-stub=on` | Stage 3b `fw_version` + `init_done = 1` HDMA write-back |
-
-Use these knobs for bisecting q-cp regressions (e.g.
-`bd-done-stub=on` if you suspect q-cp's BD walk; `qinit-stub=on`
-if `init_done` polling hangs on the host).
+**P1c** routed every interesting host doorbell to q-cp on CP0 and
+gated the legacy QEMU-side scaffolding off by default. **P7 deleted
+it outright**: the gated `r100-cm7` paths
+(`bd-done-stub` / `qinit-stub` / `mbtq-stub`) had no callers post-P1c
+and have been removed from the source tree. q-cp now owns the full
+BD lifecycle natively: `hq_task → cb_task → cb_complete` walks
+queue_desc / BD / packet over the P1a outbound iATU, writes
+`FUNC_SCRATCH` through the P1b cfg-mirror trap, sets
+`BD_FLAGS_DONE_MASK` + advances `queue_desc.ci`, and calls
+`pcie_msix_trigger` on the `r100-imsix` MMIO. Bisecting a future
+regression no longer means flipping a `-global` — the only path is
+the silicon-accurate one. Pre-P7 this section listed the
+`r100_cm7.bd-done-stub` knobs; check `git log src/machine/r100_cm7.c`
+for the historical implementation if a stub-style reproducer is
+needed.
 
 Verification: `rbln_queue_test` passes silently (no
 `failed to test queue` / `fence error` on the host serial),
@@ -212,28 +204,18 @@ Verification: `rbln_queue_test` passes silently (no
 NPU side, and `xp /1wx 0xf000200ffc` on the host monitor returns
 `0xcafedead` (BAR2 + 0xFFC = `FUNC_SCRATCH`).
 
-Pre-P1c, every queue-doorbell also pushed a 24 B `dnc_one_task`
-entry onto the q-cp DNC compute task queue (real `r100-mailbox`
-instance at `R100_PERI0_MAILBOX_M9_BASE`, chiplet 0). P3 instantiated
-the other three task-queue mailboxes that q-cp's `_inst[]` table maps
-cmd_types onto — UDMA at `R100_PERI0_MAILBOX_M10_BASE`, UDMA_LP at
-`R100_PERI1_MAILBOX_M9_BASE`, UDMA_ST at `R100_PERI1_MAILBOX_M10_BASE`,
-all on chiplet 0 — so `mtq_init`'s ISSR writes land on real Samsung-IPM
-SFRs across all four cmd_types. q-cp's
-`taskmgr_fetch_dnc_task_master_cp1` polls `MBTQ_PI_IDX` (ISSR[0])
-on each; the push wakes that loop without IRQ wiring
-(poll-based protocol). PCIE_CM7 firmware does this on silicon —
-REMU has no Cortex-M7 vCPU so `r100-cm7` took the role via
-`r100_mailbox_set_issr_words()` (in-process; no chardev). M9-1c
-synthesised a minimal `cmd_descr` (cmd_type=COMPUTE,
-`dnc_task_conf.core_affinity=BIT(0)`) into chiplet-0 private DRAM
-at `R100_CMD_DESCR_SYNTH_BASE = 0x20000000` (16 × 256 B ring) and
-pointed the entry's `cmd_descr` field at it. **P1c retired this**:
-q-cp's `mtq_push_task` on CP0 owns the mailbox push naturally once
-`cb_task` runs end-to-end. The push code stays compiled in behind
-`-global r100-cm7.mbtq-stub=on` (default off) for bisecting; cm7-debug
-emits `mbtq qid=N slot=M pi=P cmd_descr=0x... status=ok` traces when
-the stub is enabled.
+The DNC task-queue mailboxes at `R100_PERI0_MAILBOX_M9_BASE` (COMPUTE),
+`R100_PERI0_MAILBOX_M10_BASE` (UDMA), `R100_PERI1_MAILBOX_M9_BASE`
+(UDMA_LP), and `R100_PERI1_MAILBOX_M10_BASE` (UDMA_ST) — all on
+chiplet 0 — are real `r100-mailbox` instances (P3) so `mtq_init`'s
+writes to `MBTQ_PI_IDX/CI_IDX` land on real Samsung-IPM SFRs across
+all four cmd_types. q-cp's `taskmgr_fetch_dnc_task_master_cp1` polls
+`MBTQ_PI_IDX` (ISSR[0]) on each; q-cp's `mtq_push_task` on CP0 owns
+the publish side natively post-P1c (the dnc_one_task content comes
+from the CB the kmd submitted, not synthesised by REMU). The legacy
+M9-1b `r100_cm7_mbtq_push` + `r100_cm7_synth_cmd_descr` helpers are
+gone with P7, along with the `R100_CMD_DESCR_SYNTH_BASE` private-DRAM
+ring they used.
 
 #### r100-hdma + active r100-dnc (M9-1c)
 
@@ -246,8 +228,10 @@ counterpart since CharBackends are single-frontend. r100-cm7 reaches
 the chardev through a QOM link (`hdma` link prop) and the public emit
 helpers in `src/machine/r100_hdma.h`. req_id partitioning on the wire
 (documented in `src/bridge/remu_hdma_proto.h`):
-0x00 = QINIT untagged (default off post-P1c),
-0x01..0x0F = cm7 BD-done per qid+1 (default off post-P1c),
+0x00 = `r100-cm7` `OP_CFG_WRITE` upstream from the P1b cfg-mirror
+reverse path (no response on the wire),
+0x01..0x7F = reserved (legacy cm7 BD-done partition lived at
+0x01..0x0F until P7 retired the FSM; available for UMQ multi-queue),
 0x80..0xBF = r100-hdma MMIO-driven channel ops,
 0xC0..0xFF = r100-pcie-outbound synchronous PF-window reads (P1a).
 
@@ -358,11 +342,11 @@ Every `--host` run captures and checks:
   `msix-{table,pba}` overlaying `r100.bar5.msix`.
 - **M8a**: NPU `r100-mailbox` has `issr-chardev = "issr"`; host
   `r100-npu-pci` has `issr = "issr"`.
-- **M8b 3b/3c + M9-1c**: NPU `r100-cm7` has `cfg-chardev = "cfg"` +
-  `cm7-debug-chardev = "cm7_dbg"`; NPU `r100-hdma` exists with
-  `chardev = "hdma"` (M9-1c moved the chardev off cm7 onto the new
-  device); host `r100-npu-pci` has `cfg = "cfg"` + `hdma = "hdma"`
-  (logged to `{host,npu}/info-qtree-cfg-hdma.log`).
+- **cfg + hdma + M9-1c**: NPU `r100-cm7` has `cfg-chardev = "cfg"`;
+ NPU `r100-hdma` exists with `chardev = "hdma"` (M9-1c moved the
+ chardev off cm7 onto the new device); host `r100-npu-pci` has
+ `cfg = "cfg"` + `hdma = "hdma"` (logged to
+ `{host,npu}/info-qtree-cfg-hdma.log`).
 
 All results go to `host/info-*.log` + `npu/info-*.log`. Failures print
 to stdout (non-fatal — NPU still boots for post-mortem poking).
@@ -481,8 +465,10 @@ src/bridge/           Added to -I during QEMU configure — cross-side shared he
                                               OP_WRITE / READ_REQ / READ_RESP / CFG_WRITE);
                                               req_id partitions live in
                                               src/include/r100/remu_addrmap.h:
-                                              0x00 QINIT (default off post-P1c),
-                                              0x01..0x0F cm7 BD-done (default off post-P1c),
+                                              0x00 r100-cm7 OP_CFG_WRITE upstream
+                                                   (P1b cfg-mirror reverse path),
+                                              0x01..0x7F reserved (legacy cm7 BD-done
+                                                   partition retired in P7),
                                               0x80..0xBF r100-hdma channels,
                                               0xC0..0xFF r100-pcie-outbound (P1a)
                       Header-only `static inline`, so both host-side (system_ss)

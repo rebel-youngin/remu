@@ -16,14 +16,12 @@
  *               `issr` chardev (M8a NPU→host). Rest of BAR4 = lazy RAM.
  *   BAR5 1 MB   MSI-X table+PBA head; rest lazy RAM.
  *
- * The INTGR1-bit-7 (REBEL_DOORBELL_QUEUE_INIT) CM7 stub that used to
- * live on this side now sits NPU-side in src/machine/r100_cm7.c;
- * this device only provides the two wires the stub needs, plus a
- * bidirectional hdma executor (Stage 3c):
+ * Two cross-process bridges back to the NPU QEMU:
  *
- *   cfg  chardev (server): host→NPU — receives cfg-head writes, so the
- *                          NPU-side stub can look up DDH_BASE_{LO,HI}
- *                          without round-tripping to host RAM.
+ *   cfg  chardev (server): host→NPU — receives BAR2 cfg-head writes
+ *                          so the NPU-side cfg-mirror trap exposes
+ *                          DDH_BASE_{LO,HI} etc. to q-cp without
+ *                          round-tripping to host RAM.
  *   hdma chardev (server): NPU<->host — dispatches on the op field of
  *                          each incoming frame (remu_hdma_proto.h):
  *                            OP_WRITE     : pci_dma_write(payload)
@@ -514,16 +512,15 @@ static void r100_hdma_handle_read_req(R100NpuPciState *s,
                       hdr->dst, hdr->len, res, hdr->req_id);
         s->hdma_frames_dropped++;
         r100_hdma_emit_debug(s, "rx", hdr, "dma-fail");
-        /* P1: r100-pcie-outbound parks a vCPU on a per-device cond
-         * until the matching READ_RESP arrives. If we silently dropped
-         * the failed read, that vCPU would deadlock for the rest of
-         * the run. Emit a zero-payload reply (with the same req_id)
-         * so the NPU side surfaces the failure as a guest-visible
-         * read of 0x0 — loud enough to trip q-cp's NULL-deref guard
-         * but recoverable. The cm7 BD-done partition (req_id 1..15)
-         * is host-driven scaffolding that we control and that does
-         * its own retry/abort on missing payload, so don't synthesise
-         * a stub reply for it. */
+        /* r100-pcie-outbound parks a vCPU on a per-device cond until
+         * the matching READ_RESP arrives. If we silently dropped the
+         * failed read, that vCPU would deadlock for the rest of the
+         * run. Emit a zero-payload reply (with the same req_id) so
+         * the NPU side surfaces the failure as a guest-visible read
+         * of 0x0 — loud enough to trip q-cp's NULL-deref guard but
+         * recoverable. Only synthesise the fail-stub for the
+         * outbound partition (0xC0..0xFF); the reserved 0x01..0x7F
+         * range has no live consumer that expects one. */
         if (hdr->req_id >= R100_PCIE_OUTBOUND_REQ_ID_BASE) {
             uint8_t zero[REMU_HDMA_MAX_PAYLOAD] = {0};
             uint32_t reply_len = MIN(hdr->len, sizeof(zero));
@@ -572,8 +569,8 @@ static void r100_hdma_handle_read_req(R100NpuPciState *s,
  * OP_CFG_WRITE handler — the NPU-side CM7 stub publishes a u32 into
  * our BAR2 cfg-head shadow at offset `dst`. The kmd reads the same
  * location via rebel_cfg_read() (FUNC_SCRATCH = 0xFFC for rbln_queue_test).
- * No chardev echo — this is the reverse direction of the Stage-3b
- * host->NPU cfg forwarding; spraying another frame back would loop.
+ * No chardev echo — this is the reverse direction of the host->NPU
+ * cfg forwarding; spraying another frame back would loop.
  */
 static void r100_hdma_handle_cfg_write(R100NpuPciState *s,
                                        const RemuHdmaHeader *hdr,

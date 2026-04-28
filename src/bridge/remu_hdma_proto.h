@@ -8,11 +8,7 @@
  * host-side r100-npu-pci decodes each frame and executes it against
  * the x86 guest's PCI DMA space via pci_dma_{write,read}.
  *
- * The channel was one-way (NPU -> host, OP_WRITE only) up through M8b
- * Stage 3b. Stage 3c (BD-done) needs read-backs (queue_desc, BD, and
- * packet payload) plus a direct write into the host's BAR2 cfg-head
- * shadow (the kmd reads FUNC_SCRATCH from there, not from host RAM),
- * so the channel is now bidirectional with four opcodes:
+ * The channel is bidirectional with four opcodes:
  *
  *   OP_WRITE     (NPU -> host) pci_dma_write(dst, payload, len)
  *   OP_READ_REQ  (NPU -> host) "please pci_dma_read(src=dst, len) and
@@ -22,12 +18,11 @@
  *   OP_READ_RESP (host -> NPU) "here's len bytes that were at src=dst
  *                               for req_id"
  *   OP_CFG_WRITE (NPU -> host) "store payload[0] into your BAR2
- *                               cfg-head shadow at offset dst" — this
- *                               is the reverse of the Stage-3b
- *                               host -> NPU cfg forwarding path, used
- *                               so the NPU-side CM7 stub can publish
- *                               FUNC_SCRATCH values the kmd reads via
- *                               rebel_cfg_read().
+ *                               cfg-head shadow at offset dst" — the
+ *                               reverse of the host->NPU cfg
+ *                               forwarding path, used so the NPU side
+ *                               can publish FUNC_SCRATCH values the
+ *                               kmd reads via rebel_cfg_read().
  *
  * Variable-length frames:
  *
@@ -46,23 +41,28 @@
  *                     callers' RESPs disentangle without a dispatcher
  *                     table per device:
  *
- *                       0x00         — untagged QINIT writes (r100-cm7).
- *                       0x01..0x0F   — r100-cm7 BD-done per-queue
- *                                      (req_id = qid + 1, qid < 16).
- *                       0x40..0x7F   — reserved for future UMQ /
- *                                      multi-queue work.
+ *                       0x00         — r100-cm7 OP_CFG_WRITE upstream
+ *                                      from the P1b cfg-mirror reverse
+ *                                      path (OP_CFG_WRITE has no
+ *                                      matching response on the wire).
+ *                       0x01..0x7F   — reserved (UMQ multi-queue may
+ *                                      reclaim this range).
  *                       0x80..0xBF   — r100-hdma MMIO-driven channel
  *                                      ops, encoded as
  *                                      0x80 | (dir<<5) | ch where dir=0
  *                                      WR, dir=1 RD, ch in 0..15. See
  *                                      R100_HDMA_REQ_ID_* in
  *                                      r100/remu_addrmap.h.
+ *                       0xC0..0xFF   — r100-pcie-outbound synchronous
+ *                                      PF-window reads (cookie rotates
+ *                                      over the low 6 bits, single
+ *                                      in flight).
  *
  *                     r100-hdma owns the host-side chardev backend
  *                     (single-frontend) and dispatches each incoming
  *                     OP_READ_RESP by req_id range — local for the
- *                     0x80..0xBF channel ops, callback into r100-cm7
- *                     for 0x01..0x0F.
+ *                     0x80..0xBF channel ops, callback into
+ *                     r100-pcie-outbound for 0xC0..0xFF.
  *   +24 u8  data[len]  (empty for OP_READ_REQ; mandatory for the rest)
  *
  * REMU_HDMA_HDR_SIZE = 24. Total on-wire per frame = 24 + len.

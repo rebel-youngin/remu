@@ -59,22 +59,19 @@ void r100_mailbox_cm7_stub_write_issr(R100MailboxState *s, uint32_t idx,
 
 /*
  * Read the current ISSR[idx] value without going through the MMIO
- * path. Used by the M8b Stage 3c r100-cm7 BD-done state machine to
- * snapshot the queue-N producer index (kmd publishes `pi` at
- * PF.ISSR[qid] via a BAR4 MAILBOX_BASE write; that host→NPU relay
- * lands here via r100_mailbox_set_issr). Returns 0 for out-of-range
- * `idx` — a safe no-op because `pi == 0` means "nothing to consume".
+ * path. Returns 0 for out-of-range `idx` — a safe no-op because
+ * `pi == 0` means "nothing to consume". Strictly read-only so the
+ * three-way source bookkeeping in r100_mailbox_issr_store() stays
+ * authoritative.
  */
 uint32_t r100_mailbox_get_issr(R100MailboxState *s, uint32_t idx);
 
 /*
  * In-process multi-slot ISSR write — copies `count` u32 values into
- * ISSR[idx..idx+count). Used by r100-cm7 to push a 6-slot
- * dnc_one_task entry plus update the producer index on a non-PCIe
- * mailbox (PERI0_MAILBOX_M9_CPU1 task queue). Skips the host-relay
- * counter and the egress-emit chardev — these mailboxes are
- * NPU-internal (q-cp polls them directly, no host mirror).
- * Out-of-range slots are dropped silently.
+ * ISSR[idx..idx+count). Skips the host-relay counter and the
+ * egress-emit chardev — intended for NPU-internal mailboxes (q-cp
+ * polls them directly, no host mirror). Out-of-range slots are
+ * dropped silently.
  */
 void r100_mailbox_set_issr_words(R100MailboxState *s, uint32_t idx,
                                  const uint32_t *vals, uint32_t count);
