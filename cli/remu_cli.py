@@ -17,7 +17,7 @@ Usage:
     ./remucli gdb [--port PORT] [-b ELF]
     ./remucli status
     ./remucli images [--check | --from-dir PATH]
-    ./remucli test [m5|m6|m7|m8|p4a|p4b|p5|all]...
+    ./remucli test [m5|m6|m7|m8|p4a|p4b|p5|p10|all]...
     ./remucli clean [--name NAME | --all]
     ./remucli completion {bash,zsh,fish}
 """
@@ -2357,9 +2357,26 @@ TEST_REGISTRY = {
         "desc": "P5 r100-hdma LL: gdbstub-driven dw_hdma_v0_lli D2D byte-move",
         "needs": ("aarch64", "x86_64"),
     },
+    "p10": {
+        "script": "tests/p10_umd_smoke_test.py",
+        "run_name": "p10-umd",
+        "desc": ("P10 umd smoke: command_submission integration test "
+                 "(rblnSubmitJob → RBDMA OTO → cb_complete → MSI-X) — "
+                 "scaffolding only; queue_init handshake debug pending"),
+        "needs": ("aarch64", "x86_64"),
+        # Excluded from the default `./remucli test` / `./remucli test
+        # all` sweep until the queue_init handshake clears (see
+        # docs/roadmap.md → P10). Run explicitly with
+        # `./remucli test p10` to exercise the build / staging /
+        # orchestrator scaffolding once `guest/build-umd.sh` has staged
+        # `command_submission`.
+        "in_default": False,
+    },
 }
 
 TEST_KEYS = list(TEST_REGISTRY.keys())
+DEFAULT_TEST_KEYS = [k for k, v in TEST_REGISTRY.items()
+                     if v.get("in_default", True)]
 
 
 @cli.command()
@@ -2372,13 +2389,19 @@ TEST_KEYS = list(TEST_REGISTRY.keys())
 def test(tests, skip_clean, stop_on_fail):
     """Run REMU bridge end-to-end tests with pre-run cleanup.
 
-    By default runs the full suite (m5..m8). Pass one or more test ids
-    to pick specific phases, e.g.:
+    By default runs the regression set (m5..m8 + p4a/p4b/p5).  Pass one
+    or more test ids to pick specific phases, e.g.:
 
     \b
-        ./remucli test              # all four
+        ./remucli test              # full default regression
         ./remucli test m5 m6        # just M5 + M6
-        ./remucli test m8           # just M8
+        ./remucli test p10          # opt-in test (not in default)
+        ./remucli test all p10      # default regression + P10
+
+    Tests flagged `in_default=False` in TEST_REGISTRY (currently just
+    P10 — see docs/roadmap.md for the open queue_init handshake) are
+    excluded from `all` / bare invocations so a dev `./remucli test`
+    still gates regressions cleanly while we land the missing pieces.
 
     Each test is launched after `./remucli clean --name <its-run>` so
     orphan QEMU processes / stale shm / stale sockets from a prior
@@ -2388,7 +2411,16 @@ def test(tests, skip_clean, stop_on_fail):
     output stays small enough to paste into a bug report.
     """
     if not tests or "all" in tests:
-        selected = list(TEST_KEYS)
+        # `all` and the bare `./remucli test` form intentionally skip
+        # tests flagged `in_default=False` (currently P10 — see
+        # TEST_REGISTRY for the rationale). To run an opted-out test
+        # name it explicitly: `./remucli test p10`, or
+        # `./remucli test all p10` to bolt it onto the regression set.
+        selected = list(DEFAULT_TEST_KEYS)
+        if "all" in tests:
+            for t in tests:
+                if t != "all" and t not in selected:
+                    selected.append(t)
     else:
         seen = set()
         selected = [t for t in tests if not (t in seen or seen.add(t))]

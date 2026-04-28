@@ -45,19 +45,34 @@ FS="$STAGE/fs"
 IRFS="$STAGE/initramfs"
 mkdir -p "$DEBS" "$FS" "$IRFS"
 
-log "downloading linux-{image,modules}-$KVERSION + busybox-static debs (no sudo needed)"
+log "downloading linux-{image,modules}-$KVERSION + busybox-static + glibc/gcc runtime debs (no sudo needed)"
 # linux-image-*.deb ships only the bzImage; the .ko tree ships in
 # linux-modules-*.deb (the `image` deb Depends: on it at install
 # time). We need both because we have to cherry-pick 4 modules for
 # the initramfs.
+#
+# libc6 + libgcc-s1 + libgomp1 are pulled in for P10's umd smoke test
+# binary (`command_submission`, built by build-umd.sh). The initramfs
+# only needs the dynamic loader + glibc + gcc runtime so the binary
+# resolves at exec(); the rest of its deps (libcmocka / libbz2 / libz
+# / liburing / libzstd) live on the 9p share under guest/lib and are
+# resolved via LD_LIBRARY_PATH inside setup.sh. If P10 isn't being
+# exercised these debs cost ~6 MB extra in the cpio — small enough
+# that staging them unconditionally beats a config knob.
 (cd "$DEBS" && apt-get download \
     "linux-image-unsigned-$KVERSION" \
     "linux-modules-$KVERSION" \
-    "busybox-static" 2>/dev/null) || \
+    "busybox-static" \
+    "libc6" \
+    "libgcc-s1" \
+    "libgomp1" 2>/dev/null) || \
 (cd "$DEBS" && apt-get download \
     "linux-image-$KVERSION" \
     "linux-modules-$KVERSION" \
-    "busybox-static")
+    "busybox-static" \
+    "libc6" \
+    "libgcc-s1" \
+    "libgomp1")
 
 ls "$DEBS"/*.deb | while read -r d; do
     log "extract $(basename "$d")"
@@ -84,10 +99,48 @@ if [[ ! -x "$BUSYBOX" ]]; then
 fi
 
 log "building initramfs tree under $IRFS"
-mkdir -p "$IRFS"/{bin,sbin,proc,sys,dev,tmp,mnt/remu,etc,lib/modules/$KVERSION}
+mkdir -p "$IRFS"/{bin,sbin,proc,sys,dev,tmp,mnt/remu,etc,lib/modules/$KVERSION,lib64,lib/x86_64-linux-gnu,usr/lib/x86_64-linux-gnu,usr/lib64}
 
 cp "$BUSYBOX" "$IRFS/bin/busybox"
 chmod 0755 "$IRFS/bin/busybox"
+
+# glibc + libgcc-s1 + libgomp1 — the runtime + loader for P10's umd
+# smoke test binary. Two layout subtleties on Ubuntu jammy/noble:
+#   - The dynamic loader lives at /usr/lib64/ld-linux-x86-64.so.2 in
+#     the deb, but /lib64/ld-linux-x86-64.so.2 is the path baked into
+#     `ldd`'s output and into every dynamic ELF's INTERP. We mirror
+#     /usr/lib64 → /lib64 so the loader resolves either way.
+#   - libc itself is in /usr/lib/x86_64-linux-gnu in the deb; we also
+#     mirror that to /lib/x86_64-linux-gnu (the older "merged-/usr"
+#     layout some tooling still expects).
+# Falls back silently if any path is missing — not all Ubuntu releases
+# ship every multi-arch combination.
+log "staging glibc + libgcc-s1 + libgomp1 into initramfs"
+for src_dir in "$FS/usr/lib64" "$FS/lib64"; do
+    if [[ -d "$src_dir" ]]; then
+        cp -a "$src_dir/." "$IRFS/lib64/" 2>/dev/null || true
+    fi
+done
+for src_dir in "$FS/usr/lib/x86_64-linux-gnu" "$FS/lib/x86_64-linux-gnu"; do
+    if [[ -d "$src_dir" ]]; then
+        cp -a "$src_dir/." "$IRFS/lib/x86_64-linux-gnu/" 2>/dev/null || true
+        cp -a "$src_dir/." "$IRFS/usr/lib/x86_64-linux-gnu/" 2>/dev/null || true
+    fi
+done
+# `man ld.so` says the loader searches /lib + /lib64 + /usr/lib + the
+# trusted dirs from /etc/ld.so.cache before LD_LIBRARY_PATH. Without an
+# ld.so.cache (we don't run ldconfig in the initramfs) it falls back to
+# the hard-coded list, which includes /lib/x86_64-linux-gnu via DT_RPATH
+# on most distro libcs. Still, dropping a one-line ld.so.conf helps
+# diagnostic builds where someone strace's the loader.
+cat > "$IRFS/etc/ld.so.conf" <<'LDCONF'
+/lib/x86_64-linux-gnu
+/usr/lib/x86_64-linux-gnu
+/lib64
+LDCONF
+if [[ ! -e "$IRFS/lib64/ld-linux-x86-64.so.2" ]]; then
+    log "WARNING: no ld-linux-x86-64.so.2 staged — dynamic ELFs (umd binary) will NOT run"
+fi
 
 # Install busybox applets as symlinks. We query busybox itself for the
 # canonical list so we don't hardcode anything host-specific.
