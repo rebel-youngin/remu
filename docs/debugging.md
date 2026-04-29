@@ -304,10 +304,18 @@ the CA73 FreeRTOS build short-circuits the mailbox ISR to
 `default_cb` (CMake `FREERTOS_PORT != GCC_ARM_CA73` gate in
 `drivers/pcie/pcie_mailbox_callback.c`). The CM7 stub in
 `r100_cm7.c` catches `INTGR0 bit 0` and calls
-`r100_mailbox_cm7_stub_write_issr(pf_mailbox, 4, 0xFB0D)` directly,
+`r100_mailbox_cm7_stub_write_issr(pf_mailbox, 4, R100_FW_BOOT_DONE)`,
 which updates PF.ISSR[4] **and** emits the NPU→host issr frame so
-the BAR4 shadow converges. Other bits relay onto VF0.INTGR1 for
-CA73 ISR visibility. `pf-mailbox` link wired from `r100_soc.c`.
+the BAR4 shadow converges — but only **after** PF's
+`fw_boot_done_seen` latch has flipped (Side bug 2 fix). The latch
+is set the first time q-sys's own `bootdone_task` writes
+`0xFB0D` into PF.ISSR[4] from the NPU-MMIO source, so a
+SOFT_RESET arriving before q-sys has reached its cold-boot
+`main.c:250` DCS memset is silently dropped (LOG_TRACE) and the
+kmd parks on its own `readx_poll_timeout` for `val != 0` until
+the natural cold-boot publish arrives. Other bits relay onto
+VF0.INTGR1 for CA73 ISR visibility. `pf-mailbox` link wired
+from `r100_soc.c`.
 
 Verification on a settled `./remucli run --host`:
 
@@ -875,26 +883,15 @@ look like a `rebel_hw_init` lockup are not mis-attributed to the
 queue_init handshake (which the P10-fix shm cfg-shadow alias
 already resolved; see commit `d986302`).
 
-**Side bug 2 — intermittent `cfg-shadow` NULL-deref at boot
-(~30% of runs).** A subset of `--host` boots fault inside q-cp's
-`hil_init_descs` at `hil.c:519` dereferencing
-`dev_desc[func_id]->qd_addr_lo` (offset `+0x0c` of NULL). The
-direct-shm and HMP `xp` reads from `tests/p10_cfgshadow_probe.py`
-all show the kmd-published DDH at `0x80_04800000` *was* mirrored
-into the cfg-shadow file before the QUEUE_INIT doorbell — yet
-q-cp's `FUNC_READQ(PCIE_PF, DDH_BASE_LO)` returns 0 on the
-faulting run. The smell is a TCG TLB caching race: q-cp's MMU
-translation for `R100_DEVICE_COMM_SPACE_BASE` was filled before
-the `r100_cm7_init` MMIO subregion overlay landed, leaving the
-cached translation pointing at the underlying chiplet-0 DRAM
-zero-fill rather than the cfg-shadow alias. Worth checking with
-`-d in_asm,exec,page,mmu -singlestep` next time the run reproduces
-on the first try; until then, just retry the run. Recipe:
-
-```
-python3 tests/p10_cfgshadow_probe.py    # prints all three views
-                                        # of the DDH publish
-```
+**Side bug 2 — `cfg-shadow` NULL-deref (FIXED).** Was: ~30% of
+`--host` boots faulted inside q-cp's `hil_init_descs` at
+`hil.c:519` dereferencing `dev_desc[func_id]->qd_addr_lo` (offset
+`+0x0c` of NULL). The CM7-stub's unconditional `INTGR0 bit 0 →
+PF.ISSR[4]=0xFB0D` synthesis let kmd race ahead of q-sys's
+`main.c:250` DCS memset; see "Side bug 2 — `cfg-shadow`
+NULL-deref ~30% (FIXED)" further down for full root cause +
+fix. Recipe (`tests/p10_cfgshadow_probe.py`) is preserved as a
+plumbing sanity check.
 
 **Side bug 3 — KMD `readl_poll_timeout_atomic` argument unit
 mismatch.** `rebel.c:700` calls
@@ -1020,32 +1017,48 @@ it's structurally independent).** See item 1 above; fix is
 semantics (STOP-while-idle is silently absorbed). Independent
 of the SMMU question and kept regardless.
 
-**Side bug 2 update — `cfg-shadow` NULL-deref ~30%.** New
-candidate root cause that supersedes the TCG-TLB-caching theory:
-q-sys CP0's cold-boot main routine
-(`q/sys/.../osl/FreeRTOS/Source/main.c:250`) does
+**Side bug 2 — `cfg-shadow` NULL-deref ~30% (FIXED).** Diagnosis
+preserved as historical context; the fix narrowed the
+`r100-cm7` SOFT_RESET stub. Root cause: q-sys CP0's cold-boot
+main routine (`q/sys/.../osl/FreeRTOS/Source/main.c:250`) does
 `memset((void *)(FREERTOS_VA_OFFSET + DEVICE_COMMUNICATION_SPACE_BASE), 0, CP1_LOGBUF_MAGIC)`
 followed by a tail memset clearing `0x1018..0xFE000`, gated only
 on `pmu_get_chiplet_reset_flag(CHIPLET_ID) & PMU_CL_RST_MASK ==
 PMU_COLD_RESET`. The first memset covers offset 0..0x1040 of the
-DCS, which **includes `DDH_BASE_LO` at offset `0xC0`**. If the
-kmd happens to win the race and writes `DDH_BASE_LO/HI/SIZE`
-into the shared `cfg-shadow` shm *before* q-sys's memset runs,
-q-sys clobbers it back to zero, and the next QUEUE_INIT-driven
-`hil_init_descs` reads zero → NULL deref. Both processes
-`mmap MAP_SHARED` the same shm file with no ordering guarantee
-on which one wins, so this is racy by construction. The original
-TCG-TLB theory doesn't fit on its own (the cfg-mirror subregion
-is installed at machine-init before any vCPU runs, so TCG TLBs
-can't cache stale translations); the memset race fits all the
-observed symptoms. Verifying recipe: capture
-`/dev/shm/remu-<name>/remu-cfgshadow` mid-boot at three points
-(post-kmd-DDH-write, post-q-sys-memset, post-QUEUE_INIT) and
-diff. Fix landing point is debatable — the cleanest is probably
-a deferred-write path on the host side that holds the kmd's
-`DDH_BASE_LO` write until q-sys's memset has run, but that
-requires modelling more of the boot handshake. Tracked but
-unfixed.
+DCS, which **includes `DDH_BASE_LO` at offset `0xC0`**. The kmd's
+`rebel_hw_init(RBLN_RESET_FIRST)` flow rang `INTGR0 bit 0`
+SOFT_RESET, the CM7-stub *immediately* synthesised
+`PF.ISSR[4]=0xFB0D`, the kmd saw the synthetic FW_BOOT_DONE and
+proceeded to write `DDH_BASE_LO/HI/SIZE` into the shared
+`cfg-shadow` shm — and if q-sys hadn't yet reached its main.c:250
+memset (the kmd often won this race because its boot is much
+shorter than q-sys's BL1→BL2→BL31→FreeRTOS chain on TCG), q-sys
+later zeroed offsets 0..0x103F including `DDH_BASE_LO`, causing
+q-cp's `hil_init_descs` (`hil.c:519`) to NULL-deref. Both
+processes `mmap MAP_SHARED` the same shm file with no ordering
+guarantee on which one wins; the synthetic FW_BOOT_DONE was the
+ordering lie. (The original TCG-TLB theory was rejected: the
+cfg-mirror subregion is installed at machine-init before any
+vCPU runs, so TCG TLBs can't cache stale translations.)
+
+Fix: the CM7-stub's INTGR0-bit-0 synthesis is now gated on
+`r100_mailbox_fw_boot_done_seen(pf_mailbox)` — a one-shot latch
+on PF that flips the first time q-sys's `bootdone_task` writes
+`R100_FW_BOOT_DONE` into PF.ISSR[4] from the NPU-MMIO source.
+Pre-cold-boot SOFT_RESETs are dropped (logged at LOG_TRACE), so
+the kmd parks on its own `FW_BOOT_DONE` poll
+(`readx_poll_timeout` for `val != 0`) until q-sys publishes
+naturally over the existing `issr` chardev egress. q-sys's
+`bootdone_task` only runs after `cp_create_tasks()` returns
+inside `main()`, which sits below the memset on the source line
+ordering — therefore once kmd observes `0xFB0D`, the memset has
+provably already happened, and any subsequent kmd cfg writes
+land safely. Post-cold-boot SOFT_RESETs (driver re-bind /
+`rebel_hw_init` re-entry) find the latch already set and
+synthesise as before. Verification recipe stays the same:
+`tests/p10_cfgshadow_probe.py` was the diagnostic; pre-fix it
+hit the zero-clobber ~30% of runs, post-fix the three views
+agree on every iteration.
 
 ## Cleanup
 

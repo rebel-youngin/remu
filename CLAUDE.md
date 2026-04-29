@@ -66,7 +66,15 @@ frames (NPU → host). Cold-boot `FW_BOOT_DONE` is **real**: q-sys
 bit 0 (`SOFT_RESET`) triggers a narrow QEMU-side CM7-stub that
 *re-synthesises* `0xFB0D` on the kmd's post-probe soft-reset
 handshake, because REMU does not yet model a real CA73 cluster reset
-(`docs/roadmap.md` → P8). All `INTGR1` bits relay verbatim as SPI 185;
+(`docs/roadmap.md` → P8). The synthesis is gated on PF's
+`fw_boot_done_seen` one-shot latch (set by q-sys's own
+`bootdone_task` publish): pre-cold-boot SOFT_RESETs are dropped so
+the kmd parks on its FW_BOOT_DONE poll until q-sys's
+`bootdone_task` runs naturally — without this gate, kmd's
+`RBLN_RESET_FIRST` could race ahead of q-sys's `main.c:250` DCS
+memset and lose its `DDH_BASE_LO` write into the shared
+`cfg-shadow` shm (`docs/debugging.md` → Side bug 2 fix). All
+`INTGR1` bits relay verbatim as SPI 185;
 q-cp on CP0 owns every interesting bit (queue doorbells wake
 `hq_task → cb_task → cb_complete`; `QUEUE_INIT` bit 7 wakes
 `hq_init / rl_cq_init` to publish the QINIT descriptor and write back

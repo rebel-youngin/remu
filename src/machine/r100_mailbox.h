@@ -21,6 +21,19 @@
 
 #define TYPE_R100_MAILBOX       "r100-mailbox"
 
+/*
+ * FW_BOOT_DONE magic. q-sys CP0's bootdone_task writes this into
+ * PF.ISSR[4] from `bootdone_notify_to_host` once cold-boot reaches
+ * "all chiplets up" — see q/sys/osl/FreeRTOS/Source/services/
+ * bootdone_service/bootdone_service.c:67. Used here by:
+ *   - r100-mailbox: latch `fw_boot_done_seen` on the matching
+ *     NPU_MMIO write to ISSR[4], so callers can tell whether
+ *     q-sys's cold-boot main.c (incl. its DCS memset) has run.
+ *   - r100-cm7:     synthesise the post-soft-reset re-handshake
+ *     (write 0xFB0D back into PF.ISSR[4]) on INTGR0 bit 0.
+ */
+#define R100_FW_BOOT_DONE       0xFB0Du
+
 typedef struct R100MailboxState R100MailboxState;
 
 /*
@@ -75,5 +88,24 @@ uint32_t r100_mailbox_get_issr(R100MailboxState *s, uint32_t idx);
  */
 void r100_mailbox_set_issr_words(R100MailboxState *s, uint32_t idx,
                                  const uint32_t *vals, uint32_t count);
+
+/*
+ * Cold-boot publish observer. Returns true once an NPU-MMIO write of
+ * R100_FW_BOOT_DONE has hit ISSR[4] on this mailbox (the canonical
+ * q-sys `bootdone_task` handshake). One-shot latch: never clears
+ * after the first observation, including across kmd-driven
+ * `r100_mailbox_set_issr` clears of the same slot.
+ *
+ * Used by r100-cm7 to gate the post-soft-reset FW_BOOT_DONE
+ * re-synthesis: kmd's RBLN_RESET_FIRST flow rings INTGR0 bit 0
+ * before q-sys has reached its cold-boot `main.c:250` DCS memset, so
+ * answering with a fake `0xFB0D` immediately makes the kmd race
+ * ahead and write `DDH_BASE_LO` into the shared `cfg-shadow` shm
+ * just before q-sys's memset zeroes offsets 0..0x103F. Holding the
+ * synthesis until the natural cold-boot publish has happened forces
+ * the kmd's cfg writes to be causally ordered after the memset.
+ * See `docs/debugging.md` → Side bug 2.
+ */
+bool r100_mailbox_fw_boot_done_seen(R100MailboxState *s);
 
 #endif /* R100_MAILBOX_H */

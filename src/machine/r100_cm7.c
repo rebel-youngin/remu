@@ -16,8 +16,13 @@
  *     0x08 INTGR0   — M8b 3a CM7 stub: SOFT_RESET bit 0 synthesises
  *                     FW_BOOT_DONE into PF.ISSR[4] for kmd's
  *                     post-probe re-handshake (cold boot is real,
- *                     see docs/debugging.md). Other bits relay to
- *                     VF0.INTGR1 for parity with silicon.
+ *                     see docs/debugging.md). Gated on the
+ *                     `fw_boot_done_seen` latch on PF (set by q-sys's
+ *                     own `bootdone_task` write); pre-cold-boot
+ *                     SOFT_RESETs are dropped so the kmd parks on
+ *                     its FW_BOOT_DONE poll until q-sys's main.c:250
+ *                     DCS memset has run — Side bug 2 fix. Other
+ *                     bits relay to VF0.INTGR1 for parity with silicon.
  *     0x1c INTGR1   — M6 host→NPU IRQ (r100_mailbox_raise_intgr →
  *                     SPI 185). Raised verbatim — q-cp on CA73 CP0
  *                     wakes hq_task on the queue-doorbell bits and
@@ -69,10 +74,8 @@
 
 OBJECT_DECLARE_SIMPLE_TYPE(R100Cm7State, R100_CM7)
 
-/* FW_BOOT_DONE value written into PF.ISSR[4] by the CM7 stub on
- * SOFT_RESET (M8b 3a re-handshake; cold boot travels the real path
- * via q-sys' bootdone_task). */
-#define REMU_FW_BOOT_DONE 0xFB0D
+/* FW_BOOT_DONE magic now lives in r100_mailbox.h (R100_FW_BOOT_DONE) —
+ * shared with the mailbox's `fw_boot_done_seen` latch. */
 
 struct R100Cm7State {
     SysBusDevice parent_obj;
@@ -163,13 +166,39 @@ static void r100_cm7_deliver(R100Cm7State *s, uint32_t off, uint32_t val)
          * model that (see docs/roadmap.md → P8), so we synthesise only
          * the observable endpoint. Running firmware is undisturbed.
          *
+         * Side bug 2 fix: the synthesis is gated on PF's
+         * `fw_boot_done_seen` latch (set the first time q-sys's
+         * `bootdone_task` writes 0xFB0D into PF.ISSR[4] from the
+         * NPU-MMIO source). Without the gate, kmd's RBLN_RESET_FIRST
+         * SOFT_RESET on early probe can race ahead of q-sys's
+         * `main.c:250` DCS memset — kmd sees the synthetic 0xFB0D,
+         * writes DDH_BASE_LO into the shared cfg-shadow shm, and q-sys
+         * later zeroes offsets 0..0x103F (incl. DDH_BASE_LO at 0xC0),
+         * causing q-cp's `hil_init_descs` to NULL-deref ~30% of runs.
+         * With the gate, a pre-cold-boot SOFT_RESET is silently
+         * dropped; the kmd parks on its own FW_BOOT_DONE poll
+         * (`readx_poll_timeout` for `val != 0`) until q-sys publishes
+         * naturally over the existing `issr` chardev egress, which is
+         * provably after the memset (bootdone_task only runs after
+         * `cp_create_tasks()` returns inside main()). All subsequent
+         * SOFT_RESETs find the latch already set and synthesise as
+         * before.
+         *
          * Other INTGR0 bits fall through to VF0.INTGR1 so q-sys'
          * IDX_MAILBOX_PCIE_VF0 default_cb sees them (no-op today,
          * kept for parity + future subscribers).
          */
-        if ((val & 0x1U) && s->pf_mailbox) {
-            r100_mailbox_cm7_stub_write_issr(s->pf_mailbox, 4,
-                                             REMU_FW_BOOT_DONE);
+        if (val & 0x1U) {
+            if (r100_mailbox_fw_boot_done_seen(s->pf_mailbox)) {
+                r100_mailbox_cm7_stub_write_issr(s->pf_mailbox, 4,
+                                                 R100_FW_BOOT_DONE);
+            } else {
+                qemu_log_mask(LOG_TRACE,
+                              "r100-cm7: SOFT_RESET dropped — q-sys "
+                              "cold-boot FW_BOOT_DONE not yet observed; "
+                              "kmd will park on PF.ISSR[4] poll until "
+                              "the natural publish arrives\n");
+            }
         }
         if (val & ~0x1U) {
             r100_mailbox_raise_intgr(s->mailbox, 1, val & ~0x1U);

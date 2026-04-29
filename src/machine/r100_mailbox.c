@@ -19,6 +19,15 @@
  * host BAR4 shadow stays in sync. Host→NPU ISSR (via
  * r100_mailbox_set_issr) does NOT re-emit — would loop the write back.
  *
+ * Side bug 2 fix: the issr_store funnel also latches a one-shot
+ * `fw_boot_done_seen` flag the first time q-sys writes
+ * R100_FW_BOOT_DONE (= 0xFB0D) into ISSR[4] from the NPU_MMIO source.
+ * r100-cm7 reads the flag via r100_mailbox_fw_boot_done_seen() to
+ * decide whether to synthesise a post-soft-reset re-handshake; until
+ * the real cold-boot publish has happened, the synthesis is held so
+ * the kmd's cfg writes can't race ahead of q-sys's main.c:250 DCS
+ * memset. See `docs/debugging.md` → Side bug 2.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -94,6 +103,14 @@ struct R100MailboxState {
     uint64_t issr_egress_frames;    /* emitted to host (MMIO writes) */
     uint64_t issr_egress_dropped;   /* short write / backend gone */
     uint64_t issr_ingress_writes;   /* set via r100_mailbox_set_issr */
+
+    /* One-shot latch: set when an NPU_MMIO write of R100_FW_BOOT_DONE
+     * lands on ISSR[4]. r100-cm7 polls this to gate its post-soft-
+     * reset FW_BOOT_DONE re-synthesis (Side bug 2 fix). Stays set for
+     * the life of the boot — kmd's HOST_RELAY clears of ISSR[4] do
+     * not flip it back. Reset to false on machine cold reset; carried
+     * across vmstate snapshots. */
+    bool fw_boot_done_seen;
 };
 
 DECLARE_INSTANCE_CHECKER(R100MailboxState, R100_MAILBOX, TYPE_R100_MAILBOX)
@@ -200,6 +217,14 @@ static void r100_mailbox_issr_emit(R100MailboxState *s, uint32_t idx,
  * backing store, bumps the matching observability counter, and emits
  * on the egress chardev iff the source says the host needs to see it.
  * Out-of-range idx is a no-op (matches silicon RAZ/WI for reserved).
+ *
+ * Side bug 2 latch: if this is q-sys's `bootdone_task` writing
+ * R100_FW_BOOT_DONE into ISSR[4] (NPU_MMIO source — the only origin
+ * for that store on a real cold boot; CM7_STUB is REMU's
+ * post-soft-reset shortcut and doesn't count), set the one-shot
+ * `fw_boot_done_seen` flag. r100-cm7 reads it to decide whether to
+ * answer SOFT_RESET with a synthetic handshake (see
+ * r100_mailbox_fw_boot_done_seen + r100_cm7.c).
  */
 static void r100_mailbox_issr_store(R100MailboxState *s, uint32_t idx,
                                     uint32_t val, MbxIssrSrc src)
@@ -210,6 +235,9 @@ static void r100_mailbox_issr_store(R100MailboxState *s, uint32_t idx,
     s->issr[idx] = val;
     if (src == MBX_ISSR_SRC_HOST_RELAY) {
         s->issr_ingress_writes++;
+    }
+    if (src == MBX_ISSR_SRC_NPU_MMIO && idx == 4 && val == R100_FW_BOOT_DONE) {
+        s->fw_boot_done_seen = true;
     }
     if (r100_mailbox_issr_src_emits(src)) {
         r100_mailbox_issr_emit(s, idx, val);
@@ -233,6 +261,17 @@ uint32_t r100_mailbox_get_issr(R100MailboxState *s, uint32_t idx)
         return 0;
     }
     return s->issr[idx];
+}
+
+/*
+ * One-shot latch set by issr_store on the first NPU_MMIO write of
+ * R100_FW_BOOT_DONE to ISSR[4] (q-sys's `bootdone_task` publish).
+ * NULL-safe so callers can wire `pf-mailbox` lazily without a
+ * separate guard. See header comment + Side bug 2 in docs/debugging.md.
+ */
+bool r100_mailbox_fw_boot_done_seen(R100MailboxState *s)
+{
+    return s != NULL && s->fw_boot_done_seen;
 }
 
 /*
@@ -427,13 +466,15 @@ static void r100_mailbox_reset(DeviceState *dev)
     s->is_version = 0;
     memset(s->issr, 0, sizeof(s->issr));
     /* intgr_writes / issr counters kept across reset for test inspection. */
+    /* Side bug 2 latch: clear so a fresh cold boot has to re-publish. */
+    s->fw_boot_done_seen = false;
     r100_mailbox_update_irq(s, 0);
     r100_mailbox_update_irq(s, 1);
 }
 
 static const VMStateDescription r100_mailbox_vmstate = {
     .name = "r100-mailbox",
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
     .fields = (VMStateField[]) {
         VMSTATE_UINT32(mcuctrl, R100MailboxState),
@@ -446,6 +487,7 @@ static const VMStateDescription r100_mailbox_vmstate = {
         VMSTATE_UINT64_V(issr_egress_frames, R100MailboxState, 2),
         VMSTATE_UINT64_V(issr_egress_dropped, R100MailboxState, 2),
         VMSTATE_UINT64_V(issr_ingress_writes, R100MailboxState, 2),
+        VMSTATE_BOOL_V(fw_boot_done_seen, R100MailboxState, 3),
         VMSTATE_END_OF_LIST()
     },
 };
