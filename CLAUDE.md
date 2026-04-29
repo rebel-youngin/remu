@@ -412,6 +412,37 @@ LINEAR for ≤32 SIDs), stage-1 walk, multi-VF, chiplet-0 PCIe-side
 TBU SID 17, dedicated HDMA-PA SID 16. **Done in v2:** eventq /
 GERROR fault delivery (this commit).
 
+**Debug surface.** Optional `debug-chardev` property on `r100-smmu`
+(wired to chiplet 0 only — same single-frontend reasoning as
+`rbdma-debug` / `hdma-debug`); plumbed through
+`-machine r100-soc,smmu-debug=<id>` and the CLI's `--host` mode
+auto-creates `output/<name>/smmu.log`. Always-on once the file is
+opened (no `-d`/`--trace` dependency); silent when not wired so
+single-QEMU NPU smoke runs pay nothing. Format mirrors `rbdma.log` /
+`hdma.log` — one line per significant event:
+
+```
+smmu cl=0 CR0 0x0→0x4 smmuen=0→0 eventqen=0→1 cmdqen=0→0
+smmu cl=0 STRTAB_BASE base_pa=0x14000000 log2size=5 fmt=LINEAR n_sids=32
+smmu cl=0 cmdq idx=0 op=0x04 CFGI_STE_RANGE cmd[0]=0x4 cmd[1]=0x5
+smmu cl=0 xlate_in sid=0 ssid=0 dva=0x100000000 rd cr0_smmuen=1 strtab_base_pa=0x14000000
+smmu cl=0 ste sid=0 v=1 cfg=ALL_TRANS s2t0sz=25 s2sl0=1 s2tg=0 s2ps=5 s2aa64=1 s2affd=1 s2r=0 vmid=0 s2ttb=0x6000000
+smmu cl=0 ptw sid=0 dva=0x100000000 vttb=0x6000000 tsz=25 sl0=1 gran=12 eff_ps=48 perm=rd
+smmu cl=0 xlate_out sid=0 dva=0x100000000 ok pa=0x7000000 page_base=0x7000000 mask=0xfff
+```
+
+Companion offline tools under `tests/scripts/`:
+- `mem_dump.py` — generic shm-backed memory dumper (region-agnostic
+  across `remu-shm` / `host-ram` / `cfg-shadow`; hex / u32 / u64 /
+  raw output; PROT_READ). Useful for any debug session — BD
+  descriptors, queue_descs, command buffers, RBDMA OTO src/dst,
+  stream-tables, page tables, q-cp's stack/heap.
+- `smmu_decode.py` — pure-Python SMMU-v3.2 byte decoder (STE, stage-2
+  PTE, 3-level stage-2 walk against a live `remu-shm`). Pairs with
+  `mem_dump.py --format raw --output …` to decode bytes pulled from
+  any address the `smmu.log` trace points to. See
+  `docs/debugging.md` → "SMMU debug surface" for the full loop.
+
 `r100-pcie-outbound` keeps its `host-ram` alias (P10-fix); it does
 not currently go through this walker. `r100-dnc-cluster` cmd_descr
 fields stay untranslated until P6 surfaces a workload.
@@ -659,7 +690,15 @@ src/bridge/           Added to -I during QEMU configure — cross-side shared he
                       and NPU-side (arm_ss) TUs pick up the same definitions
                       without introducing a shared object.
 cli/remu_cli.py       Click-based CLI implementation
-tests/                Test binaries and test scripts
+tests/                Test binaries and end-to-end Python tests
+                        scripts/
+                          gdb_inspect_cp1.gdb  CP1 vCPU sweep (frame 0 + ELR_EL3)
+                          mem_dump.py          Generic shm-backed memory dumper
+                                               (remu-shm / host-ram / cfg-shadow,
+                                               hex / u32 / u64 / raw); PROT_READ
+                          smmu_decode.py       Offline SMMU-v3.2 decoder
+                                               (STE, stage-2 PTE, 3-level walk
+                                               against a live remu-shm)
 docs/                 Architecture, roadmap, debugging
 external/             Read-only: ssw-bundle (q-sys, q-cp, kmd, umd, ...), qemu
 guest/                M8b Stage 2 virtio-9p share (rebellions.ko / rblnfs.ko gitignored)

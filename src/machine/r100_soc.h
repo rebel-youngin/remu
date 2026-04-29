@@ -139,6 +139,19 @@ struct R100SoCMachineState {
      * machine init completes). */
     DeviceState *smmu_dev[R100_NUM_CHIPLETS];
 
+    /* `-machine r100-soc,smmu-debug=<chardev-id>` : optional ASCII
+     * trace tail wired to chiplet 0's r100-smmu only (CharBackend is
+     * single-frontend; chiplets 1..3 are untouched today since q-cp
+     * only programs the chiplet-0 SMMU on the BD lifecycle path).
+     * One line per translate / STE decode / PT-walk dispatch / CMDQ
+     * op / eventq emit / GERROR raise. Always-on (no -d / --trace
+     * dependency). Used by P10 / P11 SMMU post-mortems and the
+     * `tests/scripts/smmu_inspect.py` companion script. Mirror of
+     * rbdma_debug_chardev_id but for the SMMU TCU. If a future
+     * workload exercises the SMMU on chiplet N>0, split the prop
+     * into `smmu-debug-cl<N>` and create one chardev per chiplet. */
+    char *smmu_debug_chardev_id;
+
     /* `-machine r100-soc,rbdma-debug=<chardev-id>` : optional ASCII
      * trace tail wired to chiplet 0's r100-rbdma only (CharBackend is
      * single-frontend; chiplets 1..3 don't share — their RBDMAs are

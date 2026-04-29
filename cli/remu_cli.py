@@ -569,6 +569,7 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
                    issr_sock=None, issr_log=None,
                    hdma_sock=None, hdma_log=None,
                    rbdma_log=None,
+                   smmu_log=None,
                    ):
     """Assemble the aarch64 QEMU cmdline for the R100 NPU side.
     Matches the previous in-line flow exactly; extracted so that
@@ -674,6 +675,8 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
             machine_opt += ",hdma-debug=hdma_dbg"
     if rbdma_log is not None:
         machine_opt += ",rbdma-debug=rbdma_dbg"
+    if smmu_log is not None:
+        machine_opt += ",smmu-debug=smmu_dbg"
 
     cmd = [
         str(QEMU_BIN),
@@ -748,6 +751,16 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
         cmd += [
             "-chardev",
             "file,id=rbdma_dbg,path=%s,mux=off" % rbdma_log,
+        ]
+    if smmu_log is not None:
+        # P11/P10 SMMU post-mortem aid. Wired to chiplet 0's r100-smmu
+        # only (CharBackend is single-frontend; q-cp only programs the
+        # chiplet-0 SMMU on the BD lifecycle path). Always-on once the
+        # file is opened — the device's emit short-circuits when the
+        # backend isn't connected.
+        cmd += [
+            "-chardev",
+            "file,id=smmu_dbg,path=%s,mux=off" % smmu_log,
         ]
     click.echo("  Chiplet 0 UART -> stdio (log: %s)" % uart0_log)
 
@@ -1737,6 +1750,9 @@ def run(name, output_root, gdb, trace, chiplets, memory,
       msix.log           ASCII tail of MSI-X frames emitted by NPU (M7)
       issr.log           ASCII tail of ISSR frames emitted by NPU (M8)
       hdma.log           ASCII tail of hdma frames (both directions, M8b 3b/3c)
+      rbdma.log          ASCII tail of chiplet-0 r100-rbdma kicks / completes
+      smmu.log           ASCII tail of chiplet-0 r100-smmu translates / faults
+                         (pairs with tests/scripts/{mem_dump,smmu_decode}.py)
       shm/cfg-shadow     P10-fix shared 4 KB cfg-head backend (host BAR2
                          cfg-head trap aliases this; NPU r100-cm7 cfg-mirror
                          trap aliases the same file — kmd writes are visible
@@ -1773,6 +1789,7 @@ def run(name, output_root, gdb, trace, chiplets, memory,
     hdma_sock = None
     hdma_log = None
     rbdma_log = None
+    smmu_log = None
     if with_host:
         npu_dir = run_dir / "npu"
         npu_dir.mkdir(exist_ok=True)
@@ -1808,6 +1825,13 @@ def run(name, output_root, gdb, trace, chiplets, memory,
         # qemu_log_mask(LOG_TRACE, ...) lines + --trace cover the
         # standalone-NPU debug surface.
         rbdma_log = run_dir / "rbdma.log"
+        # smmu.log is the P11 / P10 SMMU post-mortem aid — every
+        # translate / STE decode / PT-walk dispatch / CMDQ op /
+        # eventq emit / GERROR raise on chiplet 0 lands here as one
+        # ASCII line. Pairs with `tests/scripts/mem_dump.py` +
+        # `tests/scripts/smmu_decode.py` for offline decode of the
+        # actual STE / PT bytes from the shm splice.
+        smmu_log = run_dir / "smmu.log"
 
     npu_cmd, found = _build_npu_cmd(run_dir, gdb, trace,
                                     with_host=with_host,
@@ -1820,7 +1844,8 @@ def run(name, output_root, gdb, trace, chiplets, memory,
                                     issr_log=issr_log,
                                     hdma_sock=hdma_sock,
                                     hdma_log=hdma_log,
-                                    rbdma_log=rbdma_log)
+                                    rbdma_log=rbdma_log,
+                                    smmu_log=smmu_log)
 
     if found == 0:
         click.secho("Warning: no firmware images in %s/" % IMAGES_DIR,

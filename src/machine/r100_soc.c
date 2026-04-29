@@ -300,7 +300,8 @@ static void r100_create_pvt_blocks(MemoryRegion *cfg_mr, int chiplet_id)
  * can resolve their `smmu` QOM link to this chiplet's TCU at
  * machine-realize time. Full lifecycle details in r100_smmu.c. */
 static DeviceState *r100_create_smmu(MemoryRegion *cfg_mr, int chiplet_id,
-                                     DeviceState *gic_dev)
+                                     DeviceState *gic_dev,
+                                     Chardev *debug_chr)
 {
     DeviceState *dev;
     SysBusDevice *sbd;
@@ -308,6 +309,15 @@ static DeviceState *r100_create_smmu(MemoryRegion *cfg_mr, int chiplet_id,
 
     dev = qdev_new(TYPE_R100_SMMU);
     qdev_prop_set_uint32(dev, "chiplet-id", chiplet_id);
+    /* Optional debug-tail chardev. The CharBackend is single-frontend,
+     * and the only SMMU q-cp programs end-to-end today is the chiplet-0
+     * one, so the caller passes non-NULL only for chiplet_id == 0.
+     * NULL is harmless — emit_debug short-circuits on
+     * `qemu_chr_fe_backend_connected`. Mirror of the rbdma-debug
+     * wiring above. */
+    if (debug_chr) {
+        qdev_prop_set_chr(dev, "debug-chardev", debug_chr);
+    }
     sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
     memory_region_add_subregion(cfg_mr, offset, sysbus_mmio_get_region(sbd, 0));
@@ -623,9 +633,23 @@ static void r100_chiplet_init(MachineState *machine, int chiplet_id,
     r100_create_hbm(cfg_mr, chiplet_id);
     /* P11: stash the SMMU device so engine wiring later in this
      * function (and the chiplet-0 HDMA wiring in r100_machine_realize)
-     * can resolve their `smmu` QOM link. */
-    R100_SOC_MACHINE(machine)->smmu_dev[chiplet_id] =
-        r100_create_smmu(cfg_mr, chiplet_id, gic_dev);
+     * can resolve their `smmu` QOM link. The optional `smmu-debug`
+     * chardev attaches to chiplet 0 only — same single-frontend
+     * reasoning as `rbdma-debug` above. NULL on chiplets 1..3 so the
+     * trace tail isn't accidentally fanned across multiple SMMU
+     * instances (would corrupt the file chardev's serialised stream). */
+    {
+        R100SoCMachineState *r100m_local = R100_SOC_MACHINE(machine);
+        Chardev *smmu_dbg = NULL;
+
+        if (chiplet_id == 0) {
+            smmu_dbg = r100_soc_resolve_chr(
+                          r100m_local->smmu_debug_chardev_id,
+                          "smmu debug");
+        }
+        r100m_local->smmu_dev[chiplet_id] =
+            r100_create_smmu(cfg_mr, chiplet_id, gic_dev, smmu_dbg);
+    }
     r100_create_pvt_blocks(cfg_mr, chiplet_id);
     r100_create_dma_pl330(cfg_mr, chiplet_id);
     r100_create_qspi_bridge(cfg_mr, chiplet_id);
@@ -1442,6 +1466,7 @@ R100_SOC_DEF_STRPROP(issr_debug,     issr_debug_chardev_id)
 R100_SOC_DEF_STRPROP(hdma,           hdma_chardev_id)
 R100_SOC_DEF_STRPROP(hdma_debug,     hdma_debug_chardev_id)
 R100_SOC_DEF_STRPROP(rbdma_debug,    rbdma_debug_chardev_id)
+R100_SOC_DEF_STRPROP(smmu_debug,     smmu_debug_chardev_id)
 
 #undef R100_SOC_DEF_STRPROP
 
@@ -1504,6 +1529,13 @@ static const R100SoCStrProp r100_soc_str_props[] = {
         "P10's cb lifecycle runs entirely on chiplet 0). Always-on (no "
         "--trace required), one line per task lifecycle step. P10 "
         "post-mortem aid."),
+    R100_SOC_STR_PROP("smmu-debug", smmu_debug, smmu_debug_chardev_id,
+        "chardev id for an ASCII trace of every SMMU translate / STE "
+        "decode / PT-walk dispatch / CMDQ op / eventq emit / GERROR "
+        "raise, wired to chiplet 0's r100-smmu only. Always-on (no "
+        "--trace required). P10/P11 SMMU post-mortem aid; pairs with "
+        "tests/scripts/smmu_inspect.py for offline decode of STE + "
+        "page-table contents."),
 };
 
 #undef R100_SOC_STR_PROP

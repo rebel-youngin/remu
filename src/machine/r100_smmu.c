@@ -115,6 +115,8 @@
 #include "hw/irq.h"
 #include "hw/sysbus.h"
 #include "hw/qdev-properties.h"
+#include "hw/qdev-properties-system.h"  /* DEFINE_PROP_CHR */
+#include "chardev/char-fe.h"
 #include "exec/cpu-common.h"
 #include "exec/address-spaces.h"
 #include "hw/arm/smmu-common.h"
@@ -185,6 +187,27 @@ struct R100SMMUState {
     uint64_t events_emitted;
     uint64_t events_dropped;    /* eventq full or disabled */
     uint64_t gerror_raised;
+
+    /* Translate / CMDQ counters survive reset too. They make a single
+     * `info qtree` enough to answer "did the SMMU do anything during
+     * this run?" without having to grep the smmu-debug tail. */
+    uint64_t translates_total;
+    uint64_t translates_bypass; /* CR0.SMMUEN=0 or STE BYPASS / S1_TRANS */
+    uint64_t translates_ok;     /* stage-2 walked, no fault */
+    uint64_t translates_fault;
+    uint64_t cmdq_processed;    /* entries we actually walked past */
+
+    /* Optional debug-tail chardev. Mirrors the rbdma_debug_chr +
+     * hdma_debug_chr pattern: when wired, every interesting SMMU
+     * event (translate entry/exit, STE decode, PT-walk dispatch, CR0
+     * / STRTAB / EVENTQ / CMDQ programming, CMDQ command, eventq
+     * emit, GERROR raise) emits a single ASCII line to it. Always-on
+     * once the chardev is wired (no -d / --trace dependency); empty
+     * when not wired so single-QEMU NPU smoke runs pay nothing. The
+     * stream is bounded by the number of translates a workload
+     * issues, so a typical P10 cb pair (3-4 LL elements) produces
+     * ~30 lines — fine to commit to a file chardev. */
+    CharBackend smmu_debug_chr;
 };
 
 DECLARE_INSTANCE_CHECKER(R100SMMUState, R100_SMMU, TYPE_R100_SMMU)
@@ -329,6 +352,51 @@ DECLARE_INSTANCE_CHECKER(R100SMMUState, R100_SMMU, TYPE_R100_SMMU)
 #define R100_STE2_S2R                  BIT_ULL(58)
 
 /* ------------------------------------------------------------------ */
+/* Debug-tail helper                                                   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * One ASCII line per significant SMMU event when the `debug-chardev`
+ * property is wired. Same shape as rbdma's `r100_rbdma_emit_debug` /
+ * hdma's `r100_hdma_emit_trace` — bounded throughput (one line per
+ * translate / STE decode / PT-walk / queue op / fault), no `-d` /
+ * `--trace` dependency, silent when the backend isn't connected.
+ *
+ * The traced events are deliberately the same set the existing
+ * `qemu_log_mask(LOG_TRACE, ...)` paths cover, so users who already
+ * have a `--trace`-style workflow get nothing new but a *separate*
+ * stream pointed at one device. Anything that LOG_GUEST_ERRORs (fault
+ * fallthrough, eventq overflow drop) ALSO emits here so the debug
+ * tail is self-contained.
+ *
+ * Format:
+ *   smmu cl=<id> <event> <key=value>...
+ * matching the rbdma / hdma tails so a single grep across all
+ * `*.log`s under `output/<run>/` finds related events on the same
+ * BD lifecycle.
+ */
+static void r100_smmu_emit_debug(R100SMMUState *s, const char *fmt, ...)
+    G_GNUC_PRINTF(2, 3);
+
+static void r100_smmu_emit_debug(R100SMMUState *s, const char *fmt, ...)
+{
+    char line[256];
+    int n;
+    va_list ap;
+
+    if (!qemu_chr_fe_backend_connected(&s->smmu_debug_chr)) {
+        return;
+    }
+    va_start(ap, fmt);
+    n = vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        qemu_chr_fe_write(&s->smmu_debug_chr, (const uint8_t *)line,
+                          MIN((size_t)n, sizeof(line) - 1));
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* MMIO write back-ends                                                */
 /* ------------------------------------------------------------------ */
 
@@ -340,6 +408,11 @@ static void r100_smmu_update_cmdq_base(R100SMMUState *s)
 
     s->cmdq_base_pa = val & SMMU_Q_BASE_ADDR_MASK;
     s->cmdq_log2size = val & SMMU_Q_LOG2SIZE_MASK;
+    r100_smmu_emit_debug(s,
+                         "smmu cl=%u CMDQ_BASE base_pa=0x%" PRIx64
+                         " log2size=%u\n",
+                         s->chiplet_id, s->cmdq_base_pa,
+                         s->cmdq_log2size);
 }
 
 /*
@@ -370,6 +443,11 @@ static void r100_smmu_update_eventq_base(R100SMMUState *s)
                   "r100-smmu cl=%u EVENTQ updated base_pa=0x%" PRIx64
                   " log2size=%u\n",
                   s->chiplet_id, s->eventq_base_pa, s->eventq_log2size);
+    r100_smmu_emit_debug(s,
+                         "smmu cl=%u EVENTQ_BASE base_pa=0x%" PRIx64
+                         " log2size=%u\n",
+                         s->chiplet_id, s->eventq_base_pa,
+                         s->eventq_log2size);
 }
 
 /* ------------------------------------------------------------------ */
@@ -415,6 +493,15 @@ static void r100_smmu_raise_gerror(R100SMMUState *s, uint32_t bits)
                   s->chiplet_id, bits, s->regs[SMMU_GERROR >> 2], ackn,
                   !!(s->regs[SMMU_IRQ_CTRL >> 2] &
                      SMMU_IRQ_CTRL_GERROR_IRQEN));
+    r100_smmu_emit_debug(s,
+                         "smmu cl=%u GERROR raise bits=0x%x"
+                         " gerror=0x%x gerrorn=0x%x irqen=%d total=%"
+                         PRIu64 "\n",
+                         s->chiplet_id, bits,
+                         s->regs[SMMU_GERROR >> 2], ackn,
+                         !!(s->regs[SMMU_IRQ_CTRL >> 2] &
+                            SMMU_IRQ_CTRL_GERROR_IRQEN),
+                         s->gerror_raised);
 
     if ((s->regs[SMMU_IRQ_CTRL >> 2] & SMMU_IRQ_CTRL_GERROR_IRQEN) &&
         s->gerr_irq) {
@@ -460,6 +547,12 @@ static void r100_smmu_emit_event(R100SMMUState *s, uint8_t type,
                       "r100-smmu cl=%u event dropped (eventq disabled)"
                       " type=0x%02x sid=%u input_addr=0x%" PRIx64 "\n",
                       s->chiplet_id, type, sid, (uint64_t)input_addr);
+        r100_smmu_emit_debug(s,
+                             "smmu cl=%u eventq_drop reason=disabled"
+                             " type=0x%02x sid=%u input_addr=0x%"
+                             PRIx64 " dropped_total=%" PRIu64 "\n",
+                             s->chiplet_id, type, sid,
+                             (uint64_t)input_addr, s->events_dropped);
         return;
     }
 
@@ -477,6 +570,14 @@ static void r100_smmu_emit_event(R100SMMUState *s, uint8_t type,
                       "r100-smmu cl=%u event dropped (eventq full)"
                       " type=0x%02x sid=%u input_addr=0x%" PRIx64 "\n",
                       s->chiplet_id, type, sid, (uint64_t)input_addr);
+        r100_smmu_emit_debug(s,
+                             "smmu cl=%u eventq_drop reason=full"
+                             " type=0x%02x sid=%u input_addr=0x%"
+                             PRIx64 " prod=0x%x cons=0x%x"
+                             " dropped_total=%" PRIu64 "\n",
+                             s->chiplet_id, type, sid,
+                             (uint64_t)input_addr, prod, cons,
+                             s->events_dropped);
         return;
     }
 
@@ -509,6 +610,18 @@ static void r100_smmu_emit_event(R100SMMUState *s, uint8_t type,
                   (uint64_t)entry_pa, prod, next_prod, cons,
                   !!(s->regs[SMMU_IRQ_CTRL >> 2] &
                      SMMU_IRQ_CTRL_EVENTQ_IRQEN));
+    r100_smmu_emit_debug(s,
+                         "smmu cl=%u eventq_emit type=0x%02x sid=%u"
+                         " input_addr=0x%" PRIx64 " idx=%u"
+                         " entry_pa=0x%" PRIx64 " prod=0x%x→0x%x"
+                         " cons=0x%x irqen=%d emitted_total=%" PRIu64
+                         "\n",
+                         s->chiplet_id, type, sid,
+                         (uint64_t)input_addr, idx,
+                         (uint64_t)entry_pa, prod, next_prod, cons,
+                         !!(s->regs[SMMU_IRQ_CTRL >> 2] &
+                            SMMU_IRQ_CTRL_EVENTQ_IRQEN),
+                         s->events_emitted);
 
     if ((s->regs[SMMU_IRQ_CTRL >> 2] & SMMU_IRQ_CTRL_EVENTQ_IRQEN) &&
         s->evt_irq) {
@@ -563,6 +676,15 @@ static void r100_smmu_update_strtab(R100SMMUState *s)
                   " log2size=%u fmt=%u\n",
                   s->chiplet_id, s->strtab_base_pa,
                   s->strtab_log2size, s->strtab_fmt);
+    r100_smmu_emit_debug(s,
+                         "smmu cl=%u STRTAB_BASE base_pa=0x%" PRIx64
+                         " log2size=%u fmt=%s n_sids=%u\n",
+                         s->chiplet_id, s->strtab_base_pa,
+                         s->strtab_log2size,
+                         s->strtab_fmt == SMMU_STRTAB_FMT_LINEAR
+                            ? "LINEAR" : "2LVL",
+                         s->strtab_log2size > 0
+                            ? (1u << s->strtab_log2size) : 0u);
 }
 
 /*
@@ -636,6 +758,13 @@ static void r100_smmu_process_cmdq(R100SMMUState *s, uint32_t old_cons,
                           "cmd[1]=0x%" PRIx64 "\n",
                           s->chiplet_id, idx, (unsigned)opcode,
                           r100_smmu_cmd_str(opcode), cmd[1]);
+            r100_smmu_emit_debug(s,
+                                 "smmu cl=%u cmdq idx=%u op=0x%02x %s"
+                                 " cmd[0]=0x%" PRIx64 " cmd[1]=0x%"
+                                 PRIx64 "\n",
+                                 s->chiplet_id, idx, (unsigned)opcode,
+                                 r100_smmu_cmd_str(opcode), cmd[0],
+                                 cmd[1]);
 
             if (opcode == SMMU_CMD_SYNC &&
                 (cmd[0] & SMMU_SYNC_CS_MASK) == SMMU_SYNC_CS_SIG_IRQ) {
@@ -654,6 +783,7 @@ static void r100_smmu_process_cmdq(R100SMMUState *s, uint32_t old_cons,
         } else {
             cons = (cons & ~idx_mask) | idx;
         }
+        s->cmdq_processed++;
     }
 
     s->regs[SMMU_CMDQ_CONS >> 2] = cons;
@@ -814,6 +944,19 @@ const char *r100_smmu_fault_str(R100SMMUFault f)
     return "?";
 }
 
+/* Pretty-name STE0.config for the debug tail. */
+static const char *r100_smmu_ste_config_str(uint64_t cfg_field)
+{
+    switch (cfg_field) {
+    case R100_STE0_CONFIG_ABORT:     return "ABORT";
+    case R100_STE0_CONFIG_BYPASS:    return "BYPASS";
+    case R100_STE0_CONFIG_S1_TRANS:  return "S1_TRANS";
+    case R100_STE0_CONFIG_S2_TRANS:  return "S2_TRANS";
+    case R100_STE0_CONFIG_ALL_TRANS: return "ALL_TRANS";
+    default:                         return "?";
+    }
+}
+
 void r100_smmu_translate(R100SMMUState *s, uint32_t sid, uint32_t ssid,
                          hwaddr dva, int access,
                          R100SMMUTranslateResult *out)
@@ -827,9 +970,20 @@ void r100_smmu_translate(R100SMMUState *s, uint32_t sid, uint32_t ssid,
     IOMMUAccessFlags perm = (access == R100_SMMU_ACCESS_WRITE)
                             ? IOMMU_WO : IOMMU_RO;
     int rc;
+    const char *acc_str = (access == R100_SMMU_ACCESS_WRITE) ? "wr" : "rd";
 
     out->sid = sid;
     out->fault_addr = dva;
+    s->translates_total++;
+
+    r100_smmu_emit_debug(s,
+                         "smmu cl=%u xlate_in sid=%u ssid=%u dva=0x%"
+                         PRIx64 " %s cr0_smmuen=%d strtab_base_pa=0x%"
+                         PRIx64 "\n",
+                         s->chiplet_id, sid, ssid, (uint64_t)dva,
+                         acc_str,
+                         !!(s->regs[SMMU_CR0 >> 2] & SMMU_CR0_SMMUEN),
+                         s->strtab_base_pa);
 
     /* CR0.SMMUEN gate. Pre-enable: identity. This lets early-boot
      * engine accesses (before BL2 has even programmed STRTAB_BASE)
@@ -838,30 +992,85 @@ void r100_smmu_translate(R100SMMUState *s, uint32_t sid, uint32_t ssid,
     if (!(s->regs[SMMU_CR0 >> 2] & SMMU_CR0_SMMUEN)) {
         out->ok = true;
         out->pa = dva;
+        s->translates_bypass++;
+        r100_smmu_emit_debug(s,
+                             "smmu cl=%u xlate_out sid=%u dva=0x%" PRIx64
+                             " bypass=identity_smmuen0 pa=0x%" PRIx64 "\n",
+                             s->chiplet_id, sid, (uint64_t)dva,
+                             (uint64_t)dva);
         return;
     }
 
     if (!r100_smmu_read_ste(s, sid, ste)) {
         out->ok = false;
         out->fault = R100_SMMU_FAULT_STE_FETCH;
+        s->translates_fault++;
+        r100_smmu_emit_debug(s,
+                             "smmu cl=%u xlate_out sid=%u dva=0x%" PRIx64
+                             " FAULT ste_fetch strtab_base_pa=0x%" PRIx64
+                             " ste_pa=0x%" PRIx64 "\n",
+                             s->chiplet_id, sid, (uint64_t)dva,
+                             s->strtab_base_pa,
+                             s->strtab_base_pa +
+                                (uint64_t)sid * R100_SMMU_STE_BYTES);
         r100_smmu_emit_event(s,
             r100_smmu_fault_to_event_id(out->fault), sid, dva);
         return;
     }
 
     ste0 = ste[0];
+    cfg_field = ste0 & R100_STE0_CONFIG_M;
+
+    /* One line for the decoded STE — captures every interesting
+     * stage-2 input (V, config, S2T0SZ, S2SL0, S2TG, S2PS, S2AA64,
+     * S2AFFD, S2R, S2VMID, S2TTB) so the smmu-debug tail has the
+     * decode every translate would otherwise bury in another tool. */
+    {
+        uint64_t ste2 = ste[2];
+        uint64_t ste3 = ste[3];
+        uint8_t  tsz = (ste2 & R100_STE2_S2T0SZ_M) >> R100_STE2_S2T0SZ_S;
+        uint8_t  sl0 = (ste2 & R100_STE2_S2SL0_M) >> R100_STE2_S2SL0_S;
+        uint8_t  tg  = (ste2 & R100_STE2_S2TG_M)  >> R100_STE2_S2TG_S;
+        uint8_t  ps  = (ste2 & R100_STE2_S2PS_M)  >> R100_STE2_S2PS_S;
+        int      vmid = (int)((ste2 & R100_STE2_S2VMID_M) >>
+                              R100_STE2_S2VMID_S);
+
+        r100_smmu_emit_debug(s,
+                             "smmu cl=%u ste sid=%u v=%d cfg=%s"
+                             " s2t0sz=%u s2sl0=%u s2tg=%u s2ps=%u"
+                             " s2aa64=%d s2affd=%d s2r=%d vmid=%d"
+                             " s2ttb=0x%" PRIx64 "\n",
+                             s->chiplet_id, sid,
+                             !!(ste0 & R100_STE0_VALID),
+                             r100_smmu_ste_config_str(cfg_field),
+                             tsz, sl0, tg, ps,
+                             !!(ste2 & R100_STE2_S2AA64),
+                             !!(ste2 & R100_STE2_S2AFFD),
+                             !!(ste2 & R100_STE2_S2R),
+                             vmid, (uint64_t)(ste3 & ~0xFFFULL));
+    }
+
     if (!(ste0 & R100_STE0_VALID)) {
         out->ok = false;
         out->fault = R100_SMMU_FAULT_INV_STE;
+        s->translates_fault++;
+        r100_smmu_emit_debug(s,
+                             "smmu cl=%u xlate_out sid=%u dva=0x%" PRIx64
+                             " FAULT inv_ste reason=v0\n",
+                             s->chiplet_id, sid, (uint64_t)dva);
         r100_smmu_emit_event(s,
             r100_smmu_fault_to_event_id(out->fault), sid, dva);
         return;
     }
 
-    cfg_field = ste0 & R100_STE0_CONFIG_M;
     if (cfg_field == R100_STE0_CONFIG_ABORT) {
         out->ok = false;
         out->fault = R100_SMMU_FAULT_INV_STE;
+        s->translates_fault++;
+        r100_smmu_emit_debug(s,
+                             "smmu cl=%u xlate_out sid=%u dva=0x%" PRIx64
+                             " FAULT inv_ste reason=abort\n",
+                             s->chiplet_id, sid, (uint64_t)dva);
         r100_smmu_emit_event(s,
             r100_smmu_fault_to_event_id(out->fault), sid, dva);
         return;
@@ -869,6 +1078,12 @@ void r100_smmu_translate(R100SMMUState *s, uint32_t sid, uint32_t ssid,
     if (cfg_field == R100_STE0_CONFIG_BYPASS) {
         out->ok = true;
         out->pa = dva;
+        s->translates_bypass++;
+        r100_smmu_emit_debug(s,
+                             "smmu cl=%u xlate_out sid=%u dva=0x%" PRIx64
+                             " bypass=ste_bypass pa=0x%" PRIx64 "\n",
+                             s->chiplet_id, sid, (uint64_t)dva,
+                             (uint64_t)dva);
         return;
     }
     if (cfg_field == R100_STE0_CONFIG_S1_TRANS) {
@@ -883,6 +1098,12 @@ void r100_smmu_translate(R100SMMUState *s, uint32_t sid, uint32_t ssid,
                       s->chiplet_id, sid);
         out->ok = true;
         out->pa = dva;
+        s->translates_bypass++;
+        r100_smmu_emit_debug(s,
+                             "smmu cl=%u xlate_out sid=%u dva=0x%" PRIx64
+                             " bypass=s1_not_impl pa=0x%" PRIx64 "\n",
+                             s->chiplet_id, sid, (uint64_t)dva,
+                             (uint64_t)dva);
         return;
     }
     /* S2_TRANS or ALL_TRANS — both consume STE2/STE3 stage-2 fields.
@@ -893,16 +1114,31 @@ void r100_smmu_translate(R100SMMUState *s, uint32_t sid, uint32_t ssid,
     if (!r100_smmu_build_s2cfg(s, ste, &cfg)) {
         out->ok = false;
         out->fault = R100_SMMU_FAULT_INV_STE;
+        s->translates_fault++;
+        r100_smmu_emit_debug(s,
+                             "smmu cl=%u xlate_out sid=%u dva=0x%" PRIx64
+                             " FAULT inv_ste reason=bad_s2cfg\n",
+                             s->chiplet_id, sid, (uint64_t)dva);
         r100_smmu_emit_event(s,
             r100_smmu_fault_to_event_id(out->fault), sid, dva);
         return;
     }
+
+    r100_smmu_emit_debug(s,
+                         "smmu cl=%u ptw sid=%u dva=0x%" PRIx64
+                         " vttb=0x%" PRIx64 " tsz=%u sl0=%u gran=%u"
+                         " eff_ps=%u perm=%s\n",
+                         s->chiplet_id, sid, (uint64_t)dva,
+                         cfg.s2cfg.vttb, cfg.s2cfg.tsz,
+                         cfg.s2cfg.sl0, cfg.s2cfg.granule_sz,
+                         cfg.s2cfg.eff_ps, acc_str);
 
     rc = smmu_ptw(NULL, &cfg, dva, perm, &tlbe, &info);
     if (rc != 0) {
         out->ok = false;
         out->fault = r100_smmu_map_ptw_err(info.type);
         out->fault_addr = info.addr ? info.addr : dva;
+        s->translates_fault++;
         qemu_log_mask(LOG_GUEST_ERROR,
                       "r100-smmu cl=%u TRANSLATE FAULT sid=%u dva=0x%"
                       PRIx64 " perm=%d → %s @ 0x%" PRIx64
@@ -912,6 +1148,15 @@ void r100_smmu_translate(R100SMMUState *s, uint32_t sid, uint32_t ssid,
                       out->fault_addr, cfg.s2cfg.vttb,
                       cfg.s2cfg.tsz, cfg.s2cfg.sl0,
                       cfg.s2cfg.granule_sz);
+        r100_smmu_emit_debug(s,
+                             "smmu cl=%u xlate_out sid=%u dva=0x%" PRIx64
+                             " FAULT %s @ 0x%" PRIx64 " vttb=0x%" PRIx64
+                             " tsz=%u sl0=%u gran=%u\n",
+                             s->chiplet_id, sid, (uint64_t)dva,
+                             r100_smmu_fault_str(out->fault),
+                             (uint64_t)out->fault_addr, cfg.s2cfg.vttb,
+                             cfg.s2cfg.tsz, cfg.s2cfg.sl0,
+                             cfg.s2cfg.granule_sz);
         r100_smmu_emit_event(s,
             r100_smmu_fault_to_event_id(out->fault), sid,
             out->fault_addr);
@@ -924,6 +1169,15 @@ void r100_smmu_translate(R100SMMUState *s, uint32_t sid, uint32_t ssid,
     out->ok = true;
     out->pa = tlbe.entry.translated_addr +
               (dva & tlbe.entry.addr_mask);
+    s->translates_ok++;
+    r100_smmu_emit_debug(s,
+                         "smmu cl=%u xlate_out sid=%u dva=0x%" PRIx64
+                         " ok pa=0x%" PRIx64 " page_base=0x%" PRIx64
+                         " mask=0x%" PRIx64 "\n",
+                         s->chiplet_id, sid, (uint64_t)dva,
+                         (uint64_t)out->pa,
+                         (uint64_t)tlbe.entry.translated_addr,
+                         (uint64_t)tlbe.entry.addr_mask);
 }
 
 /* ------------------------------------------------------------------ */
@@ -968,6 +1222,38 @@ static void r100_smmu_write(void *opaque, hwaddr addr, uint64_t val,
     }
 
     switch (addr) {
+    case SMMU_CR0: {
+        uint32_t old = s->regs[reg_idx];
+        s->regs[reg_idx] = (uint32_t)val;
+        if (((old ^ (uint32_t)val) & SMMU_CR0_ACK_MASK) != 0) {
+            r100_smmu_emit_debug(s,
+                "smmu cl=%u CR0 0x%x→0x%x"
+                " smmuen=%d→%d eventqen=%d→%d cmdqen=%d→%d\n",
+                s->chiplet_id, old, (uint32_t)val,
+                !!(old & SMMU_CR0_SMMUEN),
+                !!(val & SMMU_CR0_SMMUEN),
+                !!(old & SMMU_CR0_EVENTQEN),
+                !!(val & SMMU_CR0_EVENTQEN),
+                !!(old & SMMU_CR0_CMDQEN),
+                !!(val & SMMU_CR0_CMDQEN));
+        }
+        break;
+    }
+    case SMMU_IRQ_CTRL: {
+        uint32_t old = s->regs[reg_idx];
+        s->regs[reg_idx] = (uint32_t)val;
+        if (((old ^ (uint32_t)val) & SMMU_IRQ_CTRL_ACK_MASK) != 0) {
+            r100_smmu_emit_debug(s,
+                "smmu cl=%u IRQ_CTRL 0x%x→0x%x"
+                " gerror_irqen=%d→%d eventq_irqen=%d→%d\n",
+                s->chiplet_id, old, (uint32_t)val,
+                !!(old & SMMU_IRQ_CTRL_GERROR_IRQEN),
+                !!(val & SMMU_IRQ_CTRL_GERROR_IRQEN),
+                !!(old & SMMU_IRQ_CTRL_EVENTQ_IRQEN),
+                !!(val & SMMU_IRQ_CTRL_EVENTQ_IRQEN));
+        }
+        break;
+    }
     case SMMU_GBPA:
         /* FW sets GBPA_UPDATE|SHCFG and polls UPDATE clear. Latch
          * UPDATE off so the poll exits immediately. */
@@ -1092,11 +1378,21 @@ static void r100_smmu_reset(DeviceState *dev)
     s->strtab_fmt = SMMU_STRTAB_FMT_LINEAR;
     /* events_emitted / events_dropped / gerror_raised survive reset
      * — handy for "did anything happen during this run?" inspection
-     * via HMP `info qtree` / qmp `qom-get` after a regression. */
+     * via HMP `info qtree` / qmp `qom-get` after a regression.
+     * Same convention for the new translates_* / cmdq_processed
+     * counters added with the smmu-debug chardev. */
+}
+
+static void r100_smmu_unrealize(DeviceState *dev)
+{
+    R100SMMUState *s = R100_SMMU(dev);
+
+    qemu_chr_fe_deinit(&s->smmu_debug_chr, false);
 }
 
 static Property r100_smmu_properties[] = {
     DEFINE_PROP_UINT32("chiplet-id", R100SMMUState, chiplet_id, 0),
+    DEFINE_PROP_CHR("debug-chardev", R100SMMUState, smmu_debug_chr),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -1105,6 +1401,7 @@ static void r100_smmu_class_init(ObjectClass *oc, void *data)
     DeviceClass *dc = DEVICE_CLASS(oc);
 
     dc->realize = r100_smmu_realize;
+    dc->unrealize = r100_smmu_unrealize;
     device_class_set_legacy_reset(dc, r100_smmu_reset);
     device_class_set_props(dc, r100_smmu_properties);
 }

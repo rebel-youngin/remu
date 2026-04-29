@@ -68,6 +68,8 @@ output/my-test/
   hdma.log      # bidirectional HDMA (OP_WRITE / OP_READ_REQ / OP_READ_RESP)
   rbdma.log     # chiplet 0's r100-rbdma kickoff / BH fire / FNSH pop,
                 # one line per task lifecycle step
+  smmu.log      # chiplet 0's r100-smmu — translate / STE decode /
+                # PT-walk dispatch / CMDQ op / eventq emit / GERROR raise
   shm -> /dev/shm/remu-my-test/        # remu-shm + host-ram + cfg-shadow shared backends
   npu/
     monitor.sock       # HMP over unix socket
@@ -254,6 +256,87 @@ surface as `GUEST_ERROR` lines in `qemu.log`, not the per-bridge log.
 `./remucli run --host` auto-verifies all of the above on startup and
 prints pass/fail; failures are non-fatal (NPU still boots for
 post-mortem poking).
+
+## SMMU debug surface (P10 / P11 post-mortems)
+
+`smmu.log` captures every interesting event on chiplet 0's
+`r100-smmu` — written one line at a time by the device's
+`debug-chardev` backend. Always-on once the file is opened (no `-d /
+--trace` dependency); silent on standalone `./remucli run` (no
+`--host`). Format mirrors `rbdma.log` / `hdma.log` so a single
+grep across `output/<run>/*.log` correlates events on the same BD
+lifecycle:
+
+```
+smmu cl=0 CR0 0x0→0x4 smmuen=0→0 eventqen=0→1 cmdqen=0→0
+smmu cl=0 STRTAB_BASE base_pa=0x14000000 log2size=5 fmt=LINEAR n_sids=32
+smmu cl=0 cmdq idx=0 op=0x04 CFGI_STE_RANGE cmd[0]=0x4 cmd[1]=0x5
+smmu cl=0 xlate_in sid=5 ssid=0 dva=0x100000000 rd cr0_smmuen=1 strtab_base_pa=0x14000000
+smmu cl=0 ste sid=5 v=1 cfg=ALL_TRANS s2t0sz=25 s2sl0=1 s2tg=0 s2ps=5 s2aa64=1 s2affd=1 s2r=0 vmid=0 s2ttb=0x0000000006000000
+smmu cl=0 ptw sid=5 dva=0x100000000 vttb=0x6000000 tsz=25 sl0=1 gran=12 eff_ps=48 perm=rd
+smmu cl=0 xlate_out sid=5 dva=0x100000000 ok pa=0x7000000 page_base=0x7000000 mask=0xfff
+```
+
+Faults look the same but with a `FAULT <kind>` token — easy to grep
+for `xlate_out.*FAULT` to find every walk that didn't translate, or
+`eventq_emit` to find every event the FW handler should have seen.
+
+### Companion scripts
+
+Two thin Python helpers under `tests/scripts/` complete the offline
+debug loop. They mmap the `/dev/shm/remu-<name>/` backends read-only —
+no monitor / gdbstub round trip, no race against the live guest
+beyond ordinary tearing.
+
+`mem_dump.py` is region-agnostic. Anything routed through chiplet-0
+DRAM (BD descriptors, queue_descs, command buffers, RBDMA OTO src/dst,
+SMMU stream-tables, page tables, q-cp's stack/heap, …) lands in
+`/dev/shm/remu-<name>/remu-shm` and can be dumped from there:
+
+```
+# xxd-style hex view of 256 B at chiplet-PA 0x14000000 (FW STRTAB_BASE):
+./tests/scripts/mem_dump.py -n my-run -o 0x14000000 -s 256
+
+# 64-bit LE words view at the same offset:
+./tests/scripts/mem_dump.py -n my-run -o 0x14000000 -s 256 -f u64
+
+# Dump host-ram (x86 guest's physical memory; same backend the kmd
+# allocates coherent DMA from, also aliased over the chiplet-0
+# outbound iATU window):
+./tests/scripts/mem_dump.py -n my-run -r host-ram -o 0x10000000 -s 4096
+
+# List which backends exist for a run:
+./tests/scripts/mem_dump.py -n my-run --list
+```
+
+`smmu_decode.py` is a pure-Python decoder for SMMU-v3.2 bytes — STE
+(64 B), stage-2 PTE (8 B), or a 3-level walk against a live shm
+file. It's the natural follow-up when `smmu.log` says "fault" or
+"sid=N config=…" and you want to see the actual bytes:
+
+```
+# Pull SID 5's STE out of the live stream-table and decode it:
+./tests/scripts/mem_dump.py -n my-run -o $((0x14000000 + 5*64)) \
+    -s 64 -f raw -O /tmp/sid5.bin
+./tests/scripts/smmu_decode.py ste --input /tmp/sid5.bin --sid 5
+
+# Replay the page-table walk for an IPA the smmu.log line called
+# out, against the same shm the device walker reads (fields come
+# straight from the `ste sid=5 …` and `ptw …` lines):
+./tests/scripts/smmu_decode.py walk \
+    --shm /dev/shm/remu-my-run/remu-shm \
+    --vttb 0x06000000 --tsz 25 --sl0 1 --granule 12 \
+    --ipa 0x100000000
+
+# Decode a whole 4 KB L3 page (512 PTEs):
+./tests/scripts/mem_dump.py -n my-run -o 0x06002000 -s 4096 \
+    -f raw -O /tmp/l3.bin
+./tests/scripts/smmu_decode.py pte --input /tmp/l3.bin --level 3
+```
+
+Both scripts read PROT_READ — they will never modify the run state.
+Pass `mem_dump.py --snapshot` to copy bytes into Python before
+formatting if you're chasing a tearing race against a live store.
 
 ## `FW_BOOT_DONE` path — cold boot vs. soft reset
 
