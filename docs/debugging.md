@@ -68,6 +68,11 @@ output/my-test/
                 # (P7 retired the cm7-debug chardev / cm7.log trace;
                 #  P10-fix retired the cfg chardev / cfg.log — cfg-head
                 #  propagation moved to a shared cfg-shadow shm alias)
+  rbdma.log     # P10 post-mortem — chiplet 0's r100-rbdma kickoff /
+                #  BH fire / FNSH pop, one line per task lifecycle step.
+                #  Always-on, no --trace overhead. CharBackend is
+                #  single-frontend so only chiplet 0 is wired; that's
+                #  where P10's cb lifecycle runs.
   shm -> /dev/shm/remu-my-test/        # remu-shm + host-ram + cfg-shadow shared backends
   npu/
     monitor.sock       # HMP over unix socket
@@ -914,6 +919,133 @@ breakpoints on `r100_rbdma_kickoff` (`src/machine/r100_rbdma.c`)
 straddling cb[0] and cb[1] to compare the FNSH FIFO depth + GIC
 pulse counts. Until cb[1] clears, P10 stays excluded from
 `./remucli test` defaults (`in_default=False` in `TEST_REGISTRY`).
+
+**2026-04-29 update — root causes pinned, two of three solved.**
+
+The "hdma.log stays empty" + "RBDMA SPI 978 not firing" diagnosis
+was wrong. Adding structural traces to the HDMA LL walker
+(`r100_hdma_emit_trace` over the existing `hdma-debug` chardev,
+one line per doorbell / LL element / completion, always-on, no
+`--trace` overhead) showed the LL walker for cb[1] was kicking
+fine — but never completing — for two independent reasons,
+both in `src/machine/r100_hdma.c`:
+
+1. **HDMA init-time STOP-doorbell pollution (FIXED — see
+   "Side bug 4" below).** q-cp's `hdma_init_channels` posts
+   `R100_HDMA_DB_STOP_BIT` to all 32 channels at boot before any
+   are enabled. The model was treating each as a real abort,
+   poisoning `SUBCTRL_EDMA_INT_CA73` pending mask with all 32 bits
+   and `int_status` with `INT_ABORT`. When the real cb completion
+   fired later, q-cp's `hdma_forward_irq` picked the lowest
+   pending bit (always WR ch 0 from init pollution), looked up
+   `chan->cb_tcb` for it (NULL — that channel never ran), and the
+   real completion's `cb_pkt_done` never executed. Fix is a
+   one-line gate on `c->enable & R100_HDMA_ENABLE_BIT` in
+   `r100_hdma_doorbell`: real DW HDMA absorbs STOP-while-idle
+   silently. With the gate in place, `signal_completion` count
+   drops from 33 (32 spurious + 1 real) to 1 (real only),
+   `msix.log count=1` for cb[0], and the cb[0] path is correct.
+
+2. **HDMA LL walker silently aborts on IPA SAR/DAR (NOT FIXED —
+   needs proper SMMU stage-2 modelling, see
+   `docs/roadmap.md` → "SMMU honour FW page tables" for the
+   plan).** With the STOP gate in place, the walker reads its
+   first LLI from `llp = 0x42b86740` (q-cp built the LL chain in
+   its FreeRTOS heap, which lives in the SMMU stage-2 SYSTEM IPA
+   region at IPA `0x40000000+` per `q/cp/.../runtime_pt.h`
+   `ptw_s2t_pf`). On real silicon a chiplet-local SMMU stage-2
+   walks IPA → PA before the AXI burst hits DRAM:
+
+   ```
+   SYSTEM region        : IPA 0x40000000..0x80000000
+                          → PA  0x00000000..0x40000000   (1 GB)
+   CHIPLET0 USER region : IPA 0x140000000..0xA00000000
+                          → PA  0x40000000..0x900000000  (35 GB)
+   ```
+
+   REMU's `r100_smmu.c` is a register-only stub (no STE / CD / PT
+   walk), so `address_space_read` at IPA `0x42b86740` hits
+   unassigned sysmem (chiplet-0 DRAM only covered 0..0x40000000
+   pre-`R100_DRAM_INIT_SIZE` bump) and `r100_hdma_walk_ll` returns
+   `false` silently — no `signal_completion`, no GIC pulse,
+   `cb_task` parked forever. Same hazard on the destination side
+   for `dar=0x140000000+` even after the SYSTEM alias is in place.
+
+   This session validated the diagnosis end-to-end with a
+   throwaway pair of `memory_region_init_alias` overlays in
+   `r100_chiplet_init` that mirrored the SYSTEM and CHIPLET0_USER
+   IPA windows back onto the chiplet's DRAM container. With the
+   aliases + DRAM bumped to 2 GB, the cb[1] LL walk completes its
+   3-element chain (`output/p10-final-2/hdma.log`):
+
+   ```
+   hdma cl=0 ll_walk_read dir=rd ch=0 elem=1 cursor=0x42b86740 ...
+              sar=0x4e00000  dar=0x140000000  xsize=2097152
+   hdma cl=0 ll_walk_read dir=rd ch=0 elem=2 cursor=0x42b86758 ...
+              sar=0x45400000 dar=0x140200000 xsize=8192
+   hdma cl=0 ll_walk_read dir=rd ch=0 elem=3 cursor=0x42b86770 ...
+              sar=0x45600000 dar=0x140400000 xsize=4096
+   hdma cl=0 ll_walk_end dir=rd ch=0 elems=3 last_seen=1
+   hdma cl=0 signal_completion dir=rd ch=0 pending_mask=0x10000
+   ```
+
+   The aliases are **not** the right answer — they collapse stage-1
+   and stage-2 to identity, hide every page-table bug, and
+   structurally fight `r100_smmu.c`'s eventual STE / CD / PT walker.
+   They were reverted in this session; the proper plan is in
+   `docs/roadmap.md` → "SMMU honour FW page tables", which now
+   carries a concrete attack outline (concrete IPA values, FW
+   page-table source files, ordering vs. `r100-pcie-outbound` /
+   `r100-rbdma` / `r100-dnc-cluster` translation hooks).
+
+3. **A new failure mode behind the LL walker — CDMA Auto Fetch
+   error.** With the SMMU IPA aliases temporarily in place, cb[0]
+   completed cleanly (1 MSI-X observed) but the test still failed
+   downstream: q-cp's `hils.log` started dumping
+   `[1ff37014e0] 0 0 0 0 0 0 0 0` ... `CDMA Auto Fetch` register
+   sweeps and the host kmd entered a *second* `rebel_hw_init`
+   path (workqueue `rsd_device_reset_wq` →
+   `rsd_sched_device_init`) that gets stuck at `+0x439` again.
+   Likely a downstream effect of an RBDMA / DNC mismatch on the
+   second cb's task descriptor — diagnosable once SMMU stage-2
+   lands properly and cb[1]'s HDMA walk is honest. Recorded here
+   so future people picking up P10 know the LL walker isn't the
+   final boss.
+
+**Side bug 4 — HDMA init-time STOP-doorbell pollution (FIXED in
+this session, on the same branch as the SMMU work even though
+it's structurally independent).** See item 1 above; fix is
+`r100_hdma_doorbell` gating the STOP path on
+`c->enable & R100_HDMA_ENABLE_BIT` and matches DW HDMA silicon
+semantics (STOP-while-idle is silently absorbed). Independent
+of the SMMU question and kept regardless.
+
+**Side bug 2 update — `cfg-shadow` NULL-deref ~30%.** New
+candidate root cause that supersedes the TCG-TLB-caching theory:
+q-sys CP0's cold-boot main routine
+(`q/sys/.../osl/FreeRTOS/Source/main.c:250`) does
+`memset((void *)(FREERTOS_VA_OFFSET + DEVICE_COMMUNICATION_SPACE_BASE), 0, CP1_LOGBUF_MAGIC)`
+followed by a tail memset clearing `0x1018..0xFE000`, gated only
+on `pmu_get_chiplet_reset_flag(CHIPLET_ID) & PMU_CL_RST_MASK ==
+PMU_COLD_RESET`. The first memset covers offset 0..0x1040 of the
+DCS, which **includes `DDH_BASE_LO` at offset `0xC0`**. If the
+kmd happens to win the race and writes `DDH_BASE_LO/HI/SIZE`
+into the shared `cfg-shadow` shm *before* q-sys's memset runs,
+q-sys clobbers it back to zero, and the next QUEUE_INIT-driven
+`hil_init_descs` reads zero → NULL deref. Both processes
+`mmap MAP_SHARED` the same shm file with no ordering guarantee
+on which one wins, so this is racy by construction. The original
+TCG-TLB theory doesn't fit on its own (the cfg-mirror subregion
+is installed at machine-init before any vCPU runs, so TCG TLBs
+can't cache stale translations); the memset race fits all the
+observed symptoms. Verifying recipe: capture
+`/dev/shm/remu-<name>/remu-cfgshadow` mid-boot at three points
+(post-kmd-DDH-write, post-q-sys-memset, post-QUEUE_INIT) and
+diff. Fix landing point is debatable — the cleanest is probably
+a deferred-write path on the host side that holds the kmd's
+`DDH_BASE_LO` write until q-sys's memset has run, but that
+requires modelling more of the boot handshake. Tracked but
+unfixed.
 
 ## Cleanup
 

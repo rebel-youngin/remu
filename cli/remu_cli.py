@@ -546,6 +546,7 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
                    doorbell_log=None, msix_sock=None, msix_log=None,
                    issr_sock=None, issr_log=None,
                    hdma_sock=None, hdma_log=None,
+                   rbdma_log=None,
                    ):
     """Assemble the aarch64 QEMU cmdline for the R100 NPU side.
     Matches the previous in-line flow exactly; extracted so that
@@ -649,6 +650,8 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
         machine_opt += ",hdma=hdma"
         if hdma_log is not None:
             machine_opt += ",hdma-debug=hdma_dbg"
+    if rbdma_log is not None:
+        machine_opt += ",rbdma-debug=rbdma_dbg"
 
     cmd = [
         str(QEMU_BIN),
@@ -719,6 +722,11 @@ def _build_npu_cmd(run_dir, gdb, trace, with_host=False,
                 "-chardev",
                 "file,id=hdma_dbg,path=%s,mux=off" % hdma_log,
             ]
+    if rbdma_log is not None:
+        cmd += [
+            "-chardev",
+            "file,id=rbdma_dbg,path=%s,mux=off" % rbdma_log,
+        ]
     click.echo("  Chiplet 0 UART -> stdio (log: %s)" % uart0_log)
 
     for n in range(1, 4):
@@ -1742,6 +1750,7 @@ def run(name, output_root, gdb, trace, chiplets, memory,
     issr_log = None
     hdma_sock = None
     hdma_log = None
+    rbdma_log = None
     if with_host:
         npu_dir = run_dir / "npu"
         npu_dir.mkdir(exist_ok=True)
@@ -1771,6 +1780,12 @@ def run(name, output_root, gdb, trace, chiplets, memory,
         msix_log = run_dir / "msix.log"
         issr_log = run_dir / "issr.log"
         hdma_log = run_dir / "hdma.log"
+        # rbdma.log is a P10 post-mortem aid (cb lifecycle, MSI-X
+        # fan-out checking) so it's gated on --host like the other
+        # ASCII tails. Phase 1 NPU-only smoke runs don't need it —
+        # qemu_log_mask(LOG_TRACE, ...) lines + --trace cover the
+        # standalone-NPU debug surface.
+        rbdma_log = run_dir / "rbdma.log"
 
     npu_cmd, found = _build_npu_cmd(run_dir, gdb, trace,
                                     with_host=with_host,
@@ -1782,7 +1797,8 @@ def run(name, output_root, gdb, trace, chiplets, memory,
                                     issr_sock=issr_sock,
                                     issr_log=issr_log,
                                     hdma_sock=hdma_sock,
-                                    hdma_log=hdma_log)
+                                    hdma_log=hdma_log,
+                                    rbdma_log=rbdma_log)
 
     if found == 0:
         click.secho("Warning: no firmware images in %s/" % IMAGES_DIR,

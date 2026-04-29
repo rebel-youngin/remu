@@ -127,6 +127,18 @@ struct R100SoCMachineState {
     /* Optional debug tail for hdma (one ASCII line per frame sent or
      * received). Mirror of doorbell_debug_chardev_id. */
     char *hdma_debug_chardev_id;
+
+    /* `-machine r100-soc,rbdma-debug=<chardev-id>` : optional ASCII
+     * trace tail wired to chiplet 0's r100-rbdma only (CharBackend is
+     * single-frontend; chiplets 1..3 don't share — their RBDMAs are
+     * untouched today since P10's cb lifecycle runs entirely on
+     * chiplet 0's q-cp). One line per kickoff / BH fire / FNSH pop,
+     * always-on (no -d / --trace dependency), used by P10
+     * cb-lifecycle post-mortems. If a future workload exercises
+     * RBDMA on chiplet N>0, split this prop into per-chiplet
+     * `rbdma-debug-cl<N>` and create one chardev per chiplet.
+     * Mirror of hdma_debug_chardev_id but for the RBDMA engine. */
+    char *rbdma_debug_chardev_id;
 };
 
 typedef struct R100SoCMachineState R100SoCMachineState;

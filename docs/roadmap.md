@@ -362,7 +362,7 @@ Naming neutral — the M9-* labels are retired in favour of P*.
 | P7 | Retire the gated cm7 stubs — after P1 + P2, all three default-off paths in `r100-cm7` (Stage 3c BD-done state machine: `OP_READ_REQ` walk + `OP_CFG_WRITE FUNC_SCRATCH` + `OP_WRITE bd.header \|= DONE` + `OP_WRITE queue_desc.ci++` with the `r100_imsix_notify` already gone in P2; Stage 3b QINIT stub: `r100_cm7_qinit_stub` + `REMU_FW_VERSION_STR`; M9-1b mbtq push: `r100_cm7_mbtq_push` + `r100_cm7_synth_cmd_descr` + the synth ring at `R100_CMD_DESCR_SYNTH_BASE`) had no reason to exist. Deleted, along with the three bool properties (`bd-done-stub` / `qinit-stub` / `mbtq-stub`), the `r100_hdma_set_cm7_callback` plumbing + its `0x01..0x0F` `req_id` partition (now reserved up to `0x7F` for future UMQ multi-queue use), the `imsix` / `mbtq-mailbox` QOM links and `R100IMSIXState *` / `R100MailboxState *` fields on `R100Cm7State`, the `cm7-debug-chardev` debug knob (the `cm7_log` plumbing in `cli/remu_cli.py` and the matching `cm7-debug` chardev wiring in `r100_soc.c`), and the `R100_CMD_TYPE_COMPUTE` / `R100_CMD_DESCR_SYNTH_*` macros + `R100_BD_FLAGS_DONE_MASK` / `REMU_DB_QUEUE_INIT_INTGR1_BIT` / `REMU_BD_*` / `REMU_QDESC_*` / `REMU_DDH_*` constants from `src/include/r100/remu_addrmap.h` + `src/bridge/remu_doorbell_proto.h`. `r100-cm7` now does exactly two things: (1) forward host BAR4 doorbells (INTGR0 bit 0 → `r100_imsix_notify`-free synthetic FW_BOOT_DONE re-handshake via the existing mailbox path; INTGR1 bit `qid` → SPI 185 wake for q-cp's `hq_task`); (2) host the P1b cfg-mirror MMIO trap at `R100_DEVICE_COMM_SPACE_BASE` and emit `OP_CFG_WRITE` upstream over `r100-hdma`. Single source of truth for BD lifecycle: q-cp's `cb_complete`. The HDMA bidirectional protocol stays — `r100-pcie-outbound` from P1 keeps the `0xC0..0xFF` partition; q-cp on CP0 owns `OP_READ_REQ`/`OP_READ_RESP` end-to-end through that backend. **Verified:** `./remucli build` clean (aarch64 + x86_64); m5/m6/m7/m8 + p4a/p4b/p5 regression green; `--host` smoke run reaches `rbln0 probed, id=0x0 (0:0)` with `xp/1wx 0xf000200ffc → 0xcafedead` (q-cp `cb_complete → FUNC_SCRATCH` round-trip via P1b unaffected); `cm7.log` no longer produced (matches the deleted debug chardev). | done | required P1 + P2; replaces ~700 LOC of gated scaffolding with the silicon path |
 | P8 | Real CA73 soft-reset — replace M8b 3a's synthetic `0xFB0D` from `INTGR0 bit 0` with a bracketed reset of CP0/CP1 cluster CPUs + their GIC redistributor state + the PCIe mailbox regs (preserve DRAM/SRAM/cfg-head/any kmd-loaded firmware images), restart from BL1; q-sys `bootdone_task` re-emits `0xFB0D` through the existing `issr` chardev path naturally. Removes the last QEMU-side cold-boot lie. Candidate hooks: a `DeviceReset` on an aggregated "r100-ca73-cluster" QOM wrapper, or `qemu_system_reset_request` with a fine-grained `ShutdownCause` so the x86 host QEMU is unaffected. | pending | independent of P1..P7 |
 | P9 | UMQ multi-queue — `NUMBER_OF_CMD_QUEUES > 1`. Falls out of P1's per-queue parser; q-cp's `hq_task` already loops over `qid` in `host_queue_manager.c`, so the work is mostly host-side allocation + per-queue MSI-X vector wiring. Includes BD-done qid=1 (kmd "message ring") which Stage 3c's `qdesc ring_log2 range` guard used to skip; q-cp handles it natively post-P1c. | pending | depends on P1 |
-| P10 | umd smoke test in `guest/` — `rblnCreateContext` → submit → wait → exit 0. After P1 + P2 + P3 + P4A + P5 + P7, this exercises the full silicon-accurate path. **Scaffolding landed; queue_init handshake fixed (P10-fix `d986302`); cb[1] non-completion is the live blocker.** Build/staging/test-orchestrator infrastructure is in place so a single `./remucli test p10` invocation drives the umd `command_submission` integration test end-to-end inside the x86 guest. New `guest/build-umd.sh` initialises the umd's nested submodules (`external/unity` + `src/common/headers`), configures with the heavy dependencies disabled (`RBLN_BUILD_{ML,CCL,TOOLS}=OFF`, `RBLN_USE_RUST=OFF`, `DRM_ON=OFF`), builds `command_submission-static`, and stages it under `guest/bin/` + `guest/lib/` (gitignored — the 9p share carries the non-glibc shared libraries to the guest at runtime). `guest/build-guest-image.sh` extended to pull `libc6` / `libgcc-s1` / `libgomp1` debs and stage glibc + the dynamic linker (`ld-linux-x86-64.so.2`) into the busybox initramfs so dynamically-linked ELFs run at all. `guest/setup.sh` gated on `remu.run_p10=1` on `/proc/cmdline` (so plain `./remucli run --host` keeps the M8b interactive boot shape regardless of whether the binary is staged); when set, runs `command_submission -y 5` after `FW_BOOT_DONE` and parses cmocka's `[  PASSED  ] 1 test(s)` line. New `tests/p10_umd_smoke_test.py` orchestrator boots `--host` with the cmdline marker, watches `host/serial.log` for the `setup.sh` `P10 PASS` / `P10 FAIL` markers, and exits 0/1/2/77 with proper SIGKILL teardown of the QEMU pair on its way out. Excluded from `./remucli test` / `./remucli test all` via the `in_default=False` flag in `TEST_REGISTRY` so the regression set stays gated on m5..m8 + p4a/p4b/p5 until cb[1] clears. (`guest/setup.sh` also got a one-line `cp` → `cat` fix because BusyBox `cp /proc/interrupts` preserves the read-only mode and fails the artifact stash with EACCES.) **Open issue — cb[1] never completes (single MSI-X for two CBs).** The umd test submits two command buffers and waits for two MSI-X completions on vector 0; only one fires. q-cp state at +1.5 s after the second CQ doorbell (captured via the new `tests/p10_qcp_gdb_probe.py`): `hq_mgr.cb_run_cnt = 1`, `hq_mgr.cq[0].pi = 2`, `hq_mgr.cq[0].ci = 2`, both `cb_mgr.{ready,wait}_list` empty. That state means `hq_task` drained both BDs onto `cb_mgr.ready_list`, `cb_task` pulled cb[1] off and dispatched its packets to RBDMA / HDMA, and is now parked on `xTaskNotifyWait` for an engine done IRQ that never fires. cb[0] completes cleanly (`xp/1wx 0xf000200ffc → 0xcafedead`, one `vector=0` in `host/msix.log`). `output/<name>/hdma.log` is empty for the whole run, which suggests both CB workloads target NPU-local addresses (RBDMA OTO between two chiplet-0 DRAM offsets) and the missing IRQ is most likely RBDMA's GIC SPI 978 (`INT_ID_RBDMA1`) on the second kick rather than an HDMA wire issue. Confirming requires GDB on `r100_rbdma_kickoff` / `r100_rbdma_fnsh_bh` straddling cb[0] / cb[1] — open work; `tests/p10_qcp_gdb_probe.py` is the harness. **Side bug 1 — TDR `URG_EVENT_UNLOAD` cascade.** When the kmd's TDR fires, q-cp's `handle_unload_event` runs `DNC_DUMP_ESSENTIAL` + `RBDMA_DUMP_CDMA` + `rbcm_dump_chiplet_incomplete_ttreg`, a ~700-line register dump peppered with `mdelay(500000)` busy-waits that block the doorbell ISR on CP0.cpu0 for many seconds under TCG. The host kernel's `watchdog: BUG: soft lockup [insmod] rebel_hw_init+0x439` is a downstream symptom — fixing cb[1] removes it. Documented so future hangs that look like a `rebel_hw_init` lockup are not mis-attributed to the queue_init handshake. **Side bug 2 — `cfg-shadow` NULL-deref at boot (~30%).** A subset of `--host` boots fault inside q-cp's `hil_init_descs` at `hil.c:519` with `dev_desc[func_id] == NULL`, even though `tests/p10_cfgshadow_probe.py` shows the kmd-published DDH (`0x80_04800000`) was mirrored into `/dev/shm/remu-<name>/cfg-shadow` *and* visible via HMP `xp` on both QEMUs before the QUEUE_INIT doorbell. Smell is a TCG TLB caching race — q-cp's MMU translation for `R100_DEVICE_COMM_SPACE_BASE` was filled before the `r100_cm7_init` MMIO subregion overlay landed, so the cached translation points at chiplet-0 DRAM zero-fill. Workaround: retry the run. Investigation hook: `-d in_asm,exec,page,mmu -singlestep`. **Side bug 3 — KMD `readl_poll_timeout_atomic` units mismatch.** `rebel.c:700` calls `readl_poll_timeout_atomic(..., 10, jiffies_to_usecs(RBLN_REBEL_TASK_DONE_US))` where `RBLN_REBEL_TASK_DONE_US = 3 * 1000000` is *already* in µs — the inner `jiffies_to_usecs()` call inflates the "3 s" timeout to ~3 hours under HZ=250. Stock-KMD upstream bug, not REMU; means the soft-lockup runs for the full 180 s test budget instead of unwinding after 6 s. Tracked here so future P10 bring-up doesn't try to "fix" the timeout REMU-side. **Diagnostic recipes.** Both probe scripts are diagnostic-only (no `TEST_REGISTRY` entry; not part of `./remucli test`): `tests/p10_qcp_gdb_probe.py` boots `--host`, waits for the cb[1] CQ doorbell, spawns NPU gdbstub on demand, attaches `aarch64-none-elf-gdb`, dumps `hq_mgr` / `cb_mgr` globals + per-thread backtraces. `tests/p10_cfgshadow_probe.py` boots, waits for the first QUEUE_INIT doorbell, then samples `cfg-shadow` from three vantage points (direct shm read, NPU `xp`, host `xp`) to verify the alias is working. See `docs/debugging.md` → "P10 cb[1] non-completion (open)" for the full diagnostic flow + recipe. | scaffolding done, cb[1] root-cause + RBDMA fnsh debug pending | absorbs the old M9-3; cb[1] engine-done-IRQ trace is the only remaining blocker. queue_init was fixed by P10-fix (`d986302`). |
+| P10 | umd smoke test in `guest/` — `rblnCreateContext` → submit → wait → exit 0. After P1 + P2 + P3 + P4A + P5 + P7, this exercises the full silicon-accurate path. **Scaffolding landed; queue_init handshake fixed (P10-fix `d986302`); cb[1] non-completion is the live blocker.** Build/staging/test-orchestrator infrastructure is in place so a single `./remucli test p10` invocation drives the umd `command_submission` integration test end-to-end inside the x86 guest. New `guest/build-umd.sh` initialises the umd's nested submodules (`external/unity` + `src/common/headers`), configures with the heavy dependencies disabled (`RBLN_BUILD_{ML,CCL,TOOLS}=OFF`, `RBLN_USE_RUST=OFF`, `DRM_ON=OFF`), builds `command_submission-static`, and stages it under `guest/bin/` + `guest/lib/` (gitignored — the 9p share carries the non-glibc shared libraries to the guest at runtime). `guest/build-guest-image.sh` extended to pull `libc6` / `libgcc-s1` / `libgomp1` debs and stage glibc + the dynamic linker (`ld-linux-x86-64.so.2`) into the busybox initramfs so dynamically-linked ELFs run at all. `guest/setup.sh` gated on `remu.run_p10=1` on `/proc/cmdline` (so plain `./remucli run --host` keeps the M8b interactive boot shape regardless of whether the binary is staged); when set, runs `command_submission -y 5` after `FW_BOOT_DONE` and parses cmocka's `[  PASSED  ] 1 test(s)` line. New `tests/p10_umd_smoke_test.py` orchestrator boots `--host` with the cmdline marker, watches `host/serial.log` for the `setup.sh` `P10 PASS` / `P10 FAIL` markers, and exits 0/1/2/77 with proper SIGKILL teardown of the QEMU pair on its way out. Excluded from `./remucli test` / `./remucli test all` via the `in_default=False` flag in `TEST_REGISTRY` so the regression set stays gated on m5..m8 + p4a/p4b/p5 until cb[1] clears. (`guest/setup.sh` also got a one-line `cp` → `cat` fix because BusyBox `cp /proc/interrupts` preserves the read-only mode and fails the artifact stash with EACCES.) **Open issue — cb[1] never completes (single MSI-X for two CBs).** The umd test submits two command buffers and waits for two MSI-X completions on vector 0; only one fires. q-cp state at +1.5 s after the second CQ doorbell (captured via the new `tests/p10_qcp_gdb_probe.py`): `hq_mgr.cb_run_cnt = 1`, `hq_mgr.cq[0].pi = 2`, `hq_mgr.cq[0].ci = 2`, both `cb_mgr.{ready,wait}_list` empty. That state means `hq_task` drained both BDs onto `cb_mgr.ready_list`, `cb_task` pulled cb[1] off and dispatched its packets to RBDMA / HDMA, and is now parked on `xTaskNotifyWait` for an engine done IRQ that never fires. cb[0] completes cleanly (`xp/1wx 0xf000200ffc → 0xcafedead`, one `vector=0` in `host/msix.log`). `output/<name>/hdma.log` is empty for the whole run, which suggests both CB workloads target NPU-local addresses (RBDMA OTO between two chiplet-0 DRAM offsets) and the missing IRQ is most likely RBDMA's GIC SPI 978 (`INT_ID_RBDMA1`) on the second kick rather than an HDMA wire issue. Confirming requires GDB on `r100_rbdma_kickoff` / `r100_rbdma_fnsh_bh` straddling cb[0] / cb[1] — open work; `tests/p10_qcp_gdb_probe.py` is the harness. **Side bug 1 — TDR `URG_EVENT_UNLOAD` cascade.** When the kmd's TDR fires, q-cp's `handle_unload_event` runs `DNC_DUMP_ESSENTIAL` + `RBDMA_DUMP_CDMA` + `rbcm_dump_chiplet_incomplete_ttreg`, a ~700-line register dump peppered with `mdelay(500000)` busy-waits that block the doorbell ISR on CP0.cpu0 for many seconds under TCG. The host kernel's `watchdog: BUG: soft lockup [insmod] rebel_hw_init+0x439` is a downstream symptom — fixing cb[1] removes it. Documented so future hangs that look like a `rebel_hw_init` lockup are not mis-attributed to the queue_init handshake. **Side bug 2 — `cfg-shadow` NULL-deref at boot (~30%).** A subset of `--host` boots fault inside q-cp's `hil_init_descs` at `hil.c:519` with `dev_desc[func_id] == NULL`, even though `tests/p10_cfgshadow_probe.py` shows the kmd-published DDH (`0x80_04800000`) was mirrored into `/dev/shm/remu-<name>/cfg-shadow` *and* visible via HMP `xp` on both QEMUs before the QUEUE_INIT doorbell. Smell is a TCG TLB caching race — q-cp's MMU translation for `R100_DEVICE_COMM_SPACE_BASE` was filled before the `r100_cm7_init` MMIO subregion overlay landed, so the cached translation points at chiplet-0 DRAM zero-fill. Workaround: retry the run. Investigation hook: `-d in_asm,exec,page,mmu -singlestep`. **Side bug 3 — KMD `readl_poll_timeout_atomic` units mismatch.** `rebel.c:700` calls `readl_poll_timeout_atomic(..., 10, jiffies_to_usecs(RBLN_REBEL_TASK_DONE_US))` where `RBLN_REBEL_TASK_DONE_US = 3 * 1000000` is *already* in µs — the inner `jiffies_to_usecs()` call inflates the "3 s" timeout to ~3 hours under HZ=250. Stock-KMD upstream bug, not REMU; means the soft-lockup runs for the full 180 s test budget instead of unwinding after 6 s. Tracked here so future P10 bring-up doesn't try to "fix" the timeout REMU-side. **Diagnostic recipes.** Both probe scripts are diagnostic-only (no `TEST_REGISTRY` entry; not part of `./remucli test`): `tests/p10_qcp_gdb_probe.py` boots `--host`, waits for the cb[1] CQ doorbell, spawns NPU gdbstub on demand, attaches `aarch64-none-elf-gdb`, dumps `hq_mgr` / `cb_mgr` globals + per-thread backtraces. `tests/p10_cfgshadow_probe.py` boots, waits for the first QUEUE_INIT doorbell, then samples `cfg-shadow` from three vantage points (direct shm read, NPU `xp`, host `xp`) to verify the alias is working. See `docs/debugging.md` → "P10 cb[1] non-completion (open)" for the full diagnostic flow + recipe. | scaffolding done; cb[0] passes; cb[1] gated on **SMMU stage-2** (`docs/roadmap.md` § Long-term follow-ons → "SMMU honour FW page tables") + a downstream "CDMA Auto Fetch" failure surfaced when the SMMU bypass is faked with `memory_region_init_alias` overlays | absorbs the old M9-3. **2026-04-29 update**: the cb[1] hang isn't an RBDMA SPI 978 issue — `hdma.log` was empty because the LL walker silently aborted on IPA SAR/DAR. Two of the three blockers are now solved: HDMA init-time STOP-doorbell pollution (fixed: `c->enable & R100_HDMA_ENABLE_BIT` gate in `r100_hdma_doorbell`, matches DW silicon's STOP-while-idle absorption) and HDMA LL walker tracing infrastructure (the `hdma-debug` chardev now emits structural traces — doorbell / `ll_walk_start` / `ll_walk_read` per LLI / `ll_walk_end` / `signal_completion` — always-on, no `--trace` overhead). The third blocker is the SMMU stage-2 walker — see `docs/debugging.md` → "P10 cb[1] non-completion" for the addresses observed in cb[1]'s LL chain and the wrong-fix `memory_region_init_alias` shortcut that was tried + reverted on this branch. |
 
 ### Order of attack
 
@@ -450,13 +450,19 @@ dispatch graph is honest:
 - **HDMA scatter-gather** — full multi-LL DMA with address translation;
   extension of P5's behavioural step.
 - **SMMU honour FW page tables** — today's bypass is fine for
-  functional tests; required for security / multi-tenant fidelity.
+  functional tests against P4B's umd `simple_copy` (OTO, identity
+  IOVAs); **becomes a hard blocker the moment q-cp's HDMA path
+  walks an LL chain whose `LLP` / `SAR` / `DAR` are SMMU stage-2
+  IPAs**. P10's umd `command_submission` cb[1] is the first such
+  workload, and it was the trigger for the 2026-04-29 investigation
+  recorded in `docs/debugging.md` → "P10 cb[1] non-completion".
   `r100_smmu.c` is currently a register-only stub (acks `CR0→CR0ACK`,
   auto-advances `CMDQ_CONS=PROD`) — STE / CD / page tables FW sets up
   in DRAM are never walked, so every engine in REMU effectively
   operates at `S1 ∘ S2 = identity`. Engines that consume DVAs
   (`r100-rbdma` SAR/DAR per P4B, `r100-hdma` SAR/DAR per M9-1c/P5,
-  `r100-dnc-cluster` cmd_descr fields per M9-1c) all add a
+  `r100-dnc-cluster` cmd_descr fields per M9-1c,
+  `r100-pcie-outbound` chiplet-0 4 GB AXI window per P1a) all add a
   `chiplet_id * R100_CHIPLET_OFFSET` REMU-flat-global offset and call
   `address_space_{read,write}` directly — no translation. When this
   follow-on lands, the natural plug points are translation hooks at
@@ -464,6 +470,94 @@ dispatch graph is honest:
   size, &pa)` helper would suffice), driven by FW-published STE / CD
   / S1 / S2 tables already sitting in DRAM. Until then, kmd / q-cp
   must keep using identity-mapped IOVAs on REMU.
+
+  **Concrete attack outline (post-2026-04-29 P10 dig).** The
+  observed cb[1] LL chain in `output/p10-final-2/hdma.log`:
+
+  ```
+  doorbell.llp = 0x42b86740           # IPA in SYSTEM region
+  elem 1: sar=0x04e00000  dar=0x140000000  size=2 MiB
+  elem 2: sar=0x45400000  dar=0x140200000  size=8 KiB
+  elem 3: sar=0x45600000  dar=0x140400000  size=4 KiB
+  ```
+
+  q-cp's expected stage-2 PF mapping (source of truth:
+  `external/ssw-bundle/products/rebel/q/cp/include/hal/ptw.h` for the
+  IPA region constants, `q/cp/src/hal/common/runtime_pt.h` `ptw_s2t_pf`
+  for the per-region table layout):
+
+  ```
+  SYSTEM region        : IPA 0x40000000..0x80000000
+                         → PA  0x00000000..0x40000000   (1 GB)
+  CHIPLET0 USER region : IPA 0x140000000..0xA00000000
+                         → PA  0x40000000..0x900000000  (35 GB)
+  ```
+
+  So `llp = 0x42b86740` is the SYSTEM IPA at offset `0x2b86740`
+  (~45 MB) of q-cp's heap; the proper SMMU walker resolves that
+  to PA `0x02b86740` in chiplet-0 DRAM. `dar = 0x140000000+` is
+  CHIPLET0_USER IPA at offset 0..0x400000 (4 MB) which resolves
+  to PA `0x40000000+`. `sar = 0x04e00000 / 0x45400000 / 0x45600000`
+  are mixed: the 0x04e... offset is already a PA-equal-IPA in
+  the SYSTEM region (FW collapses the translation when the source
+  is its own heap), the 0x45... offsets are SYSTEM IPAs that need
+  to land at PA `0x05400000 / 0x05600000` after the −0x40000000
+  subtract. **Both directions of the mapping** show up in a
+  single LL chain — the walker can't get away with a partial
+  translation.
+
+  **Proposed shape of the fix (when this lands as a real P-row):**
+
+  1. Define `r100_smmu_translate(R100SmmuState *s, uint32_t sid,
+     uint32_t ssid, uint64_t dva, hwaddr *pa, IOMMUAccessFlags
+     flags)` returning `IOMMUTLBEntry`-ish (or just `bool ok` +
+     `hwaddr pa`). Driven by the SID lookup in
+     `docs/rbdma-smmu-review.md` § 1 — 18 SIDs split by master.
+     For HDMA-via-bypass-LUT and RBDMA-with-stage-2-only the
+     translation collapses to `S2(IPA) → PA`; for stage-1-enabled
+     SIDs it walks `STE → CD → S1 → S2`.
+
+  2. Hook it into `r100_hdma_walk_ll`'s LL-element load
+     (`address_space_read(... cursor ...)` for the LLI itself)
+     and into `r100_hdma_lli_d2d` / `r100_hdma_lli_h2d` /
+     `r100_hdma_lli_d2h`'s SAR / DAR before each
+     `address_space_{read,write}`. Hook into
+     `r100_rbdma_kickoff`'s OTO byte-mover before the
+     `address_space_*` pair (the comment block in
+     `r100_rbdma_do_oto` already calls this out as the natural
+     plug point). Hook into `r100_pcie_outbound_read` for the
+     PF-window translation.
+
+  3. The FW table source is reachable already — q-cp publishes
+     `runtime_pt` in DRAM, and BL2 stages STRTAB_BASE / CMDQ
+     into `r100_smmu.c`'s register file. The walker just needs
+     to chase those pointers; no new chardev or shm splice is
+     required.
+
+  4. Pre-checks: SAR / DAR fields > `R100_DRAM_INIT_SIZE` that
+     **aren't** in the host PCIe-bus space (`>= REMU_HOST_PHYS_BASE`)
+     are flagged as "needs SMMU translation". Today they hit
+     `MEMTX_DECODE_ERROR` and the walker bails silently.
+     Surfacing them with a `LOG_GUEST_ERROR` in the meantime is
+     also worthwhile so the next person who runs into this
+     doesn't have to repeat the diagnosis.
+
+  Tempting shortcut: install plain `memory_region_init_alias`
+  overlays for the SYSTEM / CHIPLET0_USER IPA windows and bump
+  `R100_DRAM_INIT_SIZE` from 1 GB → 2 GB so the upper alias has
+  real backing. **This is the wrong fix.** It collapses stage-1
+  *and* stage-2 to identity unconditionally, hides every
+  page-table bug FW might have, structurally fights the eventual
+  STE / CD / PT walker (the alias and the walker would both want
+  to own the same address), and breaks the moment a workload
+  uses anything other than the PF table (VFs, multi-tenant). The
+  shortcut was tried and verified on this branch (it does walk
+  the chain end-to-end and fires MSI-X for cb[0]) **purely as a
+  diagnostic step** — see `git log` around 2026-04-29 — and then
+  reverted. The session left the structural traces in
+  `r100_hdma_walk_ll` and `r100-rbdma`'s `rbdma-debug` chardev
+  in tree because they're independent of the SMMU question and
+  will be wanted for verification when the real walker lands.
 - **Performance counters** — synthetic cycle counts for FW timing
   paths; meaningless today.
 

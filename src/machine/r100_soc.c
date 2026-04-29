@@ -668,8 +668,23 @@ static void r100_chiplet_init(MachineState *machine, int chiplet_id,
     {
         DeviceState *dev = qdev_new(TYPE_R100_RBDMA);
         SysBusDevice *sbd;
+        R100SoCMachineState *r100m_local = R100_SOC_MACHINE(machine);
 
         qdev_prop_set_uint32(dev, "chiplet-id", chiplet_id);
+        /* Wire the optional debug-tail chardev to chiplet 0 only.
+         * CharBackend is single-frontend, and P10's cb lifecycle
+         * runs entirely on chiplet 0's q-cp; the other chiplets'
+         * RBDMAs are untouched today. If a future workload exercises
+         * RBDMA on chiplet N, split the machine prop into
+         * `rbdma-debug-cl<N>` and create one chardev per chiplet. */
+        if (chiplet_id == 0) {
+            Chardev *rbdma_dbg = r100_soc_resolve_chr(
+                                    r100m_local->rbdma_debug_chardev_id,
+                                    "rbdma debug");
+            if (rbdma_dbg) {
+                qdev_prop_set_chr(dev, "debug-chardev", rbdma_dbg);
+            }
+        }
         sbd = SYS_BUS_DEVICE(dev);
         sysbus_realize_and_unref(sbd, &error_fatal);
         memory_region_add_subregion_overlap(
@@ -1374,6 +1389,7 @@ R100_SOC_DEF_STRPROP(issr,           issr_chardev_id)
 R100_SOC_DEF_STRPROP(issr_debug,     issr_debug_chardev_id)
 R100_SOC_DEF_STRPROP(hdma,           hdma_chardev_id)
 R100_SOC_DEF_STRPROP(hdma_debug,     hdma_debug_chardev_id)
+R100_SOC_DEF_STRPROP(rbdma_debug,    rbdma_debug_chardev_id)
 
 #undef R100_SOC_DEF_STRPROP
 
@@ -1429,6 +1445,13 @@ static const R100SoCStrProp r100_soc_str_props[] = {
         "that the host executes as pci_dma_write (M8b 3b, M9 BD-done)."),
     R100_SOC_STR_PROP("hdma-debug", hdma_debug, hdma_debug_chardev_id,
         "chardev id for an ASCII trace of every hdma frame emitted."),
+    R100_SOC_STR_PROP("rbdma-debug", rbdma_debug, rbdma_debug_chardev_id,
+        "chardev id for an ASCII trace of every rbdma kickoff / BH fire / "
+        "FNSH pop, wired to chiplet 0's r100-rbdma only (CharBackend is "
+        "single-frontend; chiplet N>0 RBDMAs are untouched today since "
+        "P10's cb lifecycle runs entirely on chiplet 0). Always-on (no "
+        "--trace required), one line per task lifecycle step. P10 "
+        "post-mortem aid."),
 };
 
 #undef R100_SOC_STR_PROP

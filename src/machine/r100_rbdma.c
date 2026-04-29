@@ -77,6 +77,8 @@
 #include "hw/sysbus.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
+#include "hw/qdev-properties-system.h"
+#include "chardev/char-fe.h"
 #include "exec/address-spaces.h"
 #include "r100_soc.h"
 
@@ -302,6 +304,12 @@ struct R100RBDMAState {
     uint64_t oto_bytes;
     uint64_t oto_dma_errors;
     uint64_t unimp_task_kicks;
+
+    /* Optional debug-tail chardev. Every kickoff / BH fire / FNSH pop
+     * emits a single ASCII line so post-mortems can answer "did the
+     * second cb's RBDMA kick fire?" without --trace overhead.
+     * Mirrors r100-hdma's hdma_debug_chr pattern. */
+    CharBackend rbdma_debug_chr;
 };
 typedef struct R100RBDMAState R100RBDMAState;
 
@@ -333,6 +341,35 @@ static uint32_t rbdma_default(R100RBDMAState *s, hwaddr addr)
         return RBDMA_INFO5_SEED;
     default:
         return 0;
+    }
+}
+
+/* ========================================================================
+ * Debug-tail helper — single line per significant event when wired.
+ * Always-on (no -d / --trace dependency), bounded throughput because
+ * it only fires on kicks/BH/pops (one line per RBDMA task lifecycle
+ * step). When the chardev isn't wired (single-QEMU NPU smoke tests,
+ * unit tests) the call is a backend-connected? early return.
+ * ======================================================================== */
+
+static void r100_rbdma_emit_debug(R100RBDMAState *s, const char *fmt, ...)
+    G_GNUC_PRINTF(2, 3);
+
+static void r100_rbdma_emit_debug(R100RBDMAState *s, const char *fmt, ...)
+{
+    char line[200];
+    int n;
+    va_list ap;
+
+    if (!qemu_chr_fe_backend_connected(&s->rbdma_debug_chr)) {
+        return;
+    }
+    va_start(ap, fmt);
+    n = vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        qemu_chr_fe_write(&s->rbdma_debug_chr, (const uint8_t *)line,
+                          MIN((size_t)n, sizeof(line) - 1));
     }
 }
 
@@ -380,12 +417,22 @@ static bool r100_rbdma_fnsh_pop(R100RBDMAState *s, R100RBDMAFnshEntry *out)
  *
  * We don't pop here: the regstore-side FNSH_INTR_FIFO read is the
  * consumer. The BH only walks the ring forward to count + log the
- * pulses; the entries stay in the FIFO until q-cp reads them. */
+ * pulses; the entries stay in the FIFO until q-cp reads them.
+ *
+ * KNOWN HAZARD (under investigation as part of P10 cb[1] hang): if
+ * a second kick lands before q-cp pops the first entry, the BH walks
+ * head=0 → tail=2 and pulses for entry 0 a SECOND time. The Phase A
+ * trace below ("bh_walk") makes this visible: any line where
+ * `pulses_fired` advances by more than (tail - prev_tail) per BH
+ * fire indicates the re-pulse bug. Phase B B1 fixes it via a
+ * separate `walk_cursor` advanced inside the BH. */
 static void r100_rbdma_done_bh(void *opaque)
 {
     R100RBDMAState *s = opaque;
     uint32_t walk = s->fnsh_head;
     uint32_t tail = s->fnsh_tail;
+    uint64_t pulses_before = s->pulses_fired;
+    uint32_t entries_walked = 0;
 
     /* Re-snapshot at most R100_RBDMA_FIFO_DEPTH entries so a wrap
      * doesn't loop us indefinitely if a kick fires concurrently. */
@@ -395,15 +442,35 @@ static void r100_rbdma_done_bh(void *opaque)
         if (e->intr_enabled && s->done_irq) {
             qemu_irq_pulse(s->done_irq);
             s->pulses_fired++;
-            qemu_log_mask(LOG_TRACE,
-                          "r100-rbdma cl=%u kick → fnsh ptid=0x%08x "
-                          "fired=%" PRIu64 " depth=%u\n",
-                          s->chiplet_id, e->ptid_init,
-                          s->pulses_fired, r100_rbdma_fnsh_depth(s));
         }
+        qemu_log_mask(LOG_TRACE,
+                      "r100-rbdma cl=%u bh_entry slot=%u ptid=0x%08x "
+                      "intr_en=%d pulses_fired=%" PRIu64 "\n",
+                      s->chiplet_id, walk, e->ptid_init,
+                      (int)e->intr_enabled, s->pulses_fired);
         walk = (walk + 1) % R100_RBDMA_FIFO_DEPTH;
+        entries_walked++;
         s->completes++;
     }
+
+    qemu_log_mask(LOG_TRACE,
+                  "r100-rbdma cl=%u bh_done head=%u tail=%u "
+                  "entries_walked=%u pulses_this_bh=%" PRIu64
+                  " kicks=%" PRIu64 " completes=%" PRIu64
+                  " pulses_total=%" PRIu64 " depth=%u\n",
+                  s->chiplet_id, s->fnsh_head, s->fnsh_tail,
+                  entries_walked, s->pulses_fired - pulses_before,
+                  s->kicks, s->completes, s->pulses_fired,
+                  r100_rbdma_fnsh_depth(s));
+    r100_rbdma_emit_debug(s,
+                          "rbdma cl=%u bh_done head=%u tail=%u "
+                          "entries_walked=%u pulses_this_bh=%" PRIu64
+                          " kicks=%" PRIu64 " completes=%" PRIu64
+                          " pulses_total=%" PRIu64 " depth=%u\n",
+                          s->chiplet_id, s->fnsh_head, s->fnsh_tail,
+                          entries_walked, s->pulses_fired - pulses_before,
+                          s->kicks, s->completes, s->pulses_fired,
+                          r100_rbdma_fnsh_depth(s));
 
     /* `kicks` and `completes` may diverge if pulses run ahead of
      * regstore reads — that's expected, the consumer-side
@@ -589,6 +656,25 @@ static void r100_rbdma_kickoff(R100RBDMAState *s, uint32_t run_conf1)
     }
     s->kicks++;
 
+    qemu_log_mask(LOG_TRACE,
+                  "r100-rbdma cl=%u kickoff task_type=%u ptid=0x%08x "
+                  "intr_en=%d run_conf0=0x%08x run_conf1=0x%08x "
+                  "head=%u tail=%u depth=%u kicks=%" PRIu64 "\n",
+                  s->chiplet_id, task_type, ptid_init,
+                  (int)e.intr_enabled, run_conf0, run_conf1,
+                  s->fnsh_head, s->fnsh_tail,
+                  r100_rbdma_fnsh_depth(s), s->kicks);
+    r100_rbdma_emit_debug(s,
+                          "rbdma cl=%u kickoff task_type=%u ptid=0x%08x "
+                          "intr_en=%d run_conf0=0x%08x run_conf1=0x%08x "
+                          "head=%u tail=%u depth=%u kicks=%" PRIu64
+                          " oto_kicks=%" PRIu64 " unimp=%" PRIu64 "\n",
+                          s->chiplet_id, task_type, ptid_init,
+                          (int)e.intr_enabled, run_conf0, run_conf1,
+                          s->fnsh_head, s->fnsh_tail,
+                          r100_rbdma_fnsh_depth(s), s->kicks,
+                          s->oto_kicks, s->unimp_task_kicks);
+
     if (s->done_bh) {
         qemu_bh_schedule(s->done_bh);
     }
@@ -608,17 +694,39 @@ static uint64_t r100_rbdma_read(void *opaque, hwaddr addr, unsigned size)
      * round-trip a stale store value once the device's runtime state
      * has moved on. */
     switch (addr) {
-    case RBDMA_GLOBAL_INTR_FIFO_NUM_OFF:
+    case RBDMA_GLOBAL_INTR_FIFO_NUM_OFF: {
         /* {fnsh:8, err:8, reserved:16}. q-cp's done_handler loops
          * while `fnsh > 0`. err stays 0 (no synth errors). */
-        return r100_rbdma_fnsh_depth(s) & 0xFFu;
+        uint32_t depth = r100_rbdma_fnsh_depth(s) & 0xFFu;
+        qemu_log_mask(LOG_TRACE,
+                      "r100-rbdma cl=%u read_fifo_num depth=%u "
+                      "head=%u tail=%u\n",
+                      s->chiplet_id, depth, s->fnsh_head,
+                      s->fnsh_tail);
+        return depth;
+    }
 
     case RBDMA_GLOBAL_FNSH_INTR_FIFO_OFF:
         /* Pop one entry — silicon: reading this register returns the
          * head of the fnsh FIFO and decrements the readable count. */
         if (r100_rbdma_fnsh_pop(s, &e)) {
+            qemu_log_mask(LOG_TRACE,
+                          "r100-rbdma cl=%u read_fnsh_pop ptid=0x%08x "
+                          "new_head=%u tail=%u depth=%u\n",
+                          s->chiplet_id, e.ptid_init, s->fnsh_head,
+                          s->fnsh_tail, r100_rbdma_fnsh_depth(s));
+            r100_rbdma_emit_debug(s,
+                                  "rbdma cl=%u fnsh_pop ptid=0x%08x "
+                                  "new_head=%u tail=%u depth=%u\n",
+                                  s->chiplet_id, e.ptid_init,
+                                  s->fnsh_head, s->fnsh_tail,
+                                  r100_rbdma_fnsh_depth(s));
             return e.ptid_init;
         }
+        qemu_log_mask(LOG_TRACE,
+                      "r100-rbdma cl=%u read_fnsh_pop empty "
+                      "head=%u tail=%u\n",
+                      s->chiplet_id, s->fnsh_head, s->fnsh_tail);
         return 0;
 
     case RBDMA_GLOBAL_NORMALTQ_STATUS_OFF:
@@ -714,8 +822,15 @@ static void r100_rbdma_reset(DeviceState *dev)
     /* Counters intentionally survive reset. */
 }
 
+static void r100_rbdma_unrealize(DeviceState *dev)
+{
+    R100RBDMAState *s = R100_RBDMA(dev);
+    qemu_chr_fe_deinit(&s->rbdma_debug_chr, false);
+}
+
 static Property r100_rbdma_properties[] = {
     DEFINE_PROP_UINT32("chiplet-id", R100RBDMAState, chiplet_id, 0),
+    DEFINE_PROP_CHR("debug-chardev", R100RBDMAState, rbdma_debug_chr),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -724,6 +839,7 @@ static void r100_rbdma_class_init(ObjectClass *oc, void *data)
     DeviceClass *dc = DEVICE_CLASS(oc);
 
     dc->realize = r100_rbdma_realize;
+    dc->unrealize = r100_rbdma_unrealize;
     device_class_set_legacy_reset(dc, r100_rbdma_reset);
     device_class_set_props(dc, r100_rbdma_properties);
 }

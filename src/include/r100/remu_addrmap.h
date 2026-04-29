@@ -553,6 +553,7 @@ static inline uint32_t r100_dnc_intid(uint32_t dnc_id, uint32_t cmd_type)
 #define R100_HDMA_CH_REG_MSI_ABORT_HI   0xA4u
 #define R100_HDMA_CH_REG_MSI_MSGD       0xA8u    /* MSI message data */
 
+#define R100_HDMA_ENABLE_BIT            (1u << 0)
 #define R100_HDMA_DB_START_BIT          (1u << 0)
 #define R100_HDMA_DB_STOP_BIT           (1u << 1)
 

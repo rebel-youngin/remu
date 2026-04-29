@@ -220,6 +220,31 @@ static void r100_hdma_emit_debug(R100HDMAState *s, const char *dir,
     }
 }
 
+/* Structural trace tail (doorbell / LL walk start / completion). One
+ * line per significant event, lands in the same hdma-debug chardev as
+ * the OP_WRITE/READ_REQ frame trace. Always-on, bounded to a few
+ * lines per kicked LL chain — no --trace overhead. */
+static void r100_hdma_emit_trace(R100HDMAState *s, const char *fmt, ...)
+    G_GNUC_PRINTF(2, 3);
+
+static void r100_hdma_emit_trace(R100HDMAState *s, const char *fmt, ...)
+{
+    char line[256];
+    int n;
+    va_list ap;
+
+    if (!qemu_chr_fe_backend_connected(&s->hdma_debug_chr)) {
+        return;
+    }
+    va_start(ap, fmt);
+    n = vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        qemu_chr_fe_write(&s->hdma_debug_chr, (const uint8_t *)line,
+                          MIN((size_t)n, sizeof(line) - 1));
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* Public emit API (shared with r100-cm7)                              */
 /* ------------------------------------------------------------------ */
@@ -314,6 +339,18 @@ static void r100_hdma_signal_completion(R100HDMAState *s,
         qemu_irq_pulse(s->hdma_irq);
     }
     s->channel_completions++;
+    qemu_log_mask(LOG_TRACE,
+                  "r100-hdma cl=%u signal_completion dir=%s ch=%u "
+                  "pending_mask=0x%x completions=%" PRIu64 "\n",
+                  s->chiplet_id,
+                  dir == R100_HDMA_DIR_RD ? "rd" : "wr",
+                  ch, cur, s->channel_completions);
+    r100_hdma_emit_trace(s,
+                         "hdma cl=%u signal_completion dir=%s ch=%u "
+                         "pending_mask=0x%x completions=%" PRIu64 "\n",
+                         s->chiplet_id,
+                         dir == R100_HDMA_DIR_RD ? "rd" : "wr",
+                         ch, cur, s->channel_completions);
 }
 
 /* ------------------------------------------------------------------ */
@@ -611,6 +648,19 @@ static bool r100_hdma_walk_ll(R100HDMAState *s, R100HdmaDir dir,
         return false;
     }
 
+    qemu_log_mask(LOG_TRACE,
+                  "r100-hdma cl=%u ll_walk_start dir=%s ch=%u "
+                  "llp=0x%" PRIx64 "\n",
+                  s->chiplet_id,
+                  dir == R100_HDMA_DIR_RD ? "rd" : "wr",
+                  ch, cursor);
+    r100_hdma_emit_trace(s,
+                         "hdma cl=%u ll_walk_start dir=%s ch=%u "
+                         "llp=0x%" PRIx64 "\n",
+                         s->chiplet_id,
+                         dir == R100_HDMA_DIR_RD ? "rd" : "wr",
+                         ch, cursor);
+
     c->walk.ll_active = true;
 
     while (cursor != 0 && elems < R100_HDMA_LL_MAX_ELEMS) {
@@ -631,15 +681,40 @@ static bool r100_hdma_walk_ll(R100HDMAState *s, R100HdmaDir dir,
                           "r100-hdma: LL walk read elem ch=%u "
                           "addr=0x%" PRIx64 " failed\n", ch,
                           (uint64_t)cursor);
+            r100_hdma_emit_trace(s,
+                                 "hdma cl=%u ll_walk_read_fail dir=%s "
+                                 "ch=%u cursor=0x%" PRIx64 " mr=%d\n",
+                                 s->chiplet_id,
+                                 dir == R100_HDMA_DIR_RD ? "rd" : "wr",
+                                 ch, (uint64_t)cursor, (int)mr);
             c->walk.ll_active = false;
             return false;
         }
         elems++;
 
+        /* Always emit raw read for diagnostic — even when we break
+         * on CB=0 below, we need to see what we actually read. */
+        r100_hdma_emit_trace(s,
+                             "hdma cl=%u ll_walk_read dir=%s ch=%u "
+                             "elem=%d cursor=0x%" PRIx64
+                             " ctrl=0x%08x xsize=%u sar=0x%" PRIx64
+                             " dar=0x%" PRIx64 "\n",
+                             s->chiplet_id,
+                             dir == R100_HDMA_DIR_RD ? "rd" : "wr",
+                             ch, elems, (uint64_t)cursor,
+                             elem.control, elem.transfer_size,
+                             elem.sar, elem.dar);
+
         /* Cycle-bit invalid → end of chain (or trailing zero LLP
          * record_llp(0,0) terminator). q-cp always sets CB on the
          * LLI/LLP elements it builds. */
         if (!(elem.control & R100_HDMA_LL_CTRL_CB)) {
+            r100_hdma_emit_trace(s,
+                                 "hdma cl=%u ll_walk_break_no_cb dir=%s "
+                                 "ch=%u elem=%d ctrl=0x%08x\n",
+                                 s->chiplet_id,
+                                 dir == R100_HDMA_DIR_RD ? "rd" : "wr",
+                                 ch, elems, elem.control);
             break;
         }
 
@@ -655,6 +730,20 @@ static bool r100_hdma_walk_ll(R100HDMAState *s, R100HdmaDir dir,
         {
             bool sar_host = (elem.sar >= REMU_HOST_PHYS_BASE);
             bool dar_host = (elem.dar >= REMU_HOST_PHYS_BASE);
+            const char *route =
+                (sar_host && dar_host) ? "host-host"
+                : (dir == R100_HDMA_DIR_WR && dar_host) ? "wr-host-leg"
+                : (dir == R100_HDMA_DIR_RD && sar_host) ? "rd-host-leg"
+                : "d2d";
+
+            qemu_log_mask(LOG_TRACE,
+                          "r100-hdma cl=%u ll_lli dir=%s ch=%u "
+                          "elem=%d sar=0x%" PRIx64 " dar=0x%" PRIx64
+                          " size=%u ctrl=0x%08x route=%s\n",
+                          s->chiplet_id,
+                          dir == R100_HDMA_DIR_RD ? "rd" : "wr",
+                          ch, elems, elem.sar, elem.dar,
+                          elem.transfer_size, elem.control, route);
 
             if (elem.transfer_size == 0) {
                 /* Empty LLI — q-cp doesn't emit these in the
@@ -701,6 +790,18 @@ static bool r100_hdma_walk_ll(R100HDMAState *s, R100HdmaDir dir,
     }
 
     c->walk.ll_active = false;
+    qemu_log_mask(LOG_TRACE,
+                  "r100-hdma cl=%u ll_walk_end dir=%s ch=%u "
+                  "elems=%d last_seen=%d\n",
+                  s->chiplet_id,
+                  dir == R100_HDMA_DIR_RD ? "rd" : "wr",
+                  ch, elems, (int)last_seen);
+    r100_hdma_emit_trace(s,
+                         "hdma cl=%u ll_walk_end dir=%s ch=%u "
+                         "elems=%d last_seen=%d cursor=0x%" PRIx64 "\n",
+                         s->chiplet_id,
+                         dir == R100_HDMA_DIR_RD ? "rd" : "wr",
+                         ch, elems, (int)last_seen, (uint64_t)cursor);
     if (!last_seen) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "r100-hdma: LL walk dir=%d ch=%u terminated "
@@ -741,10 +842,28 @@ static void r100_hdma_kick_ll(R100HDMAState *s, R100HdmaDir dir,
 static void r100_hdma_doorbell(R100HDMAState *s, R100HdmaDir dir,
                                uint32_t ch, uint32_t val)
 {
-    if (val & R100_HDMA_DB_START_BIT) {
-        R100HdmaChan *c = &s->ch[dir][ch];
+    R100HdmaChan *c = &s->ch[dir][ch];
+    bool llen = !!(c->ctrl1 & R100_HDMA_CTRL1_LLEN_BIT);
 
-        if (c->ctrl1 & R100_HDMA_CTRL1_LLEN_BIT) {
+    qemu_log_mask(LOG_TRACE,
+                  "r100-hdma cl=%u doorbell dir=%s ch=%u val=0x%x "
+                  "llen=%d ctrl1=0x%08x sar=0x%" PRIx64
+                  " dar=0x%" PRIx64 " xfer=%u llp=0x%" PRIx64 "\n",
+                  s->chiplet_id,
+                  dir == R100_HDMA_DIR_RD ? "rd" : "wr",
+                  ch, val, (int)llen, c->ctrl1, c->sar, c->dar,
+                  c->xfer_size, c->llp);
+    r100_hdma_emit_trace(s,
+                         "hdma cl=%u doorbell dir=%s ch=%u val=0x%x "
+                         "llen=%d ctrl1=0x%08x sar=0x%" PRIx64
+                         " dar=0x%" PRIx64 " xfer=%u llp=0x%" PRIx64 "\n",
+                         s->chiplet_id,
+                         dir == R100_HDMA_DIR_RD ? "rd" : "wr",
+                         ch, val, (int)llen, c->ctrl1, c->sar, c->dar,
+                         c->xfer_size, c->llp);
+
+    if (val & R100_HDMA_DB_START_BIT) {
+        if (llen) {
             r100_hdma_kick_ll(s, dir, ch);
         } else if (dir == R100_HDMA_DIR_WR) {
             r100_hdma_kick_wr(s, ch);
@@ -754,10 +873,35 @@ static void r100_hdma_doorbell(R100HDMAState *s, R100HdmaDir dir,
         return;
     }
     if (val & R100_HDMA_DB_STOP_BIT) {
-        R100HdmaChan *c = &s->ch[dir][ch];
-        c->status = R100_HDMA_STATUS_ABORTED;
-        c->int_status |= R100_HDMA_INT_ABORT_BIT;
-        r100_hdma_signal_completion(s, dir, ch);
+        /* DW HDMA STOP semantics: if a transfer was running, force
+         * it to stop and raise INT_ABORT. If the channel was idle
+         * (CH_REG_ENABLE = 0), STOP is silently absorbed — no IRQ,
+         * no SUBCTRL_EDMA_INT_CA73 pending bit, no int_status update.
+         *
+         * q-cp's `hdma_init_channels` posts STOP to all 32 channels
+         * at boot *before* any channel is enabled, so c->enable=0
+         * for that pass. If we surfaced those as ABORT IRQs, q-cp's
+         * `hdma_forward_irq` later picks the lowest pending bit
+         * (always WR ch 0 from init pollution), dispatches into
+         * `hdma_irq_handler` with no `chan->cb_tcb`, and the *real*
+         * completion's `cb_pkt_done` (RD ch 0 LL walk) never fires —
+         * pkt_pend_cnt stays >0, cb_complete stays parked behind
+         * wait_barrier, and the host's TDR eventually times out
+         * (= P10 cb[1] never completes — observed in
+         * output/p10-bigdram/hils.log: `pi[2] ... done 1` with
+         * `last_di 1` and "send MSIx interrupt to host" missing).
+         *
+         * The status-field check (RUNNING) is unreliable as a gate
+         * because R100_HDMA_STATUS_RUNNING == 0 is also the cold-
+         * reset value, so init-time STOPs would still fall through.
+         * `c->enable` is set explicitly by q-cp via the ENABLE reg
+         * before the START doorbell, so it's a reliable proxy for
+         * "this channel had a transfer to interrupt". */
+        if (c->enable & R100_HDMA_ENABLE_BIT) {
+            c->status = R100_HDMA_STATUS_ABORTED;
+            c->int_status |= R100_HDMA_INT_ABORT_BIT;
+            r100_hdma_signal_completion(s, dir, ch);
+        }
     }
 }
 
