@@ -566,22 +566,35 @@ markers in order — missing marker pinpoints the stall:
 FW ground truth lives in `external/ssw-bundle/products/rebel/q/sys/bootloader/cp/tf-a/`
 — cross-reference via `CLAUDE.md` ("Key external files").
 
-## Open issue: P10 — cb[1] HDMA LL chain reads all zeros
+## Open issue: P10 — HDMA payload SAR/DAR via SMMU stage-2 (post-CM7-stub)
 
-**Status.** Open. `./remucli test p10` times out at 180 s on every
-run. Excluded from `./remucli test` defaults via `in_default=False`
-in `TEST_REGISTRY`. The pre-P11 "cb[1] SMMU translate fault" mode
-is gone. The pre-fix "x86 guest OOM during `rbln_register_p2pdma`"
-mode is also gone — `tests/p10_umd_smoke_test.py` and
-`tests/p10_qcp_gdb_probe.py` now both pass `--host-mem 4G`, and
-`SHM_SIZE_DEFAULT` / `R100_DRAM_INIT_SIZE` / `R100_BAR0_DDR_SIZE` are
-all aliased to `R100_RBLN_DRAM_SIZE = 36 GB` (one chiplet's full DRAM
-= real CR03 BAR0) so the kmd's MMU page-table pool at
-`0x51800000+0x2800000` and q-cp's user-allocator hits in the
-`0x40000000+` PF system IPA window are both addressable on the shared
-shm splice across the full BAR0 — there are no host-private lazy-RAM
-holes inside the silicon-visible window (see `CLAUDE.md` → "M5 splice
-points" + the inline comment at
+**Status.** Partially fixed; new front-edge bug. `./remucli test p10`
+still times out at 180 s on every run, but the failure mode has
+**moved past** the "HDMA RD ch0 LL chain reads all zeros" wedge that
+held the old version of this entry. With the chiplet-0 CM7 mailbox
+stub landed (`src/machine/r100_mailbox.c` + the chiplet-0
+`MAILBOX_CP0_M4` install in `r100_soc.c`, see `CLAUDE.md`),
+`CR0.SMMUEN` is now `1` after `notify_dram_init_done` and HDMA's
+LL fetch resolves the LLP through the v1 stage-2 walker.
+`hdma.log` for the same `command_submission -y 5` workload now
+shows the full first LLI — `xsize=0x200000 sar=0x0b800000
+dar=0x140000000`, the 2 MB host→device kernel-image copy — instead
+of the previous all-zero record. Three chiplet-0 CMDQ entries
+(`CFGI_CD sid=8`, `CFGI_STE sid=8`, `CFGI_STE_RANGE`) follow `CR0
+0xc→0xd` cleanly. The remaining failure is now a **stage-2 fault
+on the LLI's payload SAR**, not the LL chain itself — see
+"Symptom" below. Excluded from `./remucli test` defaults via
+`in_default=False` in `TEST_REGISTRY`. The pre-fix "x86 guest OOM
+during `rbln_register_p2pdma`" is also still gone —
+`tests/p10_umd_smoke_test.py` and `tests/p10_qcp_gdb_probe.py` both
+pass `--host-mem 4G`, and `SHM_SIZE_DEFAULT` / `R100_DRAM_INIT_SIZE`
+/ `R100_BAR0_DDR_SIZE` are all aliased to
+`R100_RBLN_DRAM_SIZE = 36 GB` (one chiplet's full DRAM = real CR03
+BAR0) so the kmd's MMU page-table pool at `0x51800000+0x2800000` and
+q-cp's user-allocator hits in the `0x40000000+` PF system IPA window
+are both addressable on the shared shm splice across the full BAR0
+— there are no host-private lazy-RAM holes inside the silicon-visible
+window (see `CLAUDE.md` → "M5 splice points" + the inline comment at
 `src/include/r100/remu_addrmap.h:R100_RBLN_DRAM_SIZE`). The 36 GB
 ftruncate is sparse on tmpfs so phase-1 boot tests (m5..p5, p11) still
 only commit ~tens of MB; the only host requirement is `/dev/shm` with
@@ -590,56 +603,205 @@ only commit ~tens of MB; the only host requirement is `/dev/shm` with
 the shorter splice falls back to a host-private `bar0_tail` /
 NPU-private `dram_tail` for the rest of BAR0.
 
-**Symptom (post-memory-fix).** `command_submission -y 5` from the
-umd staged into the guest by `guest/build-umd.sh` submits two CBs
-to queue 0. cb[0] completes — `output/<name>/npu/cfg.log` /
-`xp /1wx 0xf000200ffc` shows `FUNC_SCRATCH = 0xcafedead` and
-`output/<name>/host/msix.log` records one MSI-X frame. cb[1] then
-stalls. The kmd's TDR fires (`queue_timedout: command-queue-0 TDR 1
-Qseq 1/1/2`), then `rsd_device_reset` runs the dump+unload+reset
-cascade documented below, then a second `rebel_queue_init` from
-`rsd_sched_device_init` busy-polls forever (the
-`jiffies_to_usecs` side-bug below) and the host watchdog
-eventually prints `soft lockup ... rebel_hw_init+0x439`.
+**Symptom.** `command_submission -y 5` from the umd staged into
+the guest by `guest/build-umd.sh` submits two CBs to queue 0. cb[0]
+gets through the small-packet path (`PACKET_WRITE_DATA` lands on
+`FUNC_SCRATCH` via the cfg-mirror trap; `npu/cfg.log` / `xp /1wx
+0xf000200ffc` confirms `0xcafedead` and one MSI-X frame egresses),
+and the first `PACKET_LINKED_DMA` packet — cb[0]'s 2 MB host→device
+kernel-image copy — now successfully fetches its LL chain through
+SMMU stage-2 (LLP = `0x42b86640` IPA → PA `0x02b86640` walks
+fine). But the SMMU then faults on the **LLI payload's SAR** as
+HDMA tries to read the source bytes:
+
+```
+hdma cl=0 ll_walk_read dir=rd ch=0 elem=1 cursor=0x42b86640 \
+        ctrl=0x00000001 xsize=2097152 sar=0xb800000 dar=0x140000000
+hdma cl=0 smmu_fault ll-d2d-sar dva=0xb800000 fault=s2_translation
+hdma cl=0 signal_completion dir=rd ch=0 pending_mask=0x10000 completions=1
+```
+
+`SAR = 0x0b800000` is a chiplet-local NPU PA (not an IPA) and
+`DAR = 0x140000000` is a host PCIe PA — neither of them was
+translated by `cb_parse_linked_dma`'s `+ PF_SYSTEM_IPA_BASE`
+trick (only the LL *chain pointer* gets that). HDMA's
+`R100SMMUTranslate` call presently routes them through the
+chiplet-0 SMMU's PF SID anyway, which after `smmu_s2_enable(0,
+l1base)` has `STE.Config = ALL_TRANS` — so a stage-2 walk fires
+and faults because no PT entry exists for `0xb800000`. The
+walker raises `ll-d2d-sar` and signals chan-done with one
+completion; q-cp's `hdma_done_handler` advances cb[0] but the
+2 MB it expected to find at the destination is empty. The kmd's
+TDR fires (`queue_timedout: command-queue-0 TDR 1 Qseq 1/1/2`),
+`rsd_device_reset` runs the dump+unload+reset cascade documented
+below, then a second `rebel_queue_init` from
+`rsd_sched_device_init` busy-polls forever (the `jiffies_to_usecs`
+side-bug below) and the host watchdog eventually prints
+`soft lockup ... rebel_hw_init+0x439`.
 
 **Proximate cause.** `output/<name>/hdma.log` shows q-cp kicked HDMA
-RD ch0 with `llp=0x42b86740` (NPU-local PA in chiplet-0 DRAM, well
-inside the 36 GB shm splice). The walker fetches a 24-byte LL
-element at that cursor and reads **all zeros** (`ctrl=0`,
-`xsize=0`, `sar=0`, `dar=0`), breaks immediately, signals
-completion, and pulses `INT_ID_HDMA = 186` to q-cp. The gdb probe
-confirms the same: `monitor xp /16wx 0x42B86700` over a 192-byte
-window centred on the cursor returns 48 contiguous zero words. So
-either q-cp programmed `regs->llp = 0x42b86740` without ever
-populating the chain at that NPU IPA, or the CA73 stage-1 stores
-the chain elsewhere than where `CPVA_TO_PA(CHIPLET_ID, chan->mem->addr)`
-claims. Distinguishing the two requires walking q-cp's heap on the
-gdb probe — there's a follow-on note below.
+RD ch0 with `llp=0x42b8XXXX` (the low bits drift run-to-run with
+`rl_malloc`'s allocation pattern; on the run captured below it was
+`0x42b86640`). With `cr0_smmuen=1` the walker resolves the LLP via
+stage-2: `output/<name>/smmu.log` shows
+`xlate_in sid=0 dva=0x42b86640 rd cr0_smmuen=1` followed by
+`xlate_out sid=0 dva=0x42b86640 stage-2 pa=0x02b86640` — exactly
+the IPA-to-PA mapping `cb_parse_linked_dma` constructed. HDMA
+reads a valid first `dw_hdma_v0_lli{ctrl=0x1, xsize=0x200000,
+sar=0x0b800000, dar=0x140000000}` from the chain. **Then it tries
+to translate `sar=0x0b800000` through the same SID** and faults
+because that PA isn't covered by the stage-2 PT (`ptw_s2t_pf[]`
+"SYSTEM" region only maps IPA `0x40000000..0x80000000` → PA
+`0x0..0x40000000`). LLI #2 / #3 are unreachable behind the fault.
 
-`output/<name>/npu/qemu.stderr.log` shows **no** `TRANSLATE FAULT`
-or `RBDMA OTO` activity for the cb[1] window — both SMMU (P11) and
-RBDMA (P4B) are silent on the cb[1] slot, consistent with the
-"HDMA fired but transferred 0 bytes, downstream RBDMA never gated
-in" reading. cb[0] uses `PACKET_WRITE_DATA` and goes straight
-through the cfg-mirror trap to `FUNC_SCRATCH` so it doesn't touch
-HDMA at all (which is why cb[0] passes).
+The LL chain itself is well-formed — confirmed against the live NPU
+via HMP `xp /16xw 0x02b86640`: 24 valid LL bytes per element, three
+elements total, the last one carrying `ctrl=0x9` (`CB|LIE`) marking
+end-of-chain. Three LLIs match the cb shape exactly: a 2 MB kernel
+copy, an 8 KB init copy, a 4 KB CS copy from the host coherent
+buffer (sar in BAR0 IPA `0x0F000000+`) into the device IPA window
+(dar in `0x40000000+`).
 
-Diagnostic recipe:
+**Root cause for the LL-chain pointer (now fixed).**
+q-cp's `cb_parse_linked_dma`
+(`external/ssw-bundle/products/rebel/q/cp/src/cb_mgr/command_buffer_manager.c:509`)
+transforms the kmd-supplied LL chain pointer:
+
+```
+buf = rl_malloc(pkt_size_ext + sizeof(struct packet_linked_dma));
+memcpy(buf + total_size, (void *)addr, size);   /* copy chain into buf */
+flush_dcache_range(buf, pkt_size_ext);
+internal_pkt = (struct packet_linked_dma *)((uint64_t)buf + pkt_size_ext);
+*internal_pkt = *pkt;
+pkt = internal_pkt;
+/* System region from CPVA to IPA */
+pkt->addr = (uint64_t)buf & (FREERTOS_VA_OFFSET - 1);
+pkt->addr += (func_id > 0) ? VF_SYSTEM_HIDDEN_OFFSET : PF_SYSTEM_IPA_BASE;
+```
+
+For PF (`func_id == 0`), `PF_SYSTEM_IPA_BASE = 0x40000000`
+(`external/ssw-bundle/products/rebel/q/cp/include/hal/ptw.h:54`).
+So the value q-cp writes to `regs->llp` is **the buffer's PA + 0x40000000**
+— a PCIe-PF system **IPA**, not a PA — and the HDMA AXI fetch
+relies on the chiplet-0 SMMU to walk it through a stage-2 PT to
+the real backing PA. q-cp's `ptw_init_smmu_s2(num_vfs=0)`
+(`external/ssw-bundle/products/rebel/q/cp/src/hal/common/ptw.c:642`,
+called from `host_queue_manager.c:hq_init` after the first
+QUEUE_INIT doorbell) builds the matching aarch64 stage-2 PT at
+`PF_S2TT_ADDR = 0x14080000`, mapping IPA
+`0x40000000..0x80000000` → PA `0x00000000..0x40000000`. P11's v1
+stage-2 walker (`r100_smmu.c:1109`) consumes `STE.Config =
+ALL_TRANS` correctly and resolves `0x42b86640` → `0x02b86640`.
+**That part works once `CR0.SMMUEN = 1`.**
+
+**The CR0 stub (the fix this entry pivots on).** All those
+STE/S2TTB updates only matter if the TCU is powered on, and FW
+only flips `CR0.SMMUEN` via a CM7 mailbox handshake REMU doesn't
+model. Pre-fix:
+
+```
+external/ssw-bundle/products/rebel/q/sys/drivers/smmu/smmu.c:875
+static inline void notify_dram_init_done(void)
+{
+    uint32_t val = 0xFB0D;
+    int timeout = ACK_TIMEOUT;
+    ipm_samsung_write(IDX_MAILBOX_CP0_M4, 0, &val, sizeof(val), CM7_DRAM_INIT_DONE_CHANNEL);
+    ipm_samsung_send (IDX_MAILBOX_CP0_M4, 0, CM7_DRAM_INIT_DONE_CHANNEL, CPU1);
+    do {
+        ipm_samsung_receive(IDX_MAILBOX_CP0_M4, &val, sizeof(val), CM7_DRAM_INIT_DONE_CHANNEL);
+    } while (val && timeout--);
+    if (timeout <= 0) {
+        RLOG_ERR("Time out to notify DRAM init done.\n");
+        smmu_enable();
+    }
+}
+```
+
+`MAILBOX_CP0_M4` was unmapped lazy RAM — `ipm_samsung_write` stores
+via the cross-chiplet PA path (`base + target_id*OFFSET -
+FREERTOS_VA_OFFSET`), `ipm_samsung_receive` reads via the
+FREERTOS-VA path (`base` directly). Those land on different PAs in
+the unmapped region, so the receive side reads `0` on the first
+iteration, the loop exits with `val == 0 && timeout > 0`, the
+in-tree `smmu_enable()` fallback is **not** called, and
+`CR0.SMMUEN` stays `0`. q-cp then emits PF-IPA LLPs
+(`PA + 0x40000000`) into a walker stuck in identity bypass.
+Every HDMA RD walk read zeros.
+
+**Why this is chiplet-0-only.** PCIE_CM7 is on chiplet 0 (the
+chiplet with the PCIe block). Chiplets 1..3 have no PCIe and no
+CM7, so q-sys's `smmu_init` branches:
+
+```
+external/ssw-bundle/products/rebel/q/sys/drivers/smmu/smmu.c:932-935
+if (CHIPLET_ID == CHIPLET_ID0)
+    notify_dram_init_done();   /* chiplet 0: wait for CM7 ack */
+else
+    smmu_enable();             /* chiplets 1..3: MMIO-write CR0 */
+```
+
+On chiplets 1..3 the in-tree `smmu_enable()` writes `CR0.SMMUEN = 1`
+to that chiplet's `r100-smmu` MMIO directly — REMU's normal write
+handler already serves it. Worker chiplets have always had SMMU on.
+The pre-fix all-zero LL bug was chiplet-0-only because q-cp's
+HDMA / RBDMA / DNC tasks all run on chiplet 0 (where the
+umd-submitted CBs land), and only that one SMMU was stuck off.
+
+The fix is a minimal **CM7 mailbox stub** on the chiplet-0
+`MAILBOX_CP0_M4` block, opted in via two new `r100-mailbox`
+properties (`cm7-stub` + `cm7-smmu-base`) wired in `r100_soc.c`.
+ISSR reads always return `0` to preserve the lazy-RAM-via-FREERTOS-VA
+"first read returns 0" shape every CM7 poll loop in q-sys depends on
+for early exit (notably `rbln_cm7_get_values` /
+`rbln_pcie_get_ats_enabled` which the boot path runs immediately
+after `notify_dram_init_done`); writes to `INTGR1` bit
+`cm7-dram-init-done-channel` (default 11, =
+`CM7_DRAM_INIT_DONE_CHANNEL`) with `ISSR[<channel>] == 0xFB0D` poke
+`CR0.SMMUEN = 1` at `cm7-smmu-base + 0x20` via the
+`ldl_le_phys` / `stl_le_phys` RMW pair (so the existing
+`CMDQEN` / `EVENTQEN` bits set earlier by `smmu_enable_queues`
+survive) — silicon-equivalent to
+`pcie_cp2cm7_callback → dram_init_done_cb → m7_smmu_enable`.
+Counter `cm7_dram_init_done_acks` (vmstate-tracked) records
+how many times it fires.
+
+**Why the next-edge SAR fault is honest.** Once `CR0.SMMUEN = 1`,
+`r100-hdma`'s LL walker translates the LLP through the v1
+stage-2 walker fine, fetches the real LLI, then has to fetch
+SAR / DAR for the actual byte transfer. Today r100-hdma routes
+those translates through the same SID (PF=0) — but
+`SAR=0x0b800000` is a chiplet-local NPU PA (q-cp's RBDMA stage
+puts `simple_copy` source there) and `DAR=0x140000000` is a host
+PCIe PA, neither of which is in the FW's stage-2 PT. The walker
+correctly faults. On real silicon, the master driving HDMA's
+AXI burst presents a SID whose STE is configured for stage-1
+bypass (`STE_BYPASS` for SID 8 — `smmu_init_ste_bypass`), so
+SAR/DAR pass through unchanged; alternatively, FW could have
+extended the stage-2 PT to cover NPU local DRAM + the host
+window. Either of those is a follow-on fix; the SMMU model
+itself is correct.
+
+Diagnostic recipe (post-CM7-stub):
 
 ```
 ./remucli fw-build                                   # ELFs needed by gdb
 ./remucli test p10                                   # reproduces the hang
-python3 tests/p10_qcp_gdb_probe.py                   # snapshot cb[1] state
-less output/p10-umd/hdma.log                         # ll_walk_read elem=1 ctrl=0
-less output/p10-debug/qcp-bt-cb1.txt                 # gdb dump
+python3 tests/p10_qcp_gdb_probe.py                   # snapshot CA73 state
+less output/p10-umd/hdma.log                         # ll_walk_read elem=1 ctrl=0x1, then smmu_fault ll-d2d-sar
+less output/p10-umd/smmu.log                         # CR0 0xc→0xd smmuen=0→1, then xlate stage-2 ok / FAULT on SAR
+less output/p10-debug/qcp-bt-cb1.txt                 # gdb dump (tag still 'cb1')
 ```
 
-The probe pauses 1.5 s after the second `INTGR1=0x1` doorbell —
-exactly between cb[1] doorbell delivery and TDR — so the snapshot
-catches q-cp with `cb_run_cnt = 1`, `cq[0].ci = 1`, `cq[0].pi = 2`,
-all `cb_mgr.{ready,wait}_list` empty, and `cb_task` / `hdma_task`
-both suspended in `xTaskNotifyWait`. None of the running threads
-in `info threads` is in cb_task or hdma_task — they're all
+The probe pauses 1.5 s after the second `INTGR1=0x1` doorbell so
+both CBs are queued + the first one mid-flight on q-cp; with the
+CM7 stub landed, the snapshot catches q-cp with `cb_run_cnt = 1`,
+`cq[0].ci = 1`, `cq[0].pi = 2`, both `cb_mgr.{ready,wait}_list`
+empty, and `cb_task` / `hdma_task` suspended in `xTaskNotifyWait`
+waiting on an HDMA-done IRQ that never comes — but now because
+`ll_walk_read` decoded a real LLI and then faulted on the
+payload-SAR translate (see `Symptom`), not because the walker
+short-circuited on `ctrl=0`. None of the running threads in
+`info threads` is in cb_task or hdma_task — they're all
 runtime-idle CSes / DNC fetch workers. Override the settle window
 with `REMU_P10_DEBUG_DELAY_S=8.0` to catch the unload cascade
 instead.
@@ -651,24 +813,44 @@ Two more diagnostic-only probes (no `TEST_REGISTRY` entry):
   (direct shm read, NPU `xp`, host `xp`) to verify the alias is
   working.
 
-**Follow-on hypothesis (next debugging step).** The cb[1] HDMA path
-in q-cp is `cb_parse → cmd_descr_hdma → hdma_ll_trigger →
-hdma_ch_trigger`, which writes `regs->llp = chan->desc =
-hdma_pkt->addr` (the address from the `PACKET_LINKED_DMA` packet
-the kmd emitted). For `cmdgen_rebel_record_rbdma` simple_copy
-flows the LL chain is **not** populated by the kmd — it's emitted
-by q-cp's own `record_lli` / `record_llp` helpers writing into
-`chan->mem->addr`. If q-cp set `chan->desc` to the packet addr but
-emitted the chain into `chan->mem`, the two will only line up if
-the PACKET_LINKED_DMA's addr was reused as the mem buffer. Spot
-check: dump `chan->mem->addr` and `chan->mem->used_size` on the
-hdma channel q-cp picked, compare to `regs->llp.{lsb,msb}` and to
-`hdma_pkt->addr` from the cb body, and check whether
-`CPVA_TO_PA(CHIPLET_ID, chan->mem->addr) == llp` modulo the
-chiplet-base offset. The gdb probe's `print hdma_mgr` already pulls
-the htask handle; the missing piece is walking from the active
-hdma_chan back to its mem pool — cheapest route is to add a `print
-hdev` there once the q-cp source is mapped to the running ELF.
+**Fix shape — next hop: route HDMA SAR/DAR through stage-1
+bypass.** The CM7 mailbox stub above unblocked the LL chain
+walk, but `r100-hdma` still issues *all* its translations
+(LL pointer, SAR, DAR) on the same PF SID. After
+`smmu_s2_enable(0, l1base)` that SID has `Config = ALL_TRANS`, so
+the LL chain walks fine through stage-2 *but* SAR/DAR fall into
+the same walker and fault. Two viable shapes:
+
+- **Use the FW's own bypass SID for SAR/DAR.**
+  `smmu_init_ste_bypass(0)` configures `STE[8] = S1_TRANS` with
+  the in-DRAM bypass page table, identity-mapping `0x40000000+`
+  back to itself for stage-1. r100-hdma can keep using SID=0 for
+  the `LLP` translate (genuinely IPA, needs stage-2) and switch
+  to SID=8 (or whatever per-master bypass SID HDMA's master port
+  is wired to on real silicon) for SAR/DAR.
+- **Extend the stage-2 PT to cover NPU local DRAM + host
+  windows.** Match what `ptw_s2t_pf[]` would publish if the FW
+  didn't take the stage-1-bypass shortcut on these masters. More
+  faithful to real silicon's "everything DMA-side traverses S2"
+  posture but requires q-cp source changes — currently the
+  in-tree `ptw_s2t_pf[]` only covers the SYSTEM IPA window.
+
+The first approach is the smaller diff and matches stock FW
+behaviour without modifying q-cp. Once that lands, cb[0]'s 2 MB
+host→device copy can complete and we hit the next failure mode
+on cb[1] / RBDMA (whatever it turns out to be). If the walker
+turns up unrelated faults (missing `T0SZ` / wrong `SL0` / size
+mismatches), `smmu.log` logs them as `xlate_out … FAULT` lines
+and `r100_smmu_emit_event` publishes them on the eventq — honest
+follow-on SMMU v2 bugs, not blocking unknowns.
+
+The `tests/p10_qcp_gdb_probe.py` artefact stays useful for
+chasing later regressions: the ELF-symbol view (`hdma_mgr`,
+`hdev[0].chan_info[1].chans[0].desc`, `cfg-shadow` window) lines
+up cleanly with the live `xp` reads above and is the fastest way
+to confirm "did q-cp pick a different LLP this run, and where did
+it actually write the chain" without re-deriving the
+`PF_SYSTEM_IPA_BASE` offset from the FW source each time.
 
 **Side note — KMD `readl_poll_timeout_atomic` argument unit
 mismatch.** `rebel.c:700` calls
@@ -684,7 +866,7 @@ Tracked here so future people picking up P10 don't try to "fix" the
 timeout from the REMU side.
 
 **Side note — TDR `URG_EVENT_UNLOAD` register-dump cascade.** When
-the kmd's TDR fires (because cb[1] never completed), the
+the kmd's TDR fires (because cb[0] never completed), the
 `rebel_quiesce_device` path writes `REBEL_EVENT_DUMP = 4` to ISSR[6]
 and rings INTGR1 bit 6. The kmd-side `REBEL_EVENT_DUMP = 4`
 intentionally aliases the q-cp-side `URG_EVENT_UNLOAD = 4`, so
@@ -699,8 +881,8 @@ fresh, and `rebel_hw_init → rebel_queue_init` rings `INTGR1` bit 7
 (QUEUE_INIT). q-cp's `hq_task` is still mid-dump, never gets to
 re-run `hq_init`, `desc->init_done` is never written back through
 the P1a outbound iATU, and the busy-loop above eats the rest of
-the 180 s test budget. Fixing the underlying cb[1] path removes
-the entire cascade.
+the 180 s test budget. Fixing the underlying HDMA-LL path (above)
+removes the entire cascade.
 
 ## Cleanup
 

@@ -1175,6 +1175,54 @@ static void r100_soc_init(MachineState *machine)
         sysbus_mmio_map_overlap(SYS_BUS_DEVICE(mbx_pf_dev), 0,
                                 R100_PCIE_MAILBOX_PF_BASE, 10);
 
+        /* P10-fix: chiplet-0 MAILBOX_CP0_M4 — q-sys ↔ on-die PCIE_CM7
+         * channel. Real silicon: q-sys's `notify_dram_init_done`
+         * (q/sys/drivers/smmu/smmu.c:875) writes 0xFB0D into
+         * ISSR[CM7_DRAM_INIT_DONE_CHANNEL=11] then raises INTGR1[11];
+         * PCIE_CM7's `pcie_cp2cm7_callback` (pcie_mailbox_callback.c
+         * :311) services the IRQ → `dram_init_done_cb` →
+         * `m7_smmu_enable` (sets CR0.SMMUEN on this chiplet's SMMU)
+         * → writes 0 back to ISSR[11] so q-sys's poll loop exits.
+         * Without this stub, q-sys's loop short-circuits (val reads
+         * 0 instantly because the FREERTOS-VA mapping doesn't
+         * translate to the PA the cross-chiplet write hit), the
+         * `if (timeout <= 0) smmu_enable();` fallback never runs,
+         * CR0.SMMUEN stays 0 on chiplet 0, and HDMA's reads of LL
+         * chains at IPA `buf_PA + PF_SYSTEM_IPA_BASE` (q-cp's
+         * `cb_parse_linked_dma`) return zeros instead of the
+         * stage-2-translated PA — the P10 hang. The mailbox device
+         * itself plus the `cm7-stub` + `cm7-smmu-base` knobs
+         * (defined in r100_mailbox.c) is the entire stub: ISSR
+         * reads always return 0 (preserves the lazy-RAM-via-
+         * FREERTOS-VA shape that lets every q-sys CM7 poll loop
+         * exit on its first iteration — `rbln_cm7_get_values` for
+         * ATS_ENABLED / VFNUM, `rbln_pcie_request_ats_iatu`, etc.
+         * — without a full PCIE_CM7 firmware emulation), and the
+         * INTGR1 write handler synchronously pokes
+         * `SMMU.CR0.SMMUEN` at `cm7-smmu-base + 0x20` when bit
+         * `cm7-dram-init-done-channel` (default 11) is raised with
+         * `ISSR[<channel>] == 0xFB0D`.
+         *
+         * Single instance, chiplet 0 only — and worker chiplets
+         * 1..3 don't need an equivalent. PCIE_CM7 lives on chiplet
+         * 0 (it's the chiplet with the PCIe block), so the
+         * dram-init-done handshake is asymmetric in the FW:
+         * `q/sys/drivers/smmu/smmu.c:932-935` runs
+         * `notify_dram_init_done()` only on chiplet 0 and falls
+         * through to a plain `smmu_enable()` MMIO write on the
+         * others. That MMIO write hits `r100-smmu`'s normal
+         * handler and has always worked. */
+        {
+            DeviceState *cp0_m4 = qdev_new(TYPE_R100_MAILBOX);
+            qdev_prop_set_string(cp0_m4, "name", "cp0_m4.chiplet0");
+            qdev_prop_set_bit(cp0_m4, "cm7-stub", true);
+            qdev_prop_set_uint64(cp0_m4, "cm7-smmu-base",
+                                 R100_SMMU_TCU_BASE);
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(cp0_m4), &error_fatal);
+            sysbus_mmio_map_overlap(SYS_BUS_DEVICE(cp0_m4), 0,
+                                    R100_CP0_MAILBOX_M4_BASE, 10);
+        }
+
         /* P3: task-queue mailboxes at PERI{0,1}_MAILBOX_M{9,10}_CPU1
          * (chiplet 0). q-cp's CP1.cpu0 polls MBTQ_PI_IDX (ISSR[0])
          * across all four from taskmgr_fetch_dnc_task_master_cp1, one

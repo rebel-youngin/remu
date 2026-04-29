@@ -28,6 +28,66 @@
  * the kmd's cfg writes can't race ahead of q-sys's main.c:250 DCS
  * memset. See `docs/debugging.md` → Side bug 2.
  *
+ * P10-fix (CM7 mailbox stub): on chiplet-0 MAILBOX_CP0_M4 the on-die
+ * PCIE_CM7 normally services every q-sys ↔ CM7 handshake — most
+ * importantly the `notify_dram_init_done` path (q/sys/drivers/smmu/
+ * smmu.c:875 → q/sys/drivers/pcie/pcie_mailbox_callback.c:311 →
+ * pcie_ep.c:dram_init_done_cb → m7_smmu_enable). Without the ack,
+ * `CR0.SMMUEN` stays 0 on chiplet 0, q-cp's HDMA reads of LL chains
+ * at IPA `buf_PA + PF_SYSTEM_IPA_BASE` (cb_parse_linked_dma) return
+ * zeros instead of the stage-2-translated PA — the P10 hang.
+ *
+ * **Why only chiplet 0 needs this stub.** Real silicon's PCIE_CM7
+ * lives on chiplet 0 — it's the chiplet attached to the PCIe block,
+ * so the kmd, the host BAR mappings, and the on-die helper CPU that
+ * services the post-DRAM-init PCIe handshake (BAR re-anchoring,
+ * iATU reprogramming, AND the SMMU enable that gates host DMA) all
+ * sit there. Chiplets 1..3 have no PCIe block and no CM7. q-sys's
+ * `smmu_init()` reflects this asymmetry directly:
+ *
+ *     if (CHIPLET_ID == CHIPLET_ID0)
+ *         notify_dram_init_done();   // chiplet 0: wait for CM7 ack
+ *     else
+ *         smmu_enable();             // chiplets 1..3: just MMIO-write CR0
+ *
+ * On chiplets 1..3 the FW writes `CR0.SMMUEN = 1` directly to its
+ * own chiplet's SMMU MMIO — that store lands on `r100-smmu`'s normal
+ * write handler and it works out-of-the-box. No mailbox, no
+ * handshake, no stub needed. The pre-fix all-zero HDMA bug was
+ * chiplet-0-only because q-cp's HDMA / RBDMA / DNC tasks all run on
+ * CP0/CP1 of chiplet 0 (where the umd-submitted CBs land), and only
+ * chiplet 0's SMMU was the one stuck off.
+ *
+ * Pre-this-fix, the address `MAILBOX_CP0_M4` was unmapped lazy RAM,
+ * which paradoxically made q-sys boot work: `ipm_samsung_write`
+ * stores via the cross-chiplet PA path (`base + target*OFFSET -
+ * FREERTOS_VA_OFFSET`), `ipm_samsung_receive` reads via the
+ * FREERTOS-VA path (`base` directly). Those land on different PAs
+ * in the unmapped region, so every poll loop reads 0 on its first
+ * iteration and exits — `notify_dram_init_done`'s loop short-
+ * circuits past the in-tree `if (timeout <= 0) smmu_enable();`
+ * fallback (CR0.SMMUEN never gets set), but the OTHER CM7 polls
+ * (`rbln_pcie_get_ats_enabled` → `rbln_cm7_get_values` over
+ * CM7_GET_VALUES_CHANNEL, etc.) exit cleanly with val=0 and the FW
+ * boots through to FW_BOOT_DONE.
+ *
+ * The CM7-stub mode here preserves that read-zero behaviour
+ * (ISSR reads always return 0 when `cm7-stub` is set), while adding
+ * the side effect we *do* want: when FW raises INTGR1 bit
+ * `cm7-dram-init-done-channel` (default 11) with the just-stored
+ * value at ISSR[<channel>] == R100_FW_BOOT_DONE, we synchronously
+ * RMW `CR0.SMMUEN` at `cm7-smmu-base + 0x20` via the
+ * `ldl_le_phys` / `stl_le_phys` pair (so the `CMDQEN` / `EVENTQEN`
+ * bits set earlier by `smmu_enable_queues` survive) — the
+ * silicon-equivalent observable effect of `m7_smmu_enable`. q-sys's
+ * poll exits on the next read (which returns 0 because cm7-stub is
+ * on), the boot proceeds normally, and HDMA stage-2 translates work
+ * because SMMUEN is now 1. The only divergence from silicon-CM7
+ * (other than not actually running CM7 firmware) is that the
+ * fallback `if (timeout <= 0) smmu_enable();` path is unreachable
+ * in REMU regardless — the stub fires before the timeout would
+ * have. See `docs/debugging.md` → "Open issue: P10".
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -39,6 +99,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/qdev-properties-system.h"
 #include "chardev/char-fe.h"
+#include "exec/address-spaces.h"
 #include "migration/vmstate.h"
 #include "r100_soc.h"
 #include "r100_mailbox.h"
@@ -71,6 +132,14 @@
  */
 #define R100_MBX_SFR_SIZE       0x1000
 #define R100_MBX_ISSR_COUNT     64
+
+/* SMMU-600 register offsets the CM7 dram-init-done stub touches.
+ * Match q/sys/.../drivers/smmu/smmu.h: SMMU_CR0 / SMMU_CR0ACK at
+ * 0x020 / 0x024, CR0_SMMUEN = BIT(0). Keep local — pulling in the
+ * device's own header would couple the mailbox to r100-smmu's
+ * internals, and we only need the two offsets + the bit. */
+#define R100_MBX_CM7_SMMU_CR0_OFFSET    0x20
+#define R100_MBX_CM7_SMMU_CR0_SMMUEN    (1u << 0)
 
 struct R100MailboxState {
     SysBusDevice parent_obj;
@@ -111,9 +180,28 @@ struct R100MailboxState {
      * not flip it back. Reset to false on machine cold reset; carried
      * across vmstate snapshots. */
     bool fw_boot_done_seen;
+
+    /* P10-fix: optional on-die-CM7 mailbox stub. When `cm7_stub` is
+     * set, this mailbox terminates the q-sys ↔ PCIE_CM7 channel —
+     * see top-of-file banner. ISSR reads always return 0 to match
+     * the lazy-RAM-via-FREERTOS-VA shape every CM7 poll loop relies
+     * on for early exit; writes to INTGR1 bit
+     * `cm7_dram_init_done_channel` with the just-stored ISSR slot
+     * holding R100_FW_BOOT_DONE poke `CR0.SMMUEN` at
+     * `cm7_smmu_base + 0x20` (silicon-equivalent
+     * `dram_init_done_cb → m7_smmu_enable`). `cm7_smmu_base` = 0 is
+     * a soft no-op so pre-SoC-realize tests can flip the flag
+     * without crashing. */
+    bool cm7_stub;
+    uint32_t cm7_dram_init_done_channel;
+    uint64_t cm7_smmu_base;
+    uint64_t cm7_dram_init_done_acks;
 };
 
 DECLARE_INSTANCE_CHECKER(R100MailboxState, R100_MAILBOX, TYPE_R100_MAILBOX)
+
+static void r100_mailbox_cm7_dram_init_done_check(R100MailboxState *s,
+                                                  uint32_t intgr1_val);
 
 static inline uint32_t r100_mailbox_masked(const R100MailboxState *s, int g)
 {
@@ -134,6 +222,9 @@ void r100_mailbox_raise_intgr(R100MailboxState *s, int group, uint32_t val)
     s->pending[group] |= val;
     s->intgr_writes[group]++;
     r100_mailbox_update_irq(s, group);
+    if (group == 1) {
+        r100_mailbox_cm7_dram_init_done_check(s, val);
+    }
 }
 
 /*
@@ -308,6 +399,62 @@ void r100_mailbox_cm7_stub_write_issr(R100MailboxState *s, uint32_t idx,
     r100_mailbox_issr_store(s, idx, val, MBX_ISSR_SRC_CM7_STUB);
 }
 
+/*
+ * P10-fix: PCIE_CM7 dram-init-done stub. Mirrors the silicon path in
+ * q/sys/drivers/pcie/pcie_mailbox_callback.c:311 →
+ * pcie_ep.c:dram_init_done_cb → m7_smmu_enable() — set CR0.SMMUEN on
+ * this chiplet's SMMU and clear the handshake ISSR slot so q-sys's
+ * poll loop in notify_dram_init_done() observes val == 0 and exits.
+ * Called from the INTGR1 write path when the matching channel bit is
+ * raised AND ISSR[channel] reads 0xFB0D — same trigger a real CM7
+ * sees on its mailbox IRQ. NULL-base is a soft no-op (test runs may
+ * enable the stub before SoC realize wires the SMMU MMIO).
+ */
+static void r100_mailbox_cm7_dram_init_done_check(R100MailboxState *s,
+                                                  uint32_t intgr1_val)
+{
+    uint32_t channel;
+    hwaddr cr0_pa;
+    uint32_t cr0;
+
+    if (!s->cm7_stub) {
+        return;
+    }
+    channel = s->cm7_dram_init_done_channel;
+    if (!(intgr1_val & (1u << channel))) {
+        return;
+    }
+    if (channel >= R100_MBX_ISSR_COUNT ||
+        s->issr[channel] != R100_FW_BOOT_DONE) {
+        return;
+    }
+    if (s->cm7_smmu_base == 0) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "r100-mailbox[%s]: CM7 dram-init-done fired but "
+                      "cm7-smmu-base unset; skipping SMMUEN poke\n",
+                      s->name ? s->name : "?");
+        s->issr[channel] = 0;
+        return;
+    }
+
+    /* Pair little-endian load + store so we don't depend on host
+     * endianness when targeting r100-smmu's DEVICE_LITTLE_ENDIAN
+     * MMIO. RMW because CR0's other bits (CMDQEN / EVENTQEN) were
+     * set earlier in `smmu_init_queues` and must survive. */
+    cr0_pa = s->cm7_smmu_base + R100_MBX_CM7_SMMU_CR0_OFFSET;
+    cr0 = ldl_le_phys(&address_space_memory, cr0_pa);
+    cr0 |= R100_MBX_CM7_SMMU_CR0_SMMUEN;
+    stl_le_phys(&address_space_memory, cr0_pa, cr0);
+    s->issr[channel] = 0;
+    s->cm7_dram_init_done_acks++;
+    qemu_log_mask(LOG_TRACE,
+                  "r100-mailbox[%s]: CM7 dram-init-done ack — "
+                  "SMMUEN set on 0x%" PRIx64 ", ISSR[%u] cleared "
+                  "(acks=%" PRIu64 ")\n",
+                  s->name ? s->name : "?", s->cm7_smmu_base, channel,
+                  s->cm7_dram_init_done_acks);
+}
+
 static uint64_t r100_mailbox_read(void *opaque, hwaddr addr, unsigned size)
 {
     R100MailboxState *s = R100_MAILBOX(opaque);
@@ -340,6 +487,20 @@ static uint64_t r100_mailbox_read(void *opaque, hwaddr addr, unsigned size)
     default:
         if (addr >= R100_MBX_ISSR0 &&
             addr < R100_MBX_ISSR0 + R100_MBX_ISSR_COUNT * 4) {
+            /* CM7-stub mode: every CM7 channel poll loop in q-sys
+             * (notify_dram_init_done, rbln_cm7_get_values,
+             * rbln_pcie_request_ats_iatu) waits for "CM7" to clear
+             * the ISSR slot it just wrote to. With no real CM7,
+             * always returning 0 lets every poll exit on its first
+             * iteration — matching the pre-fix lazy-RAM shape where
+             * read (FREERTOS-VA path) hit a different PA than write
+             * (cross-chiplet path) and so always read 0. The
+             * dram-init-done side effect (setting CR0.SMMUEN) still
+             * fires from the INTGR1 write handler before the FW
+             * polls. See top-of-file banner. */
+            if (s->cm7_stub) {
+                return 0;
+            }
             return s->issr[(addr - R100_MBX_ISSR0) >> 2];
         }
         qemu_log_mask(LOG_UNIMP,
@@ -375,6 +536,7 @@ static void r100_mailbox_write(void *opaque, hwaddr addr, uint64_t val,
         s->pending[1] |= v;
         s->intgr_writes[1]++;
         r100_mailbox_update_irq(s, 1);
+        r100_mailbox_cm7_dram_init_done_check(s, v);
         break;
     case R100_MBX_INTCR0:
         s->pending[0] &= ~v;
@@ -465,7 +627,8 @@ static void r100_mailbox_reset(DeviceState *dev)
     s->mif_init = 0;
     s->is_version = 0;
     memset(s->issr, 0, sizeof(s->issr));
-    /* intgr_writes / issr counters kept across reset for test inspection. */
+    /* intgr_writes / issr / cm7_dram_init_done_acks counters kept across
+     * reset for test inspection. */
     /* Side bug 2 latch: clear so a fresh cold boot has to re-publish. */
     s->fw_boot_done_seen = false;
     r100_mailbox_update_irq(s, 0);
@@ -474,7 +637,7 @@ static void r100_mailbox_reset(DeviceState *dev)
 
 static const VMStateDescription r100_mailbox_vmstate = {
     .name = "r100-mailbox",
-    .version_id = 3,
+    .version_id = 4,
     .minimum_version_id = 1,
     .fields = (VMStateField[]) {
         VMSTATE_UINT32(mcuctrl, R100MailboxState),
@@ -488,6 +651,7 @@ static const VMStateDescription r100_mailbox_vmstate = {
         VMSTATE_UINT64_V(issr_egress_dropped, R100MailboxState, 2),
         VMSTATE_UINT64_V(issr_ingress_writes, R100MailboxState, 2),
         VMSTATE_BOOL_V(fw_boot_done_seen, R100MailboxState, 3),
+        VMSTATE_UINT64_V(cm7_dram_init_done_acks, R100MailboxState, 4),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -496,6 +660,18 @@ static Property r100_mailbox_properties[] = {
     DEFINE_PROP_STRING("name", R100MailboxState, name),
     DEFINE_PROP_CHR("issr-chardev", R100MailboxState, issr_chr),
     DEFINE_PROP_CHR("issr-debug-chardev", R100MailboxState, issr_debug_chr),
+    /* P10-fix: CM7 mailbox stub. See top-of-file banner +
+     * r100_mailbox_cm7_dram_init_done_check(). Only the chiplet-0
+     * MAILBOX_CP0_M4 instance opts in. ISSR reads always return 0
+     * when cm7-stub is true (matches the lazy-RAM-via-FREERTOS-VA
+     * shape every CM7 poll relies on); the SMMU-enable side effect
+     * lives behind the INTGR1[<channel>] trigger, fed by
+     * `cm7-smmu-base`. */
+    DEFINE_PROP_BOOL("cm7-stub", R100MailboxState, cm7_stub, false),
+    DEFINE_PROP_UINT32("cm7-dram-init-done-channel", R100MailboxState,
+                       cm7_dram_init_done_channel, 11),
+    DEFINE_PROP_UINT64("cm7-smmu-base", R100MailboxState,
+                       cm7_smmu_base, 0),
     DEFINE_PROP_END_OF_LIST(),
 };
 

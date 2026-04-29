@@ -221,6 +221,58 @@ Verification: `rbln_queue_test` passes silently (no
 NPU side, and `xp /1wx 0xf000200ffc` on the host monitor returns
 `0xcafedead` (BAR2 + 0xFFC = `FUNC_SCRATCH`).
 
+#### CM7 mailbox stub — chiplet-0 `MAILBOX_CP0_M4` (P10-fix)
+
+q-sys's `notify_dram_init_done` and `rbln_cm7_get_values` /
+`rbln_pcie_get_ats_enabled` etc. all talk to PCIE_CM7 over the
+chiplet-0 `MAILBOX_CP0_M4` Samsung-IPM block at
+`R100_CP0_MAILBOX_M4_BASE = 0x1FF1050000`. REMU doesn't model
+PCIE_CM7, so a `r100-mailbox` instance with `cm7-stub=true` and
+`cm7-smmu-base=R100_SMMU_TCU_BASE` terminates the channel:
+
+- ISSR reads always return `0`. This matches the pre-fix
+ lazy-RAM-via-FREERTOS-VA shape every CM7 poll loop relied on
+ (`ipm_samsung_write` lands at the cross-chiplet PA path,
+ `ipm_samsung_receive` at the FREERTOS-VA path — different
+ unmapped PAs, so the receive side reads 0 on the first
+ iteration and the loop exits cleanly with `val == 0`).
+- Writes to `INTGR1` bit `cm7-dram-init-done-channel` (default
+ 11 = `CM7_DRAM_INIT_DONE_CHANNEL`) with the just-stored
+ `ISSR[<channel>] == 0xFB0D` synchronously poke
+ `CR0.SMMUEN = 1` at `cm7-smmu-base + 0x20` via an
+ `ldl_le_phys` / `stl_le_phys` RMW (so existing `CMDQEN` /
+ `EVENTQEN` survive) — silicon-equivalent to
+ `pcie_cp2cm7_callback → dram_init_done_cb → m7_smmu_enable`.
+ Counter `cm7_dram_init_done_acks` (vmstate-tracked) records
+ fires.
+
+The stub is the entire mechanism that lets the chiplet-0 SMMU
+go from `CR0.SMMUEN = 0` (identity bypass) to `CR0.SMMUEN = 1`
+(real STE/PTW walks against the FW-published stage-2 PT in
+`hq_init`'s `ptw_init_smmu_s2 → smmu_s2_enable`). Without it,
+HDMA's reads of LL chains at IPA `buf_PA + PF_SYSTEM_IPA_BASE`
+return zeros instead of the stage-2-translated PA.
+
+**Chiplets 1..3 don't need this stub** — and never did, even before
+the fix. PCIE_CM7 is physically on chiplet 0 (the chiplet attached
+to the PCIe block), so the dram-init-done handshake only happens
+there. Worker chiplets have no PCIe and no CM7, so q-sys's
+`smmu_init` branches:
+
+```
+if (CHIPLET_ID == CHIPLET_ID0)
+    notify_dram_init_done();   /* chiplet 0: wait for CM7 ack */
+else
+    smmu_enable();             /* chiplets 1..3: MMIO-write CR0 directly */
+```
+
+On chiplets 1..3 the `smmu_enable()` path is a plain MMIO write
+that lands on `r100-smmu`'s normal handler — it always worked. The
+pre-fix all-zero HDMA bug was chiplet-0-only because every umd-side
+DMA workload (q-cp's HDMA / RBDMA / DNC tasks) runs on chiplet 0,
+and only chiplet 0's SMMU was the one stuck off. See
+`docs/debugging.md` → "Open issue: P10".
+
 The DNC task-queue mailboxes at `R100_PERI0_MAILBOX_M9_BASE` (COMPUTE),
 `R100_PERI0_MAILBOX_M10_BASE` (UDMA), `R100_PERI1_MAILBOX_M9_BASE`
 (UDMA_LP), and `R100_PERI1_MAILBOX_M10_BASE` (UDMA_ST) — all on
