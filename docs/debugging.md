@@ -566,49 +566,84 @@ markers in order — missing marker pinpoints the stall:
 FW ground truth lives in `external/ssw-bundle/products/rebel/q/sys/bootloader/cp/tf-a/`
 — cross-reference via `CLAUDE.md` ("Key external files").
 
-## Open issue: P10 — HDMA payload SAR/DAR via FW SMMU bypass (honest stage-1 walk)
+## Open issue: P10 — cb[0] complete; cb[1] gated on upstream KMD timeout bug
 
-**Status.** Two layers fixed (CM7 stub for `CR0.SMMUEN`,
-honest stage-1 walking via FW bypass STE 8); new front-edge bug
-upstream of the SMMU. `./remucli test p10` still times out at 180 s,
-but the failure mode has **moved past** both the "HDMA RD ch0 LL
-chain reads all zeros" wedge AND the "stage-2 fault on raw LLI SAR"
-follow-on that held the prior versions of this entry. Current state:
-HDMA payload SAR/DAR translate via SID 8 (the FW's
-`smmu_init_ste_bypass(0)` STE — `S1_TRANS` + CD pointing at
-`SMMU_BYPASS_PT`), `r100_smmu` walks the FW's bypass PT honestly via
-QEMU's `smmu_ptw_64_s1`, and the walker faithfully faults on raw
-host PCIe IOVAs (e.g. `SAR=0xec00000` from the kmd's
-`MAP_USERPTR` HDMA chain) because they sit outside the bypass PT's
-`0x40000000..0x8000000000` identity window — same as silicon. The
-remaining failure is now a **structural REMU dispatch issue**:
-HDMA RD's SAR is by silicon convention a raw host PCIe IOVA (per
-`kmd/.../memory.c:rbln_dma_host_convert`'s "MAP_USERPTR pages
-use the raw IOVA" comment) and should route via the host-leg
-OP_READ_REQ chardev, not the chiplet-local SMMU. See
-"Fix shape — next hop" below.
+**Status.** Three REMU-side layers landed (CM7 stub for
+`CR0.SMMUEN`, honest stage-1 walking via FW bypass STE 8,
+direction-based LLI dispatch in `r100_hdma_walk_ll`); cb[0] now
+runs end-to-end through the silicon-accurate path with one MSI-X
+delivery. `./remucli test p10` still times out at 180 s, but the
+failure mode has moved well past every HDMA / SMMU / cfg-mirror /
+CM7-handshake issue that held earlier versions of this entry. The
+remaining hang is in the kmd's `rebel_hw_init+0x439`
+busy-poll — the documented stock-KMD
+`readl_poll_timeout_atomic(..., jiffies_to_usecs(RBLN_REBEL_TASK_DONE_US))`
+unit-mismatch (the inner conversion turns a 3 s wait into ~3 h
+under TCG; stock-KMD bug, not REMU). cb[1] is unobservable on the
+NPU side because the kmd never makes it past the post-cb[0]
+re-init busy-loop into the second `command_submission` step.
 
-With the chiplet-0 CM7 mailbox stub landed (`src/machine/r100_mailbox.c`
-+ the chiplet-0 `MAILBOX_CP0_M4` install in `r100_soc.c`, see
-`CLAUDE.md`), `CR0.SMMUEN` is now `1` after `notify_dram_init_done`
-and HDMA's LL fetch resolves the LLP through the v1 stage-2 walker.
-`hdma.log` for the same `command_submission -y 5` workload now
-shows the full first LLI — `xsize=0x200000 sar≈0x0ec00000
-dar=0x140000000`, the 2 MB host→device kernel-image copy — instead
-of the previous all-zero record. Three chiplet-0 CMDQ entries
-(`CFGI_CD sid=8`, `CFGI_STE sid=8`, `CFGI_STE_RANGE`) follow `CR0
-0xc→0xd` cleanly. With the SID split and honest stage-1 walking
-landed (this session — see "What changed since" below), the
-remaining failure is a **structural REMU dispatch issue** upstream
-of the SMMU: HDMA classifies LLI addresses as host-bound only when
-≥ `REMU_HOST_PHYS_BASE`, but the kmd's `MAP_USERPTR` chains use
-raw PCIe IOVAs that fall well below the marker. The honest
-stage-1 walker now faithfully reports the resulting fault on the
-eventq (silicon-equivalent), but the address was never meant for
-the chiplet-local SMMU in the first place — see "Symptom" below
-and "Fix shape" at the bottom of this entry. Excluded from `./remucli test` defaults via
-`in_default=False` in `TEST_REGISTRY`. The pre-fix "x86 guest OOM
-during `rbln_register_p2pdma`" is also still gone —
+**What just landed (this commit) — direction-based LLI dispatch.**
+`r100_hdma_walk_ll` no longer classifies LLI fields by `addr ≷
+REMU_HOST_PHYS_BASE`. The dispatch now gates on
+`r100_smmu_enabled(s->smmu)` — a new public CR0.SMMUEN getter on
+`r100-smmu`:
+
+- **SMMUEN=0** (p5 test, NPU-only smoke, very early boot before
+  q-sys's `notify_dram_init_done`): D2D — both LLI endpoints are
+  chiplet-local DRAM and the walker runs `address_space_read` →
+  `address_space_write`. Confirmed against `output/p5-hdma/smmu.log`
+  showing the gdbstub kick fires while `cr0_smmuen=0`.
+- **SMMUEN=1** (production: q-cp drove `cmd_descr_hdma` after the
+  CM7 stub flipped CR0.SMMUEN): direction-based.
+    - `dir == WR` ⇒ SAR translates through SID 8 (FW bypass STE),
+      then `address_space_read` feeds chunked `OP_WRITE` frames;
+      DAR is the raw host PCIe IOVA the kmd published (per
+      `kmd/.../memory.c:rbln_dma_host_convert`, "MAP_USERPTR uses
+      the raw IOVA") and the host's `pci_dma_write` resolves it.
+    - `dir == RD` ⇒ SAR is the raw host IOVA;
+      `r100_hdma_emit_read_req` + park on the channel's resp_cond
+      via `qemu_cond_wait_bql()` (BQL released so the chardev
+      iothread can deliver `OP_READ_RESP`); DAR translates
+      through SID 8 and `address_space_write`s the payload.
+
+Verification (`output/p10-umd/hdma.log`): cb[0]'s 3-LLI chain
+(2 MB kernel copy + 8 KB init + 4 KB CS) walks cleanly with 515
+`OP_READ_REQ` / `OP_READ_RESP` round-trips, every chunk
+`status=ok`. `ll_walk_end ... last_seen=1`,
+`signal_completion completions=1`. `output/p10-umd/msix.log`
+shows one MSI-X frame at vector 0 — q-cp's `cb_complete →
+pcie_msix_trigger` reached the host. SMMU traces show clean
+`xlate_out sid=0 dva=0x42b86640 stage-2 ok` for every cursor
+walk and `xlate_out sid=8 dva=0x140000000 ok(s1)` for every
+DAR translate, no faults across the full chain. m5..p5 + p11 +
+p11b regression green throughout.
+
+**Why direction-based is silicon-equivalent.** On real silicon
+the HDMA controller's outbound bus connects directly to the
+chiplet-0 PCIe RC for host-bound TLPs and to the chiplet's NoC
+(SMMU-600 in front) for device-local accesses; the address itself
+selects the route. REMU has no PCIe RC and no DW iATU on the
+HDMA path, so the address heuristic doesn't carry over —
+production q-cp uses HDMA WR strictly for NPU→host and HDMA RD
+strictly for host→NPU on the `cmd_descr_hdma` MAP_USERPTR copy
+path, so direction is the equivalent silicon-truthful selector.
+A future D2D-HDMA workload (none today) would need either a
+marker on the LLI or splitting `r100-hdma` per-channel by
+`SM_HDMA_SID_LUT`.
+
+**What was wrong before.** The previous version of this entry
+described the front-edge as "REMU classifies host-bound only when
+`addr >= REMU_HOST_PHYS_BASE` (`0x8000000000`)" — but the kmd
+publishes raw PCIe IOVAs (`0xec00000`-shaped) which fall well
+below the marker, so they fell through to the chiplet-local SMMU.
+SID 8 walked the FW's bypass PT honestly and faulted on the
+`0x40000000..0x80_0000_0000`-window mismatch — silicon-truthful,
+but the address was never meant for the chiplet's SMMU in the
+first place. That entire heuristic is **gone**; the address never
+reaches the SMMU on the host-bound leg now.
+
+The pre-fix "x86 guest OOM during `rbln_register_p2pdma`" is gone —
 `tests/p10_umd_smoke_test.py` and `tests/p10_qcp_gdb_probe.py` both
 pass `--host-mem 4G`, and `SHM_SIZE_DEFAULT` / `R100_DRAM_INIT_SIZE`
 / `R100_BAR0_DDR_SIZE` are all aliased to
@@ -626,88 +661,65 @@ only commit ~tens of MB; the only host requirement is `/dev/shm` with
 the shorter splice falls back to a host-private `bar0_tail` /
 NPU-private `dram_tail` for the rest of BAR0.
 
-**Symptom.** `command_submission -y 5` from the umd staged into
-the guest by `guest/build-umd.sh` submits two CBs to queue 0. cb[0]
-gets through the small-packet path (`PACKET_WRITE_DATA` lands on
-`FUNC_SCRATCH` via the cfg-mirror trap; `npu/cfg.log` / `xp /1wx
-0xf000200ffc` confirms `0xcafedead` and one MSI-X frame egresses),
-and the first `PACKET_LINKED_DMA` packet — cb[0]'s 2 MB host→device
-kernel-image copy — now successfully fetches its LL chain through
-SMMU stage-2 (LLP = `0x42b86740` IPA → PA `0x02b86740` walks
-fine via SID 0). HDMA then translates the LLI's payload SAR
-through SID 8 (the FW's bypass STE) and faults honestly because
-the raw IOVA is outside the bypass PT's identity window:
+**Symptom (current).** `command_submission -y 5` from the umd
+staged into the guest by `guest/build-umd.sh` submits two CBs to
+queue 0. cb[0] now runs end-to-end: small-packet
+`PACKET_WRITE_DATA` lands `0xcafedead` on `FUNC_SCRATCH` via the
+cfg-mirror trap; the `PACKET_LINKED_DMA` 3-LLI chain (2 MB
+kernel copy + 8 KB init + 4 KB CS) is fetched through SMMU
+stage-2 on SID 0 (LLP IPA → PA), each LLI's DAR walks SID 8
+through the FW bypass PT (`0x140000000`-shaped → identity), and
+the SAR side fires `OP_READ_REQ` over the host-leg `hdma`
+chardev — 515 round-trips, every chunk `status=ok`. q-cp's
+`hdma_done_handler` advances cb[0]; `cb_complete` writes the
+BD flags, advances `queue_desc.ci`, publishes `FUNC_SCRATCH`,
+and calls `pcie_msix_trigger`. `output/p10-umd/msix.log` shows
+one MSI-X frame at vector 0 — the host receives the cb[0]
+completion. The hang is now in the kmd's `rebel_hw_init+0x439`
+post-cb[0] busy-loop; cb[1] is unobservable on the NPU side
+because the kmd never exits the timeout cascade. Diagnostic
+shape: `[  119.292556] queue_timedout: command-queue-0 TDR 1
+Qseq 1/1/2 job cnt 0`, then watchdog soft-lockup blames
+`rebel_hw_init+0x439`. Side-note section "KMD
+`readl_poll_timeout_atomic` argument unit mismatch" below has
+the upstream KMD bug detail.
+
+**Diagnostic surface (cb[0] verification).** When picking this
+back up, the relevant lines on a clean run:
 
 ```
-hdma cl=0 ll_walk_read dir=rd ch=0 elem=1 cursor=0x42b86740 \
-        ctrl=0x00000001 xsize=2097152 sar=0xec00000 dar=0x140000000
-smmu cl=0 xlate_in sid=8 ssid=0 dva=0xec00000 rd cr0_smmuen=1 strtab_base_pa=0x14000000
-smmu cl=0 ste sid=8 v=1 cfg=S1_TRANS ... vmid=8 s2ttb=0x0
-smmu cl=0 s1_dispatch sid=8 s1dss=SUBSTREAM0 s1ctxptr=0x14009000 ssid=0
-smmu cl=0 cd sid=8 v=1 aa64=1 ips=2 oas=40 tbi=3 asid=0 affd=1 r=1 \
-       tt0_tsz=20 tt0_gran=12 tt0_ttb=0x14060000 tt0_dis=0 tt1_dis=1
-smmu cl=0 ptw_s1 sid=8 dva=0xec00000 ttb=0x14060000 tsz=20 gran=12 perm=rd
-smmu cl=0 xlate_out sid=8 dva=0xec00000 FAULT(s1) s2_translation @ 0xec00000 \
-       ttb=0x14060000 tsz=20 gran=12
-smmu cl=0 eventq_emit type=0x10 sid=8 input_addr=0xec00000 idx=0 entry_pa=0x140f0000 \
-       prod=0x0→0x1 cons=0x0 irqen=1 emitted_total=1
-hdma cl=0 smmu_fault ll-d2d-sar sid=8 dva=0xec00000 fault=s2_translation fault_addr=0xec00000
+# output/p10-umd/hdma.log — chain decode + 515 host-leg round-trips
+hdma cl=0 ll_walk_read dir=rd ch=0 elem=1 cursor=0x42b8X640 \
+        ctrl=0x00000001 xsize=2097152 sar=0x0b800000 dar=0x140000000
+hdma cl=0 ll_lli      dir=rd ch=0 elem=1 sar=0x0b800000 dar=0x140000000 \
+        size=2097152 route=rd-host-leg
+hdma cl=0 tx op=READ_REQ req_id=0xa0 dst=0xb800000 len=4096 tag=ll-rd ...
+hdma cl=0 rx op=READ_RESP req_id=0xa0 dst=0xb800000 len=4096 tag=resp ...
+... [×512 chunks for elem=1, +×2 for elem=2, +×1 for elem=3] ...
+hdma cl=0 ll_walk_end  dir=rd ch=0 elems=3 last_seen=1 cursor=0x42b8X670
 hdma cl=0 signal_completion dir=rd ch=0 pending_mask=0x10000 completions=1
+
+# output/p10-umd/msix.log — q-cp's cb_complete reaches the host
+msix off=0xffc db_data=0x0 vector=0 status=ok count=1
+
+# output/p10-umd/smmu.log — every walk clean
+smmu cl=0 xlate_out sid=0 dva=0x42b8X640 ok pa=0x02b8X640        # cursor (stage-2)
+smmu cl=0 xlate_out sid=8 dva=0x140000000 ok(s1) pa=0x140000000  # DAR (bypass stage-1)
 ```
 
-The fault type prints as `s2_translation` because the v1
-`r100_smmu_map_ptw_err` reuses the stage-2 enum for both stages
-(SMMUv3 events report a single `F_TRANSLATION` event_id /
-`type=0x10`, so FW's `smmu_print_event` reads the same line
-either way). Note the **eventq emit** — the FW's `smmu_event_intr`
-reads the F_TRANSLATION record and surfaces SID 8's input addr,
-matching real silicon's diagnostic shape.
+The `dva=0xb800000`-style raw IOVA we used to fault on never
+reaches the SMMU now — it's routed straight to the host's
+`pci_dma_read` over the chardev.
 
-`SAR = 0xec00000` is a chiplet-local PA *from the kmd's view of
-the host PCIe IOMMU* — i.e., a raw `dma_alloc_coherent` IOVA the
-kmd published into the LLI without applying `+ host_phys_base`
-(per `rbln_dma_host_convert`'s comment: HDMA chains use raw
-IOVAs). On real silicon the HDMA controller's outbound TLP path
-routes this through the chiplet-0 PCIe RC's outbound iATU →
-host PCIe IOMMU, *not* through the chiplet's SMMU-600 — so the
-SMMU never sees the address. REMU's HDMA dispatch, by contrast,
-classifies LLI SAR/DAR as host-bound only when the address is
-`>= REMU_HOST_PHYS_BASE` (= `0x8000000000`); raw IOVAs fall
-through to the SMMU-translate-then-`address_space_*` "d2d"
-branch, which is the shape we see faulting.
-
-The walker raises `ll-d2d-sar` and signals chan-done with one
-completion; q-cp's `hdma_done_handler` advances cb[0] but the
-2 MB it expected to find at the destination is empty. The kmd's
-TDR fires (`queue_timedout: command-queue-0 TDR 1 Qseq 1/1/2`),
-`rsd_device_reset` runs the dump+unload+reset cascade documented
-below, then a second `rebel_queue_init` from
-`rsd_sched_device_init` busy-polls forever (the `jiffies_to_usecs`
-side-bug below) and the host watchdog eventually prints
-`soft lockup ... rebel_hw_init+0x439`.
-
-**Proximate cause.** `output/<name>/hdma.log` shows q-cp kicked HDMA
-RD ch0 with `llp=0x42b8XXXX` (the low bits drift run-to-run with
-`rl_malloc`'s allocation pattern; on the run captured below it was
-`0x42b86640`). With `cr0_smmuen=1` the walker resolves the LLP via
-stage-2: `output/<name>/smmu.log` shows
-`xlate_in sid=0 dva=0x42b86640 rd cr0_smmuen=1` followed by
-`xlate_out sid=0 dva=0x42b86640 stage-2 pa=0x02b86640` — exactly
-the IPA-to-PA mapping `cb_parse_linked_dma` constructed. HDMA
-reads a valid first `dw_hdma_v0_lli{ctrl=0x1, xsize=0x200000,
-sar=0x0b800000, dar=0x140000000}` from the chain. **Then it tries
-to translate `sar=0x0b800000` through the same SID** and faults
-because that PA isn't covered by the stage-2 PT (`ptw_s2t_pf[]`
-"SYSTEM" region only maps IPA `0x40000000..0x80000000` → PA
-`0x0..0x40000000`). LLI #2 / #3 are unreachable behind the fault.
-
-The LL chain itself is well-formed — confirmed against the live NPU
-via HMP `xp /16xw 0x02b86640`: 24 valid LL bytes per element, three
-elements total, the last one carrying `ctrl=0x9` (`CB|LIE`) marking
-end-of-chain. Three LLIs match the cb shape exactly: a 2 MB kernel
-copy, an 8 KB init copy, a 4 KB CS copy from the host coherent
-buffer (sar in BAR0 IPA `0x0F000000+`) into the device IPA window
-(dar in `0x40000000+`).
+**Proximate cause (current — kmd-side).** The hang trace is in
+`rebellions.ko`'s `rebel_hw_init+0x439` (resolved via the
+`Workqueue: rsd_device_reset_wq rsd_sched_device_init`
+`Call Trace` in `output/p10-umd/host/serial.log`); on stock kmd
+with HZ=250 this is the `readl_poll_timeout_atomic(...,
+jiffies_to_usecs(RBLN_REBEL_TASK_DONE_US))` that the side-note
+below explains. The watchdog prints `soft lockup ... CPU#0 stuck
+for 26s` then `52s` and so on until the 180 s test budget
+expires.
 
 **Root cause for the LL-chain pointer (now fixed).**
 q-cp's `cb_parse_linked_dma`
@@ -812,59 +824,59 @@ survive) — silicon-equivalent to
 Counter `cm7_dram_init_done_acks` (vmstate-tracked) records
 how many times it fires.
 
-**Why the next-edge SAR fault is honest (now even more honest).**
-The previous version of this entry described the stage-2 fault on
-SAR as the failure mode and proposed routing payload SAR/DAR
-through SID 8. That landed: `r100_hdma_translate` now takes a
-`sid` parameter, the LL chain *cursor* uses
-`R100_HDMA_SMMU_SID_LL_PTR = 0` (stage-2 ALL_TRANS via the user
-PT) while the LLI's *payload* SAR/DAR use
+**SID split + honest stage-1 walk (landed earlier — historical context).**
+`r100_hdma_translate` takes a `sid` parameter; the LL chain
+*cursor* uses `R100_HDMA_SMMU_SID_LL_PTR = 0` (stage-2 ALL_TRANS
+via the user PT) while the LLI's *payload* SAR/DAR use
 `R100_HDMA_SMMU_SID_PAYLOAD = 8` (the FW's bypass STE). On the
-SMMU side, `r100_smmu`'s S1_TRANS path no longer collapses to a
-"v1 identity" shortcut — the walker reads STE1.S1DSS, fetches
-the CD (`STE0.S1ContextPtr`), decodes the FW's
-`smmu_init_cd_bypass` programming (T0SZ=20, TG0=4 KB, IPS=40,
-EPD1=1, AFFD=1, R=1, AA64=1) and dispatches QEMU's
-`smmu_ptw_64_s1` against the FW's `SMMU_BYPASS_PT`
-(`smmu_create_bypass_table` builds it from `bypass_regions[]`,
-HTID0 identity-maps `0x40000000..0x8000000000` for the local
-chiplet). The CD-validation path drops QEMU's strict `CD_A=1`
-check because `smmu_init_cd_bypass` deliberately leaves CD_A
-unset (the line `val |= CD0_A;` is commented out in
+SMMU side, `r100_smmu`'s S1_TRANS path walks honestly (no v1
+identity shortcut): reads STE1.S1DSS, fetches the CD
+(`STE0.S1ContextPtr`), decodes the FW's `smmu_init_cd_bypass`
+programming (T0SZ=20, TG0=4 KB, IPS=40, EPD1=1, AFFD=1, R=1,
+AA64=1) and dispatches QEMU's `smmu_ptw_64_s1` against the FW's
+`SMMU_BYPASS_PT` (`smmu_create_bypass_table` builds it from
+`bypass_regions[]`, HTID0 identity-maps
+`0x40000000..0x8000000000` for the local chiplet). The
+CD-validation path drops QEMU's strict `CD_A=1` check because
+`smmu_init_cd_bypass` deliberately leaves CD_A unset (the line
+`val |= CD0_A;` is commented out in
 `q/sys/drivers/smmu/smmu.c:479`); real SMMU-600 silicon doesn't
 fault that bypass CD, and rejecting it would defeat the "make
-the FW SMMU init's impact real" point.
+the FW SMMU init's impact real" point. With the new
+direction-based dispatch on top, the SID 8 walker's honest
+fault on raw IOVAs (`0xec00000`-shaped) **is no longer reached
+on cb[0]** — those addresses now go straight to the host-leg
+chardev — but the walker remains in place for legitimate
+silicon errors (a kmd buffer the FW's bypass mapping doesn't
+cover) and surfaces them on the eventq same as silicon.
 
-The fault on `SAR=0xec00000` is therefore an honest
-silicon-equivalent: SID 8 walks the FW's bypass PT honestly and
-finds no entry, same as silicon would. The address simply isn't
-intended for SMMU translation in the first place — see the
-"Symptom" passage above and the "Fix shape" below.
-
-Diagnostic recipe (post-CM7-stub):
+Diagnostic recipe (post-direction-based-dispatch):
 
 ```
 ./remucli fw-build                                   # ELFs needed by gdb
-./remucli test p10                                   # reproduces the hang
+./remucli test p10                                   # reproduces the rebel_hw_init hang
 python3 tests/p10_qcp_gdb_probe.py                   # snapshot CA73 state
-less output/p10-umd/hdma.log                         # ll_walk_read elem=1 ctrl=0x1, then smmu_fault ll-d2d-sar
-less output/p10-umd/smmu.log                         # CR0 0xc→0xd smmuen=0→1, then xlate stage-2 ok / FAULT on SAR
+less output/p10-umd/hdma.log                         # cb[0] full chain: ll_walk_read elem=1..3,
+                                                     # 515 OP_READ_REQ/OP_READ_RESP, ll_walk_end last_seen=1
+less output/p10-umd/msix.log                         # one MSI-X frame at vector 0 (cb[0] complete)
+less output/p10-umd/smmu.log                         # CR0 0xc→0xd smmuen=0→1; clean xlate_out for sid=0 cursor + sid=8 DAR
+less output/p10-umd/host/serial.log                  # rebel_hw_init+0x439 soft lockup
 less output/p10-debug/qcp-bt-cb1.txt                 # gdb dump (tag still 'cb1')
 ```
 
 The probe pauses 1.5 s after the second `INTGR1=0x1` doorbell so
-both CBs are queued + the first one mid-flight on q-cp; with the
-CM7 stub landed, the snapshot catches q-cp with `cb_run_cnt = 1`,
-`cq[0].ci = 1`, `cq[0].pi = 2`, both `cb_mgr.{ready,wait}_list`
-empty, and `cb_task` / `hdma_task` suspended in `xTaskNotifyWait`
-waiting on an HDMA-done IRQ that never comes — but now because
-`ll_walk_read` decoded a real LLI and then faulted on the
-payload-SAR translate (see `Symptom`), not because the walker
-short-circuited on `ctrl=0`. None of the running threads in
-`info threads` is in cb_task or hdma_task — they're all
-runtime-idle CSes / DNC fetch workers. Override the settle window
-with `REMU_P10_DEBUG_DELAY_S=8.0` to catch the unload cascade
-instead.
+both CBs are queued + the first one mid-flight on q-cp; with
+direction-based dispatch landed, the snapshot now catches q-cp
+mid-cb[0] with `cb_run_cnt = 1`, `cq[0].ci = 1`, `cq[0].pi = 2`,
+both `cb_mgr.{ready,wait}_list` empty, and HDMA's resp_cond
+parking on `qemu_cond_wait_bql` for an `OP_READ_RESP` that the
+host-side `pci_dma_read` is actively serving. Post-cb[0] the
+`hdma_done_handler` runs `cb_complete` and the kmd-side hang
+takes over (see "Symptom" / "Side note" below). None of the
+running threads in `info threads` is in cb_task or hdma_task —
+they're all runtime-idle CSes / DNC fetch workers. Override the
+settle window with `REMU_P10_DEBUG_DELAY_S=8.0` to catch the
+post-completion / kmd-hang state instead.
 
 Two more diagnostic-only probes (no `TEST_REGISTRY` entry):
 
@@ -873,62 +885,39 @@ Two more diagnostic-only probes (no `TEST_REGISTRY` entry):
   (direct shm read, NPU `xp`, host `xp`) to verify the alias is
   working.
 
-**Fix shape — next hop: HDMA dispatch must recognise raw host
-IOVAs as host-bound.** The "use SID 8 for SAR/DAR" hop above
-landed (and made the SMMU walker honest), but exposed an
-upstream-of-SMMU issue: REMU's HDMA `walk_ll` classifies LLI
-addresses as host-bound only when `addr >= REMU_HOST_PHYS_BASE`
-(`0x8000000000`). Raw host PCIe IOVAs from the kmd's
-`dma_alloc_coherent` / `dma_map_single` (per
-`memory.c:rbln_dma_host_convert`'s "MAP_USERPTR pages use the
-raw IOVA" comment) live in the kmd's IOVA-space — anywhere from
-zero to the dma-coherent-mask, almost always below the marker —
-so REMU mis-routes them through the chiplet-local SMMU instead
-of the host-leg `OP_READ_REQ` / `OP_WRITE` chardev path.
+**Fix shape — next hop: kmd timeout cascade.** The
+`rebel_hw_init+0x439` busy-loop is the upstream KMD bug
+documented in the side-note below. From the REMU side it is
+**not currently** something we can shorten — the kmd's loop
+runs in atomic context with timer-driven deadline checks, and
+TCG's wall-clock progress under `rebel_quiesce_device`'s
+`mdelay`s makes the deadline arithmetic blow out by ~1000×.
+Three diagnostic options, none of which change REMU device
+models:
 
-On real silicon the HDMA controller's outbound bus connects
-directly to the chiplet-0 PCIe RC for host-bound TLPs and to the
-chiplet's NoC (with the SMMU-600 in front) for device-local
-accesses; the address itself selects the route. The matching
-REMU model is to dispatch by **direction** (HDMA RD's SAR is
-always host, HDMA WR's DAR is always host — a property of how
-q-cp uses the engine for `MAP_USERPTR` copies, not an address
-convention) and keep the `>= REMU_HOST_PHYS_BASE` heuristic only
-for the `r100_hdma`'s test-only D2D path that p5 exercises.
-Three candidates:
+1. **Local kmd patch** — drop `jiffies_to_usecs()` from the
+   `RBLN_REBEL_TASK_DONE_US` call site; the project policy is
+   FW-side (`cli/fw-patches/` stays empty), so a `cli/kmd-patches/`
+   directory would be a new pattern. Smallest diff, unblocks
+   cb[1] visibility, but adds a new patch surface to the
+   project.
+2. **Bump `--host-cpu` performance hints** — try `-cpu max,kvm=off`
+   on a host with KVM available + a TCG-accel hint. KVM execution
+   would let `mdelay` advance closer to wall-clock and the
+   timeout actually fire at ~3 s. Largest behavioral change.
+3. **Wait for an upstream KMD fix.** A bug report against
+   `rebellions.ko`'s `rebel.c:700` is the cleanest long-term
+   path; tracked here so the next person picking up P10 can
+   recognize the loop on sight.
 
-1. **Direction-based dispatch** (cleanest). `dir == RD` ⇒
-   route SAR via host-leg `OP_READ_REQ`, translate DAR via
-   SID 8. `dir == WR` ⇒ translate SAR via SID 8, route DAR
-   via host-leg `OP_WRITE`. The d2d branch becomes p5-only,
-   gated on a marker (e.g. SAR/DAR both `< REMU_HOST_PHYS_BASE`
-   AND both falling inside chiplet-local DRAM, which is what
-   p5's seed pattern arranges). p5's gdbstub-driven kick fires
-   while `CR0.SMMUEN=0` so this is naturally distinguishable.
-
-2. **SMMU-fault-based dispatch.** Try SID 8 first; on
-   `F_TRANSLATION`, retry as host-leg. Marginally more honest
-   to silicon (real silicon's HDMA reacts to the SMMU fault by
-   surfacing it on the eventq, not by redirecting to PCIe RC),
-   but loses the silicon-true "address selects the route"
-   model.
-
-3. **Make the kmd publish host-bound LLI addresses through
-   `rbln_dma_host_convert`.** Cleanest from REMU's
-   perspective but requires a kmd-side patch (against the
-   project policy that `cli/fw-patches/` stays empty, but that
-   policy is FW-side; kmd patches in `cli/kmd-patches/` would
-   be a new pattern).
-
-(1) is the smaller diff and best matches the
-"behave like silicon" intent. Once that lands, cb[0]'s 2 MB
-host→device copy can complete and we hit the next failure mode
-on cb[1] / RBDMA (whatever it turns out to be). If subsequent
-SMMU translates turn up unrelated faults (missing `T0SZ` /
-wrong `SL0` / size mismatches), `smmu.log` logs them as
+Once one of those clears the kmd-side hang, the next
+REMU-visible failure mode (cb[1] dispatch, post-soft-reset
+re-init, RBDMA / DNC tasks) comes into view. If subsequent SMMU
+translates turn up unrelated faults (missing `T0SZ` / wrong
+`SL0` / size mismatches), `smmu.log` logs them as
 `xlate_out … FAULT` lines and `r100_smmu_emit_event` publishes
-them on the eventq — honest follow-on SMMU v2 bugs, not
-blocking unknowns.
+them on the eventq — honest follow-on SMMU v2 bugs, not blocking
+unknowns.
 
 The `tests/p10_qcp_gdb_probe.py` artefact stays useful for
 chasing later regressions: the ELF-symbol view (`hdma_mgr`,
@@ -952,7 +941,8 @@ Tracked here so future people picking up P10 don't try to "fix" the
 timeout from the REMU side.
 
 **Side note — TDR `URG_EVENT_UNLOAD` register-dump cascade.** When
-the kmd's TDR fires (because cb[0] never completed), the
+the kmd's TDR fires for cb[1] (cb[0] now completes; cb[1] is
+gated on the kmd-side timeout bug above), the
 `rebel_quiesce_device` path writes `REBEL_EVENT_DUMP = 4` to ISSR[6]
 and rings INTGR1 bit 6. The kmd-side `REBEL_EVENT_DUMP = 4`
 intentionally aliases the q-cp-side `URG_EVENT_UNLOAD = 4`, so
@@ -967,8 +957,11 @@ fresh, and `rebel_hw_init → rebel_queue_init` rings `INTGR1` bit 7
 (QUEUE_INIT). q-cp's `hq_task` is still mid-dump, never gets to
 re-run `hq_init`, `desc->init_done` is never written back through
 the P1a outbound iATU, and the busy-loop above eats the rest of
-the 180 s test budget. Fixing the underlying HDMA-LL path (above)
-removes the entire cascade.
+the 180 s test budget. With the direction-based HDMA dispatch
+landed, the cascade now triggers strictly downstream of the kmd
+`readl_poll_timeout_atomic` unit-mismatch — clearing that bug
+(see "Fix shape" above) cuts off the soft-lockup chain at the
+source.
 
 ## Cleanup
 

@@ -47,18 +47,32 @@
  *          transfer_size, sar, dar). The `control` byte's LLP bit
  *          discriminates `dw_hdma_v0_llp` (16 B; jump to next chunk)
  *          from `dw_hdma_v0_lli` (24 B; data transfer).
- *        - for an LLI, route by SAR/DAR vs REMU_HOST_PHYS_BASE:
- *            * dir=WR && DAR≥host: NPU→host. address_space_read at
- *              SAR, emit OP_WRITE with stripped DAR. Chunked into
- *              REMU_HDMA_MAX_PAYLOAD-sized frames.
- *            * dir=RD && SAR≥host: host→NPU. Per chunk, emit
- *              OP_READ_REQ with stripped SAR + park on the
- *              channel's resp_cond via qemu_cond_wait_bql() (BQL
- *              released so the chardev iothread can deliver
- *              OP_READ_RESP). On wake, address_space_write the
- *              payload at DAR.
- *            * neither addr is host: D2D / NPU-internal copy. Direct
- *              address_space_read → address_space_write loop.
+ *        - for an LLI, dispatch on `r100_smmu_enabled(s->smmu)`
+ *          (== CR0.SMMUEN on the chiplet's SMMU-600):
+ *            * SMMUEN=1 (production: q-cp drove cmd_descr_hdma after
+ *              q-sys completed `notify_dram_init_done`):
+ *                - dir=WR: NPU→host. SAR translates through SID 8
+ *                  (FW bypass STE), then `address_space_read`
+ *                  feeds `OP_WRITE` chunks tagged with the
+ *                  WR-channel's req_id. DAR is the raw host PCIe
+ *                  IOVA the kmd published (per
+ *                  kmd/.../memory.c:rbln_dma_host_convert,
+ *                  "MAP_USERPTR uses the raw IOVA") — the host
+ *                  side resolves it via `pci_dma_write`.
+ *                - dir=RD: host→NPU. SAR is the raw host IOVA;
+ *                  emit `OP_READ_REQ` and park on the channel's
+ *                  resp_cond via `qemu_cond_wait_bql()` (BQL
+ *                  released so the chardev iothread can deliver
+ *                  `OP_READ_RESP`). On wake, DAR translates
+ *                  through SID 8 and `address_space_write`s the
+ *                  payload.
+ *            * SMMUEN=0 (p5 test, NPU-only smoke runs, very early
+ *              boot): D2D — both endpoints address chiplet-local
+ *              DRAM and the walker runs a plain
+ *              `address_space_read` → `address_space_write` loop.
+ *              SMMU translate is identity in this regime (matches
+ *              Arm-SMMU pre-enable bypass), so engine bring-up
+ *              tests work without any FW init.
  *        - LIE bit on the LLI signals end-of-chain; on hit we exit
  *          the loop, flip status to STOPPED, set INT_STOP, write the
  *          per-channel SUBCTRL pending bit, and pulse SPI 186.
@@ -112,23 +126,37 @@
  * onto SID 8 unconditionally because q-cp's `cb_parse_linked_dma`
  * doesn't IPA-transform the LLI payload, so the bypass STE is the
  * matching FW init — the `SM_HDMA_SID_LUT` shadow's per-channel
- * dispatch can wait on multi-VF (P11 v2). When a workload puts a
- * VA outside the bypass-PT window into an LLI's SAR/DAR (e.g.
- * raw host IOVA `0x0b800000` from the umd's `MAP_USERPTR` HDMA
- * chain), the walker faults faithfully and the eventq carries
- * an `F_TRANSLATION` event — same path as silicon. The fix isn't
- * to bypass-shortcut here; it's either (a) extend the FW bypass
- * PT to cover the kmd's IOVA range, or (b) teach REMU that an
- * HDMA RD's SAR is by convention a raw host IOVA (per
- * `kmd/.../memory.c:rbln_dma_host_convert`'s "MAP_USERPTR pages
- * use the raw IOVA" comment) and route via the host-leg
- * OP_READ_REQ chardev path regardless of the `>=
- * REMU_HOST_PHYS_BASE` heuristic. Tracked in
- * `docs/debugging.md` → "P10 …".
+ * dispatch can wait on multi-VF (P11 v2).
  *
- * Pre-`CR0.SMMUEN` (single-QEMU runs, p5 test, early boot) the
- * translate is identity for *both* SIDs — no regression on existing
- * regression tests.
+ * P10 LLI dispatch: REMU classifies host vs. NPU side by
+ * *direction*, not by `>= REMU_HOST_PHYS_BASE`. q-cp programs
+ * HDMA WR for NPU→host and HDMA RD for host→NPU on the production
+ * MAP_USERPTR copy path; the kmd publishes the host endpoint as
+ * a raw PCIe IOVA in the LLI's payload field (per
+ * `kmd/.../memory.c:rbln_dma_host_convert`, "MAP_USERPTR uses the
+ * raw IOVA"), so REMU routes that side through the host-leg
+ * `hdma` chardev (`OP_READ_REQ` / `OP_WRITE`) where the host's
+ * `pci_dma_{read,write}` resolves it. The chiplet-local end goes
+ * through SID 8 / the FW bypass PT. The previous version of this
+ * banner described an address-classifier (`addr >=
+ * REMU_HOST_PHYS_BASE` ⇒ host) that mis-routed raw IOVAs through
+ * the chiplet-local SMMU and faulted honestly on
+ * `xlate_in sid=8 dva=0x0ec00000` — see commit history + the now-
+ * resolved P10 entry in `docs/debugging.md`.
+ *
+ * The dispatch is **gated on `r100_smmu_enabled(s->smmu)`** so the
+ * pre-enable D2D regime keeps working: p5's gdbstub test fires
+ * its kick before q-sys has run `notify_dram_init_done` (verified
+ * via `output/p5-hdma/smmu.log`'s `cr0_smmuen=0`); single-QEMU
+ * NPU-only smoke runs never enable the SMMU. In that regime both
+ * SAR and DAR are NPU-internal and the walker takes the D2D
+ * branch (`address_space_read` → `address_space_write` against
+ * `&address_space_memory`). When a workload puts a VA outside
+ * the bypass-PT window into an LLI's SAR/DAR (legitimate
+ * silicon error, e.g. a kmd buffer the FW's bypass mapping
+ * doesn't cover), the SID 8 walker faults faithfully and the
+ * eventq carries an `F_TRANSLATION` record — same path as
+ * silicon.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -681,8 +709,12 @@ static bool r100_hdma_lli_rd(R100HDMAState *s, uint32_t ch,
      * actually walks that stage-1 PT (no v1 identity shortcut for
      * S1_TRANS — see r100_smmu.c's stage-1 path), so an address
      * outside `0x40000000..0x8000000000` faults faithfully. SAR is
-     * the host bus address and never touches our SMMU. See
-     * file-banner "SMMU note (P11/P10)". */
+     * the host bus address — the call site (P10 direction-based
+     * dispatch in `r100_hdma_walk_ll`) hands us the LLI's raw
+     * value (the kmd publishes raw PCIe IOVAs without
+     * `+ HOST_PHYS_BASE`), passed through `r100_hdma_strip_host_phys`
+     * defensively. Never touches our SMMU. See file-banner
+     * "SMMU note (P11/P10)". */
     if (!r100_hdma_translate(s, R100_HDMA_SMMU_SID_PAYLOAD,
                              dar_npu, R100_SMMU_ACCESS_WRITE,
                              "ll-rd-dar", &dar_pa)) {
@@ -718,11 +750,14 @@ static bool r100_hdma_lli_wr(R100HDMAState *s, uint32_t ch,
      * `SMMU_BYPASS_PT`) is the right STE for the device-side end
      * of the transfer. The walker walks that stage-1 PT honestly,
      * so an SAR outside the bypass window faults same as silicon.
-     * DAR is the host bus address (REMU_HOST_PHYS_BASE-stripped at
-     * the call site) and never touches our SMMU. v1 translates
-     * once and assumes the transfer fits one mapped block (FW's
-     * bypass PT uses 2 MB / 1 GB block descriptors, holds in
-     * practice). */
+     * DAR is the host bus address — the call site (P10
+     * direction-based dispatch in `r100_hdma_walk_ll`) hands us
+     * the LLI's raw value (the kmd publishes raw PCIe IOVAs
+     * without `+ HOST_PHYS_BASE`), passed through
+     * `r100_hdma_strip_host_phys` defensively. Never touches our
+     * SMMU. v1 translates once and assumes the transfer fits one
+     * mapped block (FW's bypass PT uses 2 MB / 1 GB block
+     * descriptors, holds in practice). */
     if (!r100_hdma_translate(s, R100_HDMA_SMMU_SID_PAYLOAD,
                              sar_npu, R100_SMMU_ACCESS_READ,
                              "ll-wr-sar", &sar_pa)) {
@@ -936,15 +971,42 @@ static bool r100_hdma_walk_ll(R100HDMAState *s, R100HdmaDir dir,
             continue;
         }
 
-        /* LLI shape: dispatch by SAR/DAR direction. */
+        /* LLI shape: dispatch by direction once the FW's SMMU is
+         * live. Pre-enable (p5 test, NPU-only smoke runs, very
+         * early boot before q-sys's `notify_dram_init_done`):
+         * D2D — both endpoints address chiplet-local DRAM and the
+         * walker is a plain passthrough byte-mover.
+         *
+         * Direction-based dispatch (P10): q-cp drives HDMA WR for
+         * NPU→host and HDMA RD for host→NPU on the production
+         * MAP_USERPTR copy path. The kmd publishes the host
+         * endpoint as a *raw* PCIe IOVA in the LLI's payload field
+         * (no `+ HOST_PHYS_BASE`, per
+         * `kmd/.../memory.c:rbln_dma_host_convert`'s "MAP_USERPTR
+         * uses the raw IOVA" comment), so the host-leg helpers
+         * receive that address as-is and emit it on the `hdma`
+         * chardev for the host-side `pci_dma_{read,write}` to
+         * resolve. The chiplet-local end goes through the FW's
+         * bypass STE 8 — see r100_hdma_lli_{rd,wr}.
+         *
+         * On real silicon the address itself selects between the
+         * PCIe RC and the chiplet NoC (with SMMU-600 in front);
+         * REMU folds that onto direction because q-cp's
+         * cmd_descr_hdma path always crosses domains, and that's
+         * the only LLI shape the production stack emits. Future
+         * D2D-HDMA workloads (none today) would need either a
+         * marker on the LLI or splitting `r100_hdma` per-channel
+         * by SM_HDMA_SID_LUT. The strip is defensive: production
+         * LLI fields are raw IOVAs (< HOST_PHYS_BASE), but a
+         * future workload that mirrors the LLP chain's
+         * `+ PF_SYSTEM_IPA_BASE` convention into payload would
+         * fall through cleanly. */
         {
-            bool sar_host = (elem.sar >= REMU_HOST_PHYS_BASE);
-            bool dar_host = (elem.dar >= REMU_HOST_PHYS_BASE);
+            bool smmu_live = r100_smmu_enabled(s->smmu);
             const char *route =
-                (sar_host && dar_host) ? "host-host"
-                : (dir == R100_HDMA_DIR_WR && dar_host) ? "wr-host-leg"
-                : (dir == R100_HDMA_DIR_RD && sar_host) ? "rd-host-leg"
-                : "d2d";
+                !smmu_live ? "d2d-pre-smmu"
+                : (dir == R100_HDMA_DIR_WR) ? "wr-host-leg"
+                : "rd-host-leg";
 
             qemu_log_mask(LOG_TRACE,
                           "r100-hdma cl=%u ll_lli dir=%s ch=%u "
@@ -954,36 +1016,33 @@ static bool r100_hdma_walk_ll(R100HDMAState *s, R100HdmaDir dir,
                           dir == R100_HDMA_DIR_RD ? "rd" : "wr",
                           ch, elems, elem.sar, elem.dar,
                           elem.transfer_size, elem.control, route);
+            r100_hdma_emit_trace(s,
+                                 "hdma cl=%u ll_lli dir=%s ch=%u "
+                                 "elem=%d sar=0x%" PRIx64
+                                 " dar=0x%" PRIx64 " size=%u "
+                                 "route=%s\n",
+                                 s->chiplet_id,
+                                 dir == R100_HDMA_DIR_RD ? "rd" : "wr",
+                                 ch, elems, elem.sar, elem.dar,
+                                 elem.transfer_size, route);
 
             if (elem.transfer_size == 0) {
                 /* Empty LLI — q-cp doesn't emit these in the
                  * cmd_descr_hdma path but the test_hdma_if unit
                  * tests do; treat as no-op. */
-            } else if (sar_host && dar_host) {
-                qemu_log_mask(LOG_GUEST_ERROR,
-                              "r100-hdma: LL ch=%u dir=%d both addrs "
-                              "host (sar=0x%" PRIx64 " dar=0x%" PRIx64
-                              ") — unsupported\n",
-                              ch, (int)dir, elem.sar, elem.dar);
-                ok = false;
-            } else if (dir == R100_HDMA_DIR_WR && dar_host) {
-                ok = r100_hdma_lli_wr(
-                        s, ch, elem.sar,
-                        elem.dar - REMU_HOST_PHYS_BASE,
-                        elem.transfer_size);
-            } else if (dir == R100_HDMA_DIR_RD && sar_host) {
-                ok = r100_hdma_lli_rd(
-                        s, ch,
-                        elem.sar - REMU_HOST_PHYS_BASE,
-                        elem.dar, elem.transfer_size);
-            } else {
-                /* D2D / NPU-internal copy. Both SAR and DAR are
-                 * NPU-side DVAs; r100_hdma_lli_d2d runs them through
-                 * `r100_smmu_translate` (P11). When CR0.SMMUEN=0 the
-                 * walker is a passthrough so kmd/q-cp's "all entries
-                 * bypass-region" regime keeps working. */
+            } else if (!smmu_live) {
                 ok = r100_hdma_lli_d2d(s, ch, elem.sar, elem.dar,
                                        elem.transfer_size);
+            } else if (dir == R100_HDMA_DIR_WR) {
+                ok = r100_hdma_lli_wr(
+                        s, ch, elem.sar,
+                        r100_hdma_strip_host_phys(elem.dar),
+                        elem.transfer_size);
+            } else { /* dir == R100_HDMA_DIR_RD */
+                ok = r100_hdma_lli_rd(
+                        s, ch,
+                        r100_hdma_strip_host_phys(elem.sar),
+                        elem.dar, elem.transfer_size);
             }
         }
 

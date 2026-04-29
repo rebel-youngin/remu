@@ -1222,6 +1222,14 @@ static const char *r100_smmu_ste_config_str(uint64_t cfg_field)
     }
 }
 
+bool r100_smmu_enabled(R100SMMUState *s)
+{
+    if (s == NULL) {
+        return false;
+    }
+    return !!(s->regs[SMMU_CR0 >> 2] & SMMU_CR0_SMMUEN);
+}
+
 void r100_smmu_translate(R100SMMUState *s, uint32_t sid, uint32_t ssid,
                          hwaddr dva, int access,
                          R100SMMUTranslateResult *out)

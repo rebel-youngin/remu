@@ -133,4 +133,21 @@ void r100_smmu_translate(R100SMMUState *s, uint32_t sid, uint32_t ssid,
  * engines so the diagnostic tail says *why* the walk failed. */
 const char *r100_smmu_fault_str(R100SMMUFault fault);
 
+/*
+ * True iff CR0.SMMUEN is currently set on this chiplet's SMMU. Engines
+ * that need to switch dispatch policy on the FW's "SMMU is live" signal
+ * (notably r100-hdma's LLI direction-vs-D2D split — see
+ * `docs/roadmap.md` → P10) call this rather than re-implementing the
+ * CR0 register layout. Always-true for `s == NULL` would be wrong
+ * (engines pre-SMMU should D2D), so callers must hold a real link;
+ * `s == NULL` returns false.
+ *
+ * BQL-safe (the underlying register is a plain MMIO latch updated
+ * under BQL by `r100_smmu_mmio_write` and the cm7 stub's
+ * `ldl_le_phys / stl_le_phys` RMW). No memory barrier is needed
+ * because the caller is on the same vCPU thread that drives the
+ * dispatch decision.
+ */
+bool r100_smmu_enabled(R100SMMUState *s);
+
 #endif /* R100_SMMU_H */

@@ -307,6 +307,38 @@ for UMQ multi-queue),
 0xC0..0xFF = reserved (formerly r100-pcie-outbound synchronous
 PF-window reads; the device now aliases shared host-ram instead).
 
+**LLI dispatch (P10).** The LL walker (`r100_hdma_walk_ll`) gates
+on `r100_smmu_enabled(s->smmu)` (= chiplet's CR0.SMMUEN) once it
+has decoded a 24-byte LLI. SMMUEN=1 (production: q-cp drives
+`cmd_descr_hdma` after q-sys's `notify_dram_init_done` flips
+SMMU on via the CM7 stub) → dispatch by direction:
+- WR ⇒ SAR translates through SID 8 (FW bypass STE), then
+  `address_space_read` feeds chunked `OP_WRITE` frames to the
+  host; DAR is the raw host PCIe IOVA the kmd published (per
+  `kmd/.../memory.c:rbln_dma_host_convert`'s "MAP_USERPTR uses
+  the raw IOVA" comment) and the host's `pci_dma_write` resolves
+  it.
+- RD ⇒ SAR is the raw host IOVA; emit `OP_READ_REQ`, park on the
+  channel's resp_cond via `qemu_cond_wait_bql()` (BQL released
+  so the chardev iothread can deliver `OP_READ_RESP`), then DAR
+  translates through SID 8 and `address_space_write`s the
+  payload.
+
+SMMUEN=0 (p5 test, NPU-only smoke runs, very early boot before
+`notify_dram_init_done`) → D2D — both endpoints are chiplet-local
+DRAM offsets and the walker runs `address_space_read` →
+`address_space_write` directly. SMMU translate is identity in
+this regime so no FW init is needed for engine bring-up tests.
+
+The pre-P10 dispatch classified by `addr ≷ REMU_HOST_PHYS_BASE`
+on each LLI field, which mis-routed the umd's raw PCIe IOVAs
+through the chiplet-local SMMU and produced honest stage-1
+faults on `0x0ec00000`-shaped addresses. The address heuristic
+is gone; on real silicon the address itself selects PCIe RC vs
+NoC + SMMU-600, and REMU's direction-based mapping is
+silicon-equivalent because q-cp's production path always crosses
+domains (WR = NPU→host, RD = host→NPU).
+
 The passive `r100-dnc-cluster` register-file stub (sparse regstore
 seeding IP_INFO / SHM TPG / RDSN bits for boot) gained an active
 task-completion path: writes to slot+0x81C (TASK_DESC_CFG1) with
@@ -431,6 +463,15 @@ the default for engine masters per Notion REBELQ SMMU Design § 1.
 SAR/DAR use `R100_HDMA_SMMU_SID_PAYLOAD = 8` — the FW's bypass
 STE that `smmu_init_ste_bypass(0)` programs (S1_TRANS + CD →
 `SMMU_BYPASS_PT`). Multi-VF (SIDs 1..4 + 9..12) is v2.
+`r100_smmu_enabled(s)` — public CR0.SMMUEN getter — exists so
+`r100-hdma`'s LLI dispatch can switch policy on the FW's "SMMU
+is live" signal: pre-enable (p5 / NPU-only smoke) it walks D2D
+(both endpoints chiplet-local DRAM); post-enable (the
+`notify_dram_init_done` handshake → CM7 stub flips CR0.SMMUEN)
+it dispatches by direction — WR's DAR / RD's SAR are raw host
+PCIe IOVAs the kmd published (per `rbln_dma_host_convert`) and
+go out the host-leg `hdma` chardev, while the chiplet-local end
+walks SID 8 / the bypass PT.
 
 3. **Eventq + GERROR fault delivery (v2 — this commit).** Every
    `r100_smmu_translate` fault (`INV_STE`, `STE_FETCH`, page-table
@@ -643,13 +684,15 @@ cleanup so SIGKILL'd prior state never poisons the next:
   `record_llp(0,0)` terminator at chiplet-0 DRAM offset `0x07900000`,
   then drives `CTRL1=LLEN`, `LLP_LO|HI=desc`, `ENABLE=1`,
   `DOORBELL=START` against `r100-hdma` WR-ch0 at
-  `0x1C00000000 + 0x180380000`. Both SAR/DAR are NPU-local DRAM so the
-  walker takes the D2D in-process loop (`address_space_read` →
-  `address_space_write`) — covers the LL chain decode + control-bit
-  walking without depending on a live host BAR. The host-leg paths
-  (NPU→host OP_WRITE chunking, host→NPU OP_READ_REQ + parked
-  `qemu_cond_wait_bql()` round-trip) fall out of P10's umd `simple_copy`
-  via a one-line address_space ↔ chardev swap from the D2D path.
+  `0x1C00000000 + 0x180380000`. The kick fires before q-sys's
+  `notify_dram_init_done` flips `CR0.SMMUEN`, so the walker's
+  `r100_smmu_enabled(s)` gate selects the D2D in-process loop
+  (`address_space_read` → `address_space_write`) — covers the LL
+  chain decode + control-bit walking without depending on a live
+  host BAR. The post-SMMU-enable host-leg paths (RD → host-leg
+  `OP_READ_REQ` + parked `qemu_cond_wait_bql()` round-trip; WR →
+  NPU→host `OP_WRITE` chunking) are exercised end-to-end by the
+  umd workload through `command_submission` (P10).
 - `tests/p11_smmu_walk_test.py` — `--host` boot, same shm-splice
   + gdbstub harness as p4b/p5 (gdbstub on `tcp::4569`). Stages a 3-level
   stage-2 page table (L1 @ `0x06000000`, L2 @ `0x06001000`, L3 @
