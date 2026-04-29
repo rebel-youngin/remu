@@ -1,34 +1,19 @@
-# RBDMA + SMMU design review (vs. Notion)
+# RBDMA + SMMU — gap analysis
 
-Date: 2026-04-28 (review snapshot, pre-P11)
-Scope: review of the current `r100-smmu` (`src/machine/r100_smmu.c`,
-~306 LOC) and `r100-rbdma` (`src/machine/r100_rbdma.c`, ~743 LOC)
-device models against the silicon design captured in Notion.
+Cross-reference of the silicon design (Notion) against the current
+REMU device models. Drives the SMMU v2 milestone (`docs/roadmap.md`)
+and informs the prioritisation of RBDMA follow-on work.
 
-> **2026-04-29 update:** **P11 has landed**, replacing the
-> register-only stub described in § "SMMU — register-only stub" /
-> § "Cross-cutting note" below with a real stage-2 walker (PF only,
-> SID 0). RBDMA OTO and HDMA LL walker now translate through
-> `r100_smmu_translate(SID=0, …)` before each `address_space_*` call.
-> Every "today's identity stub" / "register-only" / "S1∘S2 = identity"
-> phrasing in this document refers to the **pre-P11** state and is
-> kept for design-review historical context. The list of v2 follow-ons
-> in § "SMMU — register-only stub" (stage-1 walk, multi-VF, eventq /
-> GERROR, IOTLB cache, 2LVL stream tables, SID-17 PCIe TBU) is still
-> accurate; P11 deliberately scoped to v1 and deferred all of them.
-> See `docs/roadmap.md` → P11 for the milestone-level breakdown +
-> deferred-v2 list.
-
-Sources read:
+Sources:
 - Notion **REBELQ SMMU Design** (`a27418f9fef34eca8ed4c2dd27f55d26`)
 - Notion **RBDMA v1 User Guide** (`2e60ab893cfc4d2f9769c94a295b1e5f`,
   R100 = REBEL_H = RBDMA v1)
-- `src/machine/r100_smmu.c` (full file)
-- `src/machine/r100_rbdma.c` + `r100_rbdma.h` (full file)
+- `src/machine/r100_smmu.c` + `r100_smmu.h`
+- `src/machine/r100_rbdma.c` + `r100_rbdma.h`
 
 ---
 
-## Notion docs — what the silicon actually does
+## Notion docs — what the silicon does
 
 ### REBELQ SMMU Design
 
@@ -41,7 +26,7 @@ SMMU-600 with 18 SIDs split by master + function:
 | 16    | Device HDMA (PA mode)                   | bypass                         | bypass                            |
 | 17    | Host inbound (PCIe TBU, all functions)  | bypass                         | PCIe addr → PA, table built in BL2 early-init |
 
-Key invariants from the doc:
+Key invariants:
 
 - SID 17 page table must be ready **before CRS release (~1 s)**, so BL2
   builds it (16 KB initial table). Host distinguishes PF / VFn purely
@@ -87,19 +72,27 @@ Key invariants from the doc:
 
 ### `r100_smmu.c` — `r100-smmu`, MMIO 64 KB @ TCU_OFFSET 0x1FF4200000, per chiplet
 
-- Pure register-file write-back. **No STE / CD / page-table walk
-  anywhere.**
+**v1 (current):** stage-2 walker, PF only (SID 0).
+
 - BL2 boot: `CR0` bits mirror into `CR0ACK`; `GBPA.UPDATE`
   auto-clears; `IRQ_CTRLACK` mirrors `IRQ_CTRL`. Just enough to
   clear the BL2 spin-loops.
-- FreeRTOS path: only `CMDQ_BASE / PROD / CONS` + `CMD_SYNC` are
-  interpreted — on PROD write, walks `(old_cons, new_prod]`, for any
-  entry with opcode `0x46` / CS=SIG_IRQ writes `0` to
-  `cmd[1].msiaddr` and advances CONS=PROD. Non-SYNC commands
-  (CFGI_*, TLBI_*, PREFETCH_*, ATC_INV, RESUME) are silently dropped.
-- Effective transform: `S1 ∘ S2 = identity`. Engines (`r100-rbdma`,
-  `r100-hdma`, `r100-dnc-cluster`, `r100-pcie-outbound`) all assume
-  this and bypass the SMMU.
+- `STRTAB_BASE` / `STRTAB_BASE_CFG` cache the in-DRAM stream-table
+  geometry (LINEAR only; q-sys uses LINEAR for the ≤32-SID R100).
+- CMDQ recognises and logs `CMD_SYNC` (zeroes msiaddr per
+  `CS=SIG_IRQ`) + the full `CMD_TLBI_*` / `CMD_CFGI_*` /
+  `CMD_PREFETCH_*` opcode set (advance CONS as no-ops — v1 has no
+  STE / IOTLB cache to invalidate; every translate re-reads the STE).
+- Public `r100_smmu_translate(s, sid, ssid, dva, access, *out)`:
+  pre-`CR0.SMMUEN` → identity; post-enable → read STE for `sid`,
+  decode `STE0.{V, config}` (`BYPASS`→identity, `ABORT`→`INV_STE`
+  fault, `S1_TRANS`→v1 identity+LOG_UNIMP, `S2_TRANS` /
+  `ALL_TRANS`→build `SMMUTransCfg` from STE2/STE3 and dispatch to
+  QEMU's existing `smmu_ptw_64_s2`).
+- Wired into `r100-rbdma` (OTO src+dst before chiplet base) and
+  `r100-hdma` (LL walker LLP cursor + per-LLI SAR/DAR for D2D,
+  NPU→host OP_WRITE chunks, host→NPU OP_READ_REQ chunks) via QOM
+  `link<r100-smmu>` properties.
 
 ### `r100_rbdma.c` — `r100-rbdma`, MMIO 1 MB @ NBUS_L_RBDMA_CFG_BASE 0x1FF3700000, per chiplet
 
@@ -113,11 +106,13 @@ Key invariants from the doc:
   `td_ptid_init@0x200`, decodes `td_run_conf0.task_type`. **OTO=0**
   is the only behavioural path — pulls `srcaddr / destaddr /
   sizeof128blk / run_conf0` from the regstore, reconstructs 41-bit
-  byte addresses (`{msb[1:0], lo[31:0]} << 7`), adds
-  `chiplet_id × R100_CHIPLET_OFFSET`, and runs `address_space_read` →
-  buf → `address_space_write` against `&address_space_memory`
-  (cap 32 MiB). Other task_types log `LOG_UNIMP` and still push the
-  FNSH entry so q-cp's done loop unwinds.
+  byte addresses (`{msb[1:0], lo[31:0]} << 7`), calls
+  `r100_smmu_translate(SID=0, …)` to honour stage-2 (identity when
+  `CR0.SMMUEN=0`), adds `chiplet_id × R100_CHIPLET_OFFSET`, and runs
+  `address_space_read` → buf → `address_space_write` against
+  `&address_space_memory` (cap 32 MiB). Other task_types log
+  `LOG_UNIMP` and still push the FNSH entry so q-cp's done loop
+  unwinds.
 - BH walks the FNSH ring after the push, pulses
   `INT_ID_RBDMA1 = 978` per entry (skips when `intr_disable = 1`).
   `INT_ID_RBDMA0_ERR = 977` is wired but never pulsed.
@@ -126,134 +121,118 @@ Key invariants from the doc:
 
 ---
 
-## Review — gaps vs. silicon
+## SMMU v2 gaps
 
-### SMMU — register-only stub, identity translation
+In rough priority order:
 
-Documented honestly in code comments and matches the agreed scope, but
-the gap is wide:
+1. **Stage-1 walk via CD per SSID.** q-cp's `smmu_init_ste` sets
+   `STE1.S1DSS=BYPASS` for SIDs 0..4 today; v2 honours CD per SSID.
+   DNC compute uses SSID-keyed translation. Plug point: the
+   `S1_TRANS` arm in `r100_smmu_translate` (currently identity +
+   `LOG_UNIMP`). QEMU's `smmu_ptw_64_s1` is already linked via
+   `CONFIG_ARM_SMMUV3=y` — REMU only needs CD decode + dispatch.
+2. **Multi-VF (SIDs 1..4).** Each VF has its own page table; per-VF
+   `vttb` resolved through STE per-SID. SID 0 hardcoded today on
+   both engines — v2 either threads SID through engine state or
+   exposes a SID resolver from the engine's QOM context. RBDMA's
+   `ip_info2.chiplet_id` does not fold into SID; a separate
+   chiplet/VF→SID mapping table is needed.
+3. **STE / IOTLB cache + honest `CMD_TLBI_*` / `CMD_CFGI_*`
+   invalidation.** v1 re-reads STE on every translate (correct but
+   uncached). v2 needs:
+   - per-SID STE cache invalidated by `CMD_CFGI_STE`,
+   - per-SSID CD cache invalidated by `CMD_CFGI_CD`,
+   - VA / IPA IOTLB invalidated by `CMD_TLBI_NH_*` / `CMD_TLBI_S2_IPA`,
+   - whole-cache invalidate on `CMD_TLBI_NSNH_ALL`.
+   Today's CMDQ already recognises and logs every opcode — adding
+   the cache itself is the work.
+4. **Eventq / GERROR fault delivery.** STE.config=ABORT, translate
+   faults, and stage-2 PT walk faults should land on the software
+   event queue with MSI raise. `R100SMMUFault` enum exists for the
+   error-code; missing pieces are eventq pointer plumbing,
+   `EVENTQ_PROD/CONS` advance, and the MSI emit on `IRQ_CTRL`.
+5. **2LVL stream-table format.** v1 supports LINEAR only. q-sys's
+   ≤32-SID R100 uses LINEAR; 2LVL is purely for capacity headroom.
+   `STRTAB_BASE_CFG.fmt` is already cached — `r100_smmu_read_ste`
+   needs a 2LVL branch that walks the L1 → L2 indirection.
+6. **Chiplet-0 PCIe-side TBU SID 17.** Host-inbound translation via
+   the BL2-staged 16 KB initial table from
+   `tf-a/.../smmu/smmu.c:smmu_early_init`. Distinct path from the
+   NPU-side engine SIDs; it lives on the *host* side of the PCIe
+   boundary. REMU's `r100-pcie-outbound` is the natural anchor — a
+   second translate hook that runs the kmd-published bus address
+   through SID 17's stage-2 before the `host-ram` alias materialises
+   it. Today the alias bypasses the SMMU entirely (correct under
+   the all-bypass regime kmd uses on bring-up).
+7. **Dedicated HDMA-PA-mode SID 16.** Notion's regime where the
+   bypass region `0x0..0x80_0000_0000` passes through unchanged.
+   Today's `r100-hdma` model already assumes PA passthrough on the
+   NPU-side; SID 16 wiring becomes meaningful when stage-1 lands and
+   some channels need IPA translation while others need PA bypass.
+8. **OAS / output-addr-size enforcement.** Doc constrains
+   OAS = 40-bit. Benign while identity / stage-2 only is the regime.
 
-1. **No STE / CD / page-table walk.** None of the SID-based behaviour
-   from the design doc (S1+S2 for SID 0–4, htid-strip for SID 8–12,
-   S2-only for SID 17) exists. Deliberate pragmatic choice —
-   `r100-rbdma`, `r100-hdma`, `r100-pcie-outbound` and
-   `r100-dnc-cluster` all bypass and rely on flat AXI / chiplet-base
-   plumbing.
-2. **`STRTAB_BASE` / `STRTAB_BASE_CFG` are write-only no-ops.** BL2's
-   stream-table init is silently dropped; nothing reads it back.
-3. **Event queue / GERROR / PRIQ paths absent.** `EVENTQEN` / `PRIQEN`
-   bits ack via `CR0ACK`, but no eventq pointer plumbing or MSI
-   generation. Fault-injection paths (`pterror` etc.) don't work.
-4. **CMDQ command set is single-opcode.** Only `CMD_SYNC` is honoured;
-   `CFGI_STE / CD`, `TLBI_*`, `ATC_INV`, `PREFETCH_*` are dropped.
-   Today this is benign (no STE / CD state to invalidate), but a
-   future translation hook will need to make these coherent with
-   whatever cache it holds.
-5. **OAS / output-addr-size config is ignored.** Doc constrains
-   OAS = 40-bit; REMU has no enforcement. Benign while identity is
-   the regime.
+---
 
-The header docstring is candid that this is the bare minimum to clear
-`smmu_early_init` and `smmu_sync` polls. Everything else in the design
-doc (PCIE TBU, HDMA TBU, DNC/DDMA TBU, page-table BL2 staging,
-SR-IOV reconfig) is structurally absent.
+## RBDMA gaps (rough priority)
 
-### RBDMA — partial reg-block + OTO byte mover
-
-Conformant pieces (vs. the user guide):
-
-- 8 TE, chiplet_id at `ip_info2[7:0]`, kick on `td_run_conf1@0x21C`,
-  ascending descriptor write, `intr_disable` bit honoured, INT_ID
-  977 / 978 wiring, OTO byte-mover with 128-B-grain address
-  reconstruction. ✓
-
-Gaps that matter, in rough priority for the umd workload roadmap:
-
-1. **Address translation (SMMU-coupled).** SAR / DAR are documented
-   as DVAs in the user guide; REMU treats them as raw chiplet-local
-   PAs. Fine while SMMU is identity (umd's allocator hands out
-   PA-equal-DVA today), but the moment SMMU honours FW page tables,
-   every `r100_rbdma_do_oto` call needs an
-   `r100_smmu_translate(SID, SSID, dva, …)` hook in front of
-   `address_space_*`. Plug point already noted in the OTO comment
-   block.
-2. **PTD path absent.** `td_ptl_v2p / msb / info / num` writes hit the
-   regstore as anonymous words; the PT queue is invisible. **PTL=8 /
-   IVL=9** task types fall through to `LOG_UNIMP`. Today's regression
-   tests don't push PTs (umd's `simple_copy` is OTO-only with
-   identity SMMU), but anything that exercises page-table life-cycle
-   will silently no-op.
-3. **`td_expand` / `td_run_conf_ext@0x280`.** REMU only kicks on
+1. **PTD path absent.** `td_ptl_v2p / msb / info / num` writes hit
+   the regstore as anonymous words; the PT queue is invisible.
+   **PTL=8 / IVL=9** task types fall through to `LOG_UNIMP`. Anything
+   that exercises page-table life-cycle silently no-ops. Comes back
+   into focus once SMMU v2 stage-1 lands and q-cp pushes per-task
+   PTs.
+2. **`td_expand` / `td_run_conf_ext@0x280`.** REMU only kicks on
    `0x21C`. With `pkg_mode.td_expand = 1` (SP Parallel mode + MP
    Sync) the silicon trigger moves to 0x280 — REMU would store the
    descriptor and silently never kick. Easy fix: also trip the
    kickoff handler when `pkg_mode[0] == 1 && addr == 0x280`.
-4. **Sync (TSYNC / LSYNC / RLSYNC / MPSYNC) totally unmodelled.**
+3. **Sync (TSYNC / LSYNC / RLSYNC / MPSYNC) totally unmodelled.**
    Sync registers (`tsync_g000_dpdc_*` @ 0x2000+, `tsync_dnc_cfg_*`,
    `mp_hash_pos*`, sync masks in TD) all hit the regstore. The
    kickoff path doesn't gate on dependency state, so a task that
    should block on a DNC put-tsync runs *immediately*. Fine while
-   OTO-only umd pulls everything sequentially, but regresses the
-   moment a mixed DNC / RBDMA workload arrives.
-5. **Auto-fetch (`proc[0..3]_*` @ 0x7000 / 7010 / 7020 / 7030).** No
+   OTO-only umd pulls everything sequentially; regresses the moment
+   a mixed DNC / RBDMA workload arrives.
+4. **Auto-fetch (`proc[0..3]_*` @ 0x7000 / 7010 / 7020 / 7030).** No
    reaction to `proc_ptr_bytesize` writes. The user guide flags this
    as the standard CP path (and the recommended double-buffered
    shape). q-cp's `simple_copy` doesn't use it today; if it ever
    does, the descriptor stream will be silently ignored.
-6. **CST / DAS / GTH / SCT / GTHR / SCTR / OTM / VCM / DUM / PTL / IVL.**
+5. **CST / DAS / GTH / SCT / GTHR / SCTR / OTM / VCM / DUM / PTL / IVL.**
    All `LOG_UNIMP` no-op; they complete the FNSH push so q-cp's done
    loop unblocks. CST is trivial (broadcast 4 B → 128 B); DUM is
-   even cheaper (no data move). DAS is OTO with overlap-safe ordering
-   — fine since `memcpy` is overlap-safe. The gather / scatter family
-   will need real work the moment compiler-generated workloads land.
-7. **Process kill / task kill / clear** (`global_cdma_stop_resume_kill@0x1C0`,
+   even cheaper (no data move). DAS is OTO with overlap-safe
+   ordering. The gather / scatter family will need real work the
+   moment compiler-generated workloads land.
+6. **Process kill / task kill / clear** (`global_cdma_stop_resume_kill@0x1C0`,
    `kill_status@0x1C8`, `te_pause / te_clear@0x80x0`). Regstore-only
    — the doc's `polling until kill_status == 1` would spin forever.
    Off the umd happy path today, but any error-injection test hits
    this.
-8. **Error injection.** `err_irq` wired but unused; no synth path into
-   `global_err_intr_fifo[0x140..0x148]`. Trivial follow-on.
-9. **VCM / multi-chiplet TSYNC routing.** `chiplet_id` is plumbed in
+7. **Error injection.** `err_irq` wired but unused; no synth path
+   into `global_err_intr_fifo[0x140..0x148]`. Trivial follow-on.
+8. **VCM / multi-chiplet TSYNC routing.** `chiplet_id` is plumbed in
    `ip_info2`, but the `tsync_dnc_cfg_baseaddr`-relative emit path
    the doc describes (cross-chiplet TSYNC delivery) is unmodelled.
-10. **Queue-depth mismatch.** REMU seeds **32-deep** TQ / UTQ / PTQ /
-    TEQ / FNSH; doc says **64 / 64 / 128 / N / N**. Pragmatic since
-    the credit-report path returns "all free" regardless of depth,
-    but worth a one-liner in the comment that 32 is "small-but-not-
-    silicon-shape" rather than the real number — a future
-    credit-tracking implementation would otherwise inherit the wrong
-    cap.
-11. **Wrongcmd / RO / WO / undefined-addr enforcement absent.**
+9. **Queue-depth mismatch.** REMU seeds **32-deep** TQ / UTQ / PTQ /
+   TEQ / FNSH; doc says **64 / 64 / 128 / N / N**. Pragmatic since
+   the credit-report path returns "all free" regardless of depth.
+   A future credit-tracking implementation would otherwise inherit
+   the wrong cap.
+10. **Wrongcmd / RO / WO / undefined-addr enforcement absent.**
     `LOG_GUEST_ERROR` opportunity if/when q-cp is buggy. Low value.
-12. **Log Manager (CDMA `0x500..0x538`) / Bus Profiling (`0x84F8..`)
-    registers are entirely passive.** q-cp profiling reads return
-    synthesised IP_INFO seeds or zeros. Defer until profiling becomes
-    interesting.
-
-### Cross-cutting note
-
-`r100-rbdma`'s OTO mover and `r100-hdma`'s D2D walker share the same
-convention: chiplet base added on top of "DVA treated as PA". When
-SMMU translation lands, a single
-`r100_smmu_translate(asid, dva, &pa)` helper called from both engines
-+ `r100-pcie-outbound` (and from any future SID-17 host-inbound trap)
-would close the gap consistently. The REMU code already calls this
-out in two places (`docs/roadmap.md → "SMMU honour FW page tables"`
-and the OTO header comment) — the plumbing is just waiting for an
-STE / CD / PT walker on the SMMU side.
+11. **Log Manager (CDMA `0x500..0x538`) / Bus Profiling
+    (`0x84F8..`)** registers are entirely passive. Defer until
+    profiling becomes interesting.
 
 ---
 
-## Summary
+## Cross-cutting note
 
-SMMU is a deliberate identity-translation register stub — fine for the
-current boot / test surface but missing every functional path from the
-design doc (STE / CD walk, eventq, GERROR, command-set beyond
-CMD_SYNC). RBDMA conforms on the OTO byte-mover + IP_INFO + done IRQ;
-the next concrete gaps in priority order are:
-
-1. honor the SMMU translation when it lands,
-2. `td_expand` triggering on `0x280`,
-3. PTD push + PTL / IVL behaviour,
-4. sync-group dependency gating,
-5. auto-fetch (`proc0..3`) descriptor streams.
+`r100-rbdma`'s OTO mover, `r100-hdma`'s D2D / chunked walker, and any
+future SID-17 host-inbound trap on `r100-pcie-outbound` all share the
+same `r100_smmu_translate(s, sid, ssid, dva, access, *out)` entry.
+v2 changes shape on the SMMU side; the engine call sites stay the
+same. v1 plug points already in place are the natural insertion
+points for the v2 walker extensions.

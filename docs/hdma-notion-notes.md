@@ -2,7 +2,7 @@
 
 Distilled from the Engineering Wiki → CP FW pages. Source of truth is
 Notion; this file is a pinned snapshot for offline reference while
-working on `r100-hdma` (P5) and any DVA / IPA translation question.
+working on `r100-hdma` and any DVA / IPA translation question.
 Re-fetch the originals if anything below looks stale.
 
 ## Sources
@@ -130,7 +130,7 @@ descriptor structure types and the memory pool sizing:
 - Net benefit on tp16 LLM: descriptor-build cycles dropped 39.31 →
   2.07 (@32 MHz), but no e2e speedup. Feature kept on a branch only.
 
-Not directly needed for P5; kept for context.
+Not directly needed by `r100-hdma` today; kept for context.
 
 ## 4. SMMU regime — what HDMA addresses mean
 
@@ -153,57 +153,15 @@ tagged and translated. HDMA-specific points:
 
 ### REMU implication
 
-**Pre-P11**: REMU's `r100_smmu.c` was a register-only stub
-(`CR0→CR0ACK`, `CMDQ_CONS=PROD`, no STE / CD / page-table walk),
-giving an effective `S1 ∘ S2 = identity`. The Notion bypass-region
-rule is *exactly* this regime — HDMA / RBDMA / DNC engines could
-call `address_space_{read,write}` directly on the kmd-published
-address plus `chiplet_id * R100_CHIPLET_OFFSET` (REMU's flat-global
-vs. chiplet-local plumbing) and be silicon-faithful while kmd / q-cp
-left the LUT in all-bypass shape.
+`r100_smmu.c` v1 implements a stage-2 walker (PF only, SID 0). HDMA's
+NPU-side SAR/DAR/cursor go through `r100_smmu_translate(SID=0, …)`
+before each `address_space_*` call; when `CR0.SMMUEN=0` the translate
+falls through to identity (the all-bypass regime kmd / q-cp use on
+bring-up — the Notion bypass-region rule applies here unchanged).
+When q-sys's `smmu_s2_enable` flips `STE0.config` to `ALL_TRANS` with
+stage-2 fields filled, the walker honours the in-DRAM page tables.
 
-**P11** replaced the stub with a real stage-2 walker (PF only).
-HDMA's NPU-side SAR/DAR/cursor go through
-`r100_smmu_translate(SID=0, …)` before each `address_space_*` call;
-when `CR0.SMMUEN=0` the translate is identity, so the bypass regime
-described above keeps working unchanged. When q-sys's
-`smmu_s2_enable` flips STE0.config to ALL_TRANS with stage-2 fields
-filled, the walker honours the in-DRAM page tables. v2 follow-ons
-(stage-1 walk via CD per SSID, multi-VF, IOTLB cache, dedicated
-HDMA-PA-mode SID 16 wiring, host-inbound SID 17 PCIe TBU) are gated
-on workload need.
-
-## 5. Direct implications for P5
-
-Today's `src/machine/r100_hdma.c` models the **non-LL doorbell
-path**: per-channel `ENABLE / DOORBELL / XFER_SIZE / SAR / DAR /
-STATUS / INT_STATUS / INT_CLEAR`, single transfer per doorbell.
-That's enough for a hand-driven test (M9-1c) but not enough for
-q-cp's `cmd_descr_hdma` because q-cp always uses LL mode.
-
-Closing P5 means adding to `r100-hdma`:
-
-1. **Missing per-channel registers**: `CTRL1` (with the `LLEN` bit),
-   `LLP_LO / LLP_HI`, `WATERMARK`, `ELEM_PF`, `HANDSHAKE`, `CYCLE`,
-   `FUNC_NUM`, `QOS`, `INT_SETUP`, `MSI_MSGD`, `MSI_STOP`,
-   `MSI_WATERMARK`, `MSI_ABORT`. Most can be plain regstore; `LLEN`
-   and `LLP_*` are load-bearing for the kick path.
-2. **LL walk on doorbell** when `LLEN=1`:
-   - read `dw_hdma_v0_llp` at `LLP_LO|HI` (chiplet 0 sysmem),
-   - for each chained `dw_hdma_v0_lli`: extract `(size, sar, dar,
-     ctrl)` and execute the SAR→DAR copy using the same path as
-     today (cross-PCIe → `OP_WRITE`/`OP_READ_REQ` over `hdma`
-     chardev; intra-NPU → `address_space_{read,write}` directly),
-   - on each element completion with the watermark bit set, raise
-     watermark IRQ; on chain end, raise done IRQ.
-3. **MSI fan-out**: writing to `MSI_MSGD` at the addresses programmed
-   in `msi_{stop,watermark,abort}` is an MSI-X frame back to host —
-   reuse the existing `r100-imsix` chardev path so kmd's IRQ handler
-   gets fed naturally.
-4. **DVA passthrough** stays identity-mapped per the SMMU doc — no
-   new translation hook needed for P5; `chiplet_id *
-   R100_CHIPLET_OFFSET` add is sufficient.
-
-The bidirectional `hdma` chardev wire format and the `0x80..0xBF`
-`req_id` partition are already in place from M9-1c — P5 only adds
-LL-walk callers, not a new transport.
+v2 follow-ons (stage-1 walk via CD per SSID, multi-VF, IOTLB cache,
+dedicated HDMA-PA-mode SID 16 wiring, host-inbound SID 17 PCIe TBU)
+are gated on workload need — see `docs/roadmap.md` → "SMMU v2" and
+`docs/rbdma-smmu-review.md` for the priority list.

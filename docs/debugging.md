@@ -1,9 +1,9 @@
 # Testing & Debugging
 
 How to build REMU, run it into a reproducible output directory, and
-inspect the result. Prescriptive. Per-milestone design rationale lives
-in `git log` (see `docs/roadmap.md` for the commit map) — this doc
-only covers what breaks in practice.
+inspect the result. Per-fix design rationale lives in `git log` — this
+doc only covers what breaks in practice and how to drive the
+emulator.
 
 ## Prerequisites
 
@@ -56,23 +56,18 @@ output/my-test/
   qemu.log        # only if --trace
 ```
 
-Phase 2 (`./remucli run --host` — both QEMUs + 5 chardev bridges):
+Phase 2 (`./remucli run --host` — both QEMUs + chardev bridges):
 
 ```
 output/my-test/
   cmdline.txt + uart{0..3}.log + hils.log   # NPU side (as above)
-  doorbell.log  # M6+M8a    — host → NPU frames (INTGR + MAILBOX_BASE)
-  msix.log      # M7        — NPU → host MSI-X frames
-  issr.log      # M8a       — NPU → host ISSR frames
-  hdma.log      # M8b 3b+3c — bidirectional HDMA (OP_WRITE / OP_READ_REQ / OP_READ_RESP)
-                # (P7 retired the cm7-debug chardev / cm7.log trace;
-                #  P10-fix retired the cfg chardev / cfg.log — cfg-head
-                #  propagation moved to a shared cfg-shadow shm alias)
-  rbdma.log     # P10 post-mortem — chiplet 0's r100-rbdma kickoff /
-                #  BH fire / FNSH pop, one line per task lifecycle step.
-                #  Always-on, no --trace overhead. CharBackend is
-                #  single-frontend so only chiplet 0 is wired; that's
-                #  where P10's cb lifecycle runs.
+  doorbell.log  # host → NPU frames (INTGR + MAILBOX_BASE)
+  msix.log      # NPU → host MSI-X frames (sourced by q-cp's cb_complete
+                #  → pcie_msix_trigger via the r100-imsix MMIO trap)
+  issr.log      # NPU → host ISSR frames
+  hdma.log      # bidirectional HDMA (OP_WRITE / OP_READ_REQ / OP_READ_RESP)
+  rbdma.log     # chiplet 0's r100-rbdma kickoff / BH fire / FNSH pop,
+                # one line per task lifecycle step
   shm -> /dev/shm/remu-my-test/        # remu-shm + host-ram + cfg-shadow shared backends
   npu/
     monitor.sock       # HMP over unix socket
@@ -80,7 +75,7 @@ output/my-test/
     info-{mtree,qtree,mtree-imsix,qtree-issr,qtree-cfg-hdma}.log  # startup bridge checks
   host/
     cmdline.txt + qemu.{stdout,stderr}.log
-    serial.log         # SeaBIOS idle, or Linux + kmd dmesg when M8b Stage 2 staged
+    serial.log         # SeaBIOS idle, or Linux + kmd dmesg when guest image staged
     monitor.sock       # HMP
     {doorbell,msix,issr,hdma}.sock  # chardev listeners (host = server, NPU = client)
     info-{pci,mtree,mtree-bar4,mtree-bar5,qtree-issr,qtree-cfg-hdma}.log
@@ -218,104 +213,86 @@ bytes, two addresses.
 ## Bridge sanity tests
 
 `./remucli test all` runs every milestone's end-to-end Python test with
-per-test cleanup. Individual invocation: `./remucli test {m5,m6,m7,m8}`
-or `python3 tests/mN_*.py`. Each test wraps a `--name` (`m5-flow`,
-`m6-doorbell`, `m7-msix`, `m8-issr`), so stale shm / sockets / orphan
-QEMUs from a prior attempt are cleaned first.
+per-test cleanup. Individual invocation: `./remucli test {m5,m6,m7,m8,p4a,p4b,p5,p11}`
+or `python3 tests/<test>.py`. Each test wraps a `--name` so stale
+shm / sockets / orphan QEMUs from a prior attempt are cleaned first.
 
-Bridge-wiring design detail is in `docs/architecture.md` and commit
-messages (`7b03328` M1-M4, `72c98f0` M5, `85b76bb`/`500856b` M6,
-`db3d1df` M7, `cd24aa9` M8a). Quick on-line checks:
+Quick on-line checks:
 
 ```
-# M6: host BAR4 MMIO overlay + NPU cm7/mailbox in qtree
+# host BAR4 MMIO overlay + NPU cm7/mailbox in qtree
 printf 'info mtree\nquit\n' | socat - UNIX-CONNECT:output/<name>/host/monitor.sock | rg 'r100.bar4'
 printf 'info qtree\nquit\n' | socat - UNIX-CONNECT:output/<name>/npu/monitor.sock  | rg 'r100-(cm7|mailbox)'
 
-# M7: NPU r100-imsix at 0x1BFFFFF000, host BAR5 msix-{table,pba}
+# NPU r100-imsix at 0x1BFFFFF000, host BAR5 msix-{table,pba}
 printf 'info mtree\nquit\n' | socat - UNIX-CONNECT:output/<name>/npu/monitor.sock  | rg 'r100-imsix'
 printf 'info mtree\nquit\n' | socat - UNIX-CONNECT:output/<name>/host/monitor.sock | rg 'msix-(table|pba)'
 
-# M8a: ISSR shadow must match between host BAR4 + MAILBOX_BASE and NPU mailbox SFR
+# ISSR shadow must match between host BAR4 + MAILBOX_BASE and NPU mailbox SFR
 #   BAR4 base is in host/info-pci.log (currently 0xfe000000 under SeaBIOS)
 printf 'xp /1wx 0xfe000090\nquit\n'    | socat - UNIX-CONNECT:output/<name>/host/monitor.sock
 printf 'xp /1wx 0x1ff8160090\nquit\n'  | socat - UNIX-CONNECT:output/<name>/npu/monitor.sock
 
-# cfg + hdma chardevs must be bound on both ends in qtree
-# (P7 retired the cm7-debug chardev along with the gated stubs)
-printf 'info qtree\nquit\n' | socat - UNIX-CONNECT:output/<name>/host/monitor.sock | rg '(cfg|hdma) *='
-printf 'info qtree\nquit\n' | socat - UNIX-CONNECT:output/<name>/npu/monitor.sock  | rg '(cfg|hdma)-chardev'
+# hdma chardev must be bound on both ends in qtree
+printf 'info qtree\nquit\n' | socat - UNIX-CONNECT:output/<name>/host/monitor.sock | rg 'hdma *='
+printf 'info qtree\nquit\n' | socat - UNIX-CONNECT:output/<name>/npu/monitor.sock  | rg 'hdma-chardev'
+
+# cfg-mirror alias must overlap on both sides (cfg-shadow shm)
+printf 'info mtree\nquit\n' | socat - UNIX-CONNECT:output/<name>/host/monitor.sock | rg 'r100.bar2.cfg.alias'
+printf 'info mtree\nquit\n' | socat - UNIX-CONNECT:output/<name>/npu/monitor.sock  | rg 'r100.cm7.cfg-mirror.alias'
 ```
 
-`{doorbell,msix,issr,cfg,hdma}.log` are per-bridge ASCII traces
-(format `<bus> off=0x... val=0x... [status=...] count=N`, or for
-hdma: `hdma <dir> op=<mnemonic> dst=0x... len=... req_id=N status=... count=N`
+`{doorbell,msix,issr,hdma}.log` are per-bridge ASCII traces (format
+`<bus> off=0x... val=0x... [status=...] count=N`, or for hdma:
+`hdma <dir> op=<mnemonic> dst=0x... len=... req_id=N status=... count=N`
 where `<dir>` is `tx` / `rx` and mnemonics are
-`WRITE`/`READ_REQ`/`READ_RESP`/`CFG_WRITE`). `msix.log` is sourced
-exclusively by q-cp's `cb_complete → pcie_msix_trigger` via the
-`r100-imsix` MMIO trap (P2 deleted the cm7-side notify; P7 retired
-the entire FSM that used to host it). The `cm7.log` BD-done trace
-chardev was retired in P7 — pre-P7 runs produced it as scaffolding;
-post-P7 there is no NPU-side cm7 FSM so the file is no longer
-created.
-Empty-after-traffic means the chardev is down — check both QEMUs are
-up and the `*.sock` files exist. Rejected frames (bad offset / vector
-≥ 32 / bad HDMA magic) only surface as `GUEST_ERROR` lines in
-`qemu.log`, not the per-bridge log.
+`WRITE`/`READ_REQ`/`READ_RESP`). Empty-after-traffic means the chardev
+is down — check both QEMUs are up and the `*.sock` files exist.
+Rejected frames (bad offset / vector ≥ 32 / bad HDMA magic) only
+surface as `GUEST_ERROR` lines in `qemu.log`, not the per-bridge log.
 
 `./remucli run --host` auto-verifies all of the above on startup and
 prints pass/fail; failures are non-fatal (NPU still boots for
 post-mortem poking).
 
-### `FW_BOOT_DONE` path — cold boot (real) + soft reset (CM7 stub)
+## `FW_BOOT_DONE` path — cold boot vs. soft reset
 
 There are **two** times the kmd reads `0xFB0D` out of BAR4+0x90, and
 they travel different paths in REMU:
 
-**Cold boot (real, post GIC-wiring fix).** q-sys FreeRTOS runs
-`bootdone_task` pinned to chiplet-0 CPU 0. The task crosses its
-internal gates (`CL_BOOTDONE_MASK`, etc.) and calls
+**Cold boot (real).** q-sys FreeRTOS runs `bootdone_task` pinned to
+chiplet-0 CPU 0. The task crosses its internal gates
+(`CL_BOOTDONE_MASK`, etc.) and calls
 `bootdone_notify_to_host(PCIE_PF)`, which writes `0xFB0D` to the
 chiplet-0 **PF** mailbox's `ISSR[4]` via the Samsung-IPM register
 path. `r100-mailbox` egresses that write as an 8-byte frame on the
 `issr` chardev, and the host-side `r100-npu-pci` lands it in the
-BAR4+0x90 shadow so the driver reads the real value. No stub in
-the loop (i.e. `r100-cm7`'s SOFT_RESET synthesiser is not involved
-on cold boot). Ground truth:
+BAR4+0x90 shadow so the driver reads the real value. No stub in the
+loop. Ground truth:
 
 ```
 rg 'Notify Host - PF FW_BOOT_DONE' output/<name>/uart0.log
 grep '0x90.*0xfb0d'                 output/<name>/issr.log
 ```
 
-If `Notify Host - PF FW_BOOT_DONE` never prints in `--host` mode but
-does print in `--host --no-guest-boot`, suspect an IRQ-storm
-regression on CA73 CPU 0 — see "Post-mortems" below for the
-diagnostic recipe.
-
-**Soft reset (stubbed).** kmd `rebel_hw_init` always clears
+**Soft reset (CM7 stub, gated).** kmd `rebel_hw_init` always clears
 `ISSR[4]` and rings `INTGR0 bit 0` (`REBEL_DOORBELL_SOFT_RESET`)
 during probe — even when firmware is already up — then polls
-`ISSR[4]` for a fresh `0xFB0D` in `rebel_reset_done`. On silicon
-the PCIE_CM7 subcontroller physically resets the CA73 cluster,
-firmware reboots from BL1, and `bootdone_task` re-emits `0xFB0D`
-naturally. REMU models neither CM7 nor the PMU reset sequence, and
-the CA73 FreeRTOS build short-circuits the mailbox ISR to
-`default_cb` (CMake `FREERTOS_PORT != GCC_ARM_CA73` gate in
-`drivers/pcie/pcie_mailbox_callback.c`). The CM7 stub in
-`r100_cm7.c` catches `INTGR0 bit 0` and calls
-`r100_mailbox_cm7_stub_write_issr(pf_mailbox, 4, R100_FW_BOOT_DONE)`,
-which updates PF.ISSR[4] **and** emits the NPU→host issr frame so
-the BAR4 shadow converges — but only **after** PF's
-`fw_boot_done_seen` latch has flipped (Side bug 2 fix). The latch
-is set the first time q-sys's own `bootdone_task` writes
-`0xFB0D` into PF.ISSR[4] from the NPU-MMIO source, so a
-SOFT_RESET arriving before q-sys has reached its cold-boot
-`main.c:250` DCS memset is silently dropped (LOG_TRACE) and the
-kmd parks on its own `readx_poll_timeout` for `val != 0` until
-the natural cold-boot publish arrives. Other bits relay onto
-VF0.INTGR1 for CA73 ISR visibility. `pf-mailbox` link wired
-from `r100_soc.c`.
+`ISSR[4]` for a fresh `0xFB0D` in `rebel_reset_done`. On silicon the
+PCIE_CM7 subcontroller physically resets the CA73 cluster, firmware
+reboots from BL1, and `bootdone_task` re-emits `0xFB0D` naturally.
+REMU models neither CM7 nor the PMU reset sequence, so the CM7 stub
+in `r100_cm7.c` catches `INTGR0 bit 0` and synthesises
+`PF.ISSR[4] = R100_FW_BOOT_DONE`, then emits the NPU→host issr frame
+so the BAR4 shadow converges. **The synthesis is gated on
+`r100_mailbox_fw_boot_done_seen(pf_mailbox)`** — a one-shot latch
+flipped only when q-sys's own `bootdone_task` writes `0xFB0D` from
+the NPU-MMIO source. Pre-cold-boot SOFT_RESETs are dropped (logged at
+LOG_TRACE) so the kmd parks on its own `FW_BOOT_DONE` poll until
+q-sys publishes naturally over the existing `issr` chardev.
+Post-cold-boot SOFT_RESETs find the latch already set and synthesise
+as before. The CM7 stub retires when REMU grows a real CA73
+soft-reset model (`docs/roadmap.md` → P8).
 
 Verification on a settled `./remucli run --host`:
 
@@ -332,20 +309,15 @@ If `rebel_soft_reset + 0` appears but `FW_BOOT_DONE` doesn't: walk
 host BAR4 `xp /1wx 0xfe000090` (shadow). Empty `qemu.stderr.log`
 means the run-directory redirect failed.
 
-The CM7 stub retires when REMU grows a real CA73 soft-reset model
-(`docs/roadmap.md` → P8).
-
-### x86 Linux guest boot (M8b Stage 2, commit `1ef7208`)
+## x86 Linux guest boot
 
 Without `images/x86_guest/{bzImage,initramfs.cpio.gz}`, the x86 side
 idles at SeaBIOS. When staged, `./remucli run --host` auto-wires:
 
 - `-kernel <bzImage> -initrd <initramfs> -append "console=ttyS0 rdinit=/init earlyprintk=serial"`
 - `-fsdev local,id=remu,path=guest/,security_model=none -device virtio-9p-pci,fsdev=remu,mount_tag=remu`
-- `-cpu qemu64 → -cpu max` (stock kmd is `-march=native` with BMI2
-  instructions that trap `#UD` on `qemu64`; commit `985fd58` also
-  patches the GIC CPU-interface `bpr > 0` assertion that bit once `-cpu max`
-  was enabled).
+- `-cpu max` (stock kmd is `-march=native` with BMI2 instructions
+  that trap `#UD` on `qemu64`).
 
 Stage artifacts:
 
@@ -364,7 +336,7 @@ tests still work).
 CLI overrides on `./remucli run`: `--guest-kernel`, `--guest-initrd`,
 `--guest-share`, `--no-guest-boot`, `--guest-cmdline-extra`.
 
-Healthy `output/<name>/host/serial.log` on Stage 3a:
+Healthy `output/<name>/host/serial.log`:
 
 ```
 Linux version 6.8.0-107-generic … boot banner
@@ -382,246 +354,14 @@ rebellions rbln0: [rbln-rbl] FW_BOOT_DONE
 
 No `FW_BOOT_DONE` → see CM7-stub shadow-check recipe above.
 
-### Stage 3b — QINIT CM7 stub (retired in P7)
+## BD lifecycle on `--host` — verifying the loop
 
-> **Status:** P1c gated this stub off by default; **P7 deleted it
-> outright** along with `r100_cm7_qinit_stub`, `REMU_FW_VERSION_STR`,
-> and the `qinit-stub` bool property. q-cp on CP0 publishes the real
-> `fw_version` + `init_done = 1` natively through the P1a outbound
-> iATU + P1b cfg-mirror trap. The historical scaffolding lives in
-> `git log src/machine/r100_cm7.c` if a stub-style reproducer is
-> needed for bisecting.
-
-P10-fix moved cfg-head propagation off the `cfg` chardev onto a
-shared `cfg-shadow` `memory-backend-file` aliased on both sides
-(host x86 BAR2 cfg-head subregion ↔ NPU r100-cm7 cfg-mirror trap).
-The `cfg` / `cfg-debug` chardevs are gone. The bidirectional `hdma`
-chardev stays:
-
-| chardev | dir | frame | role |
-|---------|-----|-------|------|
-| `hdma` | NPU↔host | 24 B header + payload | Bidirectional DMA. NPU→host: `OP_WRITE` (P5 HDMA LL host-leg writes), `OP_READ_REQ` (P5 HDMA LL host-leg reads, tagged by `req_id`). Host→NPU: `OP_READ_RESP` (paired response to a pending `OP_READ_REQ`). The historical `OP_CFG_WRITE` (NPU→host cfg shadow update; r100-cm7 P1b reverse path) was retired with the shm-backed cfg-shadow and the opcode stays unallocated. The P1a outbound iATU formerly issued `OP_READ_REQ`/`OP_WRITE` in the `0xC0..0xFF` `req_id` partition; P10-fix retired that path in favour of a direct `host-ram` `MemoryRegion` alias, so the partition is reserved. See `src/bridge/remu_hdma_proto.h`. |
-
-`fw_version` round-trip — observe q-cp's real publish on a stock
-`./remucli run --host`:
-
-```
-$ rg 'fw version' output/<name>/host/serial.log
-rebellions rbln0: rbln_async_probe_worker: fw version: 3.2.0~dev~7~g47f862cb
-```
-
-If you see `3.remu-stub` instead, you are on a pre-P7 build (or
-re-enabling the deleted stub by hand) — the string lived in
-`REMU_FW_VERSION_STR` in `r100_cm7.c`, deleted by P7.
-
-### Stage 3c — BD-done state machine (retired in P7)
-
-> **Status:** P1c retired this scaffolding by default; **P7 deleted
-> it outright** along with the `R100Cm7BdJob` per-queue state
-> machine, the `r100_hdma_set_cm7_callback` plumbing, the
-> `0x01..0x0F` cm7 `req_id` partition (now reserved up to `0x7F`
-> for future UMQ multi-queue), the `imsix` / `mbtq-mailbox` QOM
-> links on `r100-cm7`, the `bd-done-stub` / `mbtq-stub` /
-> `qinit-stub` bool properties, and the `cm7-debug` chardev that
-> produced `cm7.log`. q-cp on CP0 owns the entire BD walk natively
-> (`hq_task → cb_task → cb_complete`) over the P1a outbound iATU
-> + the P1b cfg-mirror trap; MSI-X comes from q-cp's
-> `pcie_msix_trigger` (q-sys `osl/FreeRTOS/.../msix.c`) writing
-> the `r100-imsix` MMIO. See "P1b/P1c" below for the current flow.
-> The historical FSM phase ASCII (`bd-done qid=N WAIT_QDESC →
-> WAIT_BD → WAIT_PKT → IDLE complete`) and the matching `hdma.log`
-> `req_id=qid+1` slice it produced live in `git log
-> src/machine/r100_cm7.c` (last in `198d8a2`) if a stub-style
-> reproducer is needed.
-
-#### Sanity-checking the bridges
-
-The host-side `info qtree` must show the `hdma` CharBackend bound on
-`r100-npu-pci`. The NPU-side must show a separate `r100-hdma` device
-with its own `chardev = "hdma"` property (M9-1c moved the chardev
-off cm7 onto the new device, which models q-cp's dw_hdma_v0 register
-block — see `docs/roadmap.md` → M9-1c). `./remucli run --host`
-auto-verifies both ends and logs snippets to
-`host/info-qtree-cfg-hdma.log` and `npu/info-qtree-cfg-hdma.log`.
-The pre-P10-fix `cfg` / `cfg-debug` chardev props on `r100-cm7` and
-`r100-npu-pci` are gone; cfg-head propagation is verified separately
-by checking that both QEMUs `mmap` the shared
-`/dev/shm/remu-<name>/cfg-shadow` file (visible in `info mtree` as
-the `r100.bar2.cfg.alias` and `r100.cm7.cfg-mirror.alias`
-subregions). A missing `hdma` property means the
-`-machine r100-soc,hdma=…` or `-device r100-npu-pci,hdma=…` option
-didn't latch — check `cli/remu_cli.py` chardev id literals.
-
-#### M9-1c — active DNC + HDMA reg block
-
-> **Status post-P7:** the cm7-side mbtq push (`r100_cm7_mbtq_push` +
-> `r100_cm7_synth_cmd_descr` + the `R100_CMD_DESCR_SYNTH_BASE`
-> ring) was retired in P7 along with the BD-done FSM. Every
-> queue-doorbell on `INTGR1` bit `qid` now relays as a single SPI
-> 185 wake to q-cp's `hq_task` on CP0; q-cp's `cb_task` builds the
-> real `cmd_descr` from CB content, and `mtq_push_task` publishes
-> it onto the matching `r100-mailbox` block (P3: COMPUTE / UDMA /
-> UDMA_LP / UDMA_ST on chiplet 0) by indexing
-> `_inst[HW_SPEC_DNC_QUEUE_NUM=4]`. The
-> `r100-dnc-cluster` kickoff → done passage → DNC SPI path
-> (described below) stays default-on; q-cp's `dnc_send_task` is the
-> producer either way.
-
-The active path on `INTGR1` bit `qid`: q-cp's CP1 worker calls
-`dnc_send_task` after popping a real `cmd_descr` from the mailbox;
-the writes land on `r100-dnc-cluster`, the final 4-byte store to
-slot+0x81C with `itdone=1` triggers a BH that synthesises a
-`dnc_reg_done_passage` at slot+0xA00 and pulses the matching DNC GIC
-SPI from `r100_dnc_intid()`.
-
-Log signatures (NPU side, with dnc-debug active):
-
-| Trace line | Means |
-|---|---|
-| `r100-dnc cl=C dcl=D slot=S kickoff dnc_id=N cmd_type=T desc_id=0x... → intid=I spi=I-32 fired=...` | q-cp reached `dnc_send_task` and wrote DESC_CFG1 with itdone=1; r100-dnc latched the done passage and pulsed the DNC SPI. |
-| `r100-dnc cl=C dcl=D slot=S: completion FIFO full` | Pending completions exceeded `DNC_DONE_FIFO_DEPTH=32`. Almost certainly indicates an IRQ-storm bug (e.g. spurious tlb_invalidate-shaped writes). |
-
-Common failure: the kickoff trace never fires even though the
-mailbox shows `MBTQ_PI_IDX` advancing. That means q-cp's CP1 worker
-isn't reaching `dnc_send_task` for the pushed task. First check
-via CP1 GDB (`tests/scripts/gdb_inspect_cp1.gdb`): is the worker
-thread on a DNC range that includes DNC0? Pre-P7 the cm7-side
-synth at `0x20000000` was a fixed address you could `xp` to verify
-the cmd_descr layout — post-P7 the address is q-cp-allocated, so
-you have to chase it through the `mtq_push_task` payload at
-`PERI0_MAILBOX_M9_CPU1` ISSR slots (or break on `dnc_send_task`
-in the CP1 GDB session).
-
-#### P1a / P10-fix — chiplet-0 PCIe outbound iATU stub
-
-Real silicon translates AArch64 loads in the
-`R100_PCIE_AXI_SLV_BASE_ADDR = 0x8000000000ULL` range into PCIe TLPs
-via the chiplet-0 DesignWare iATU; the kmd publishes bus addresses
-with `HOST_PHYS_BASE = 0x8000000000ULL` already added so q-cp on
-CA73 CP0 can dereference them directly. REMU has no DW iATU. P1a
-introduced `r100-pcie-outbound`; P10-fix replaced its chardev RPC
-with a direct shared-memory alias after the chardev path deadlocked
-under the kmd's busy-poll (the chardev RX iothread couldn't acquire
-BQL while a vCPU was parked in `readl_poll_timeout_atomic`):
-
-- **`r100-pcie-outbound`** (`src/machine/r100_pcie_outbound.c`,
-  4 GB MMIO @ 0x8000000000, chiplet 0 PF only) — realised as a
-  `MemoryRegion` alias over the shared `host-ram`
-  `memory-backend-file` (the host x86 QEMU's main RAM). Both QEMUs
-  `mmap` the same file, so q-cp's outbound loads/stores are plain
-  TCG accesses against the same pages the kmd allocates with
-  `dma_alloc_coherent`. No chardev hop, no `qemu_cond_wait_bql()`,
-  no BQL contention. The pre-P10-fix chardev path
-  (`OP_READ_REQ` / `OP_WRITE` in req_id partition `0xC0..0xFF`,
-  parked vCPU on a per-device condvar via
-  `r100_hdma_set_outbound_callback()`) is gone.
-- **BAR2 cfg-head ↔ NPU MMIO alias** in `r100-cm7` (P1a → P1b →
-  P10-fix). Both QEMUs alias a shared 4 KB `cfg-shadow`
-  `memory-backend-file`: the host x86 QEMU's `r100-npu-pci` over the
-  BAR2 cfg-head subregion at `FW_LOGBUF_SIZE`, the NPU `r100-cm7`
-  over `R100_DEVICE_COMM_SPACE_BASE = 0x10200000` (prio 10 over
-  chiplet-0 DRAM). q-cp's `hil_init_descs` reads `DDH_BASE_LO/HI/SIZE`
-  from the alias, which returns the kmd's writes directly. q-sys
-  CP0's cold-boot `memset(DEVICE_COMMUNICATION_SPACE_BASE, 0,
-  CP1_LOGBUF_MAGIC)` flows through unmodified (the alias is plain
-  TCG RAM, any access width / alignment works). The pre-P10-fix
-  `cfg`/`cfg-debug` chardev path + NPU-side `cfg_shadow[1024]` u32
-  array + host-side `cfg_mmio_regs[]` + `OP_CFG_WRITE` reverse-emit
-  are gone.
-
-`req_id` partitions on the `hdma` wire (canonical in
-`src/include/r100/remu_addrmap.h`):
-
-| Range | Owner |
-|-------|-------|
-| `0x00..0x7F` | reserved (legacy cm7 BD-done partition lived at `0x01..0x0F` until P7 retired the FSM; the P1b cfg-mirror reverse-emit at `0x00` was retired with the shm-backed cfg-shadow alias; available for UMQ multi-queue) |
-| `0x80..0xBF` | `r100-hdma` MMIO-driven channel ops (M9-1c) |
-| `0xC0..0xFF` | reserved (formerly `r100-pcie-outbound` synchronous PF-window reads; the device now aliases shared host-ram instead) |
-
-Verifying P1a on a `--host` run (output paths under `output/<name>/`):
-
-```
-$ grep "Device descriptor\|Queue descriptor\|Context descriptor" \
-       output/<name>/hils.log
-[HILS … cpu=0 INFO  func=0] Device descriptor addr 0x8002d00000, size 286720
-[HILS … cpu=0 INFO  func=0] Queue descriptor  addr 0x8002d000ec, size 32
-[HILS … cpu=0 INFO  func=0] Context descriptor addr 0x8002d0012c, size 1112
-
-$ grep "outbound" output/<name>/hdma.log
-hdma cl=0 tx op=READ_REQ  req_id=0xc0 dst=0x2d0000c len=… tag=outbound-rd …
-hdma cl=0 rx op=READ_RESP req_id=0xc0 dst=0x2d0000c len=… tag=resp …
-
-$ python3 - <<'EOF' && echo OK
-import socket
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.connect("output/<name>/npu/monitor.sock")
-s.sendall(b"xp /4wx 0x102000c0\n")
-print(s.recv(4096).decode())
-EOF
-# 0x102000c0: 0x02d00000 0x00000080 0x00046000 0x00000000
-#   ^ DDH_BASE_LO (= kmd's coherent DMA addr, no HOST_PHYS_BASE)
-#                ^ DDH_BASE_HI = 0x80 (HOST_PHYS_BASE >> 32)
-#                              ^ DDH_SIZE = 0x46000
-```
-
-Failure modes:
-
-- NPU monitor `xp /4wx 0x102000c0` reads zero while the kmd
-  `dmesg` shows the DDH publish — both QEMUs aren't `mmap`ing the
-  same `cfg-shadow` file. Check that
-  `/proc/<host-pid>/maps` and `/proc/<npu-pid>/maps` both contain
-  `/dev/shm/remu-<name>/cfg-shadow`, and that
-  `info mtree -f` on each shows the `r100.bar2.cfg.alias` /
-  `r100.cm7.cfg-mirror.alias` subregion at the right base. The
-  `host-ram` / `cfg-shadow` aliases require the
-  `-object memory-backend-file,...,share=on` objects to land on
-  both QEMU command lines (see `cli/remu_cli.py`).
-- q-cp logs `Device descriptor addr 0, size 0` even though the kmd
-  dmesg shows `rbln_alloc_dma_buffer ok` — pre-P10-fix the cfg
-  chardev RX could lag behind the doorbell, leaving DDH unset
-  when q-cp's `hq_task` ran. P10-fix removes the race by sharing
-  the cfg-head backend; if you still see it, double-check the
-  `cfg-shadow` mmap on both sides. Pre-P1b dcache-alias variants
-  of the same symptom are obsolete (the alias is plain TCG RAM,
-  no MMIO uncacheable bit needed).
-- `hdma … status=dma-fail` on a `OP_READ_REQ` from
-  `r100-hdma`'s 0x80..0xBF channel partition — host's
-  `pci_dma_read` returned non-`MEMTX_OK` for a bus address q-cp's
-  HDMA-LL chain dereferenced. Usual cause: kmd has already freed /
-  unmapped the DMA buffer, or the bus address is outside the kmd's
-  allocation.
-
-#### P1b/P1c — honest BD lifecycle on q-cp/CP0
-
-P1a wired q-cp's outbound iATU and gave q-cp's `hil_init_descs` a
-working DDH publish path. P1b and P1c finish the loop:
-
-- **P1b** (NPU→host cfg reverse mirror) — closed the cfg loop both
-  ways through the cfg-mirror trap. **P10-fix subsumed it**: the
-  host x86 and NPU QEMUs alias the same `cfg-shadow`
-  `memory-backend-file` over their BAR2 cfg-head and cfg-mirror
-  MMIO traps, so q-cp's `cb_complete → writel(FUNC_SCRATCH, magic)`
-  lands directly in the shared backend and is observable on the
-  kmd's next `rebel_cfg_read(FUNC_SCRATCH)` for `rbln_queue_test`
-  with no chardev queue and no ordering race against the doorbell.
-  The pre-P10-fix `OP_CFG_WRITE` reverse-emit on the `hdma` chardev
-  + host-side `cfg_mmio_regs[]` array are gone.
-- **P1c** (gate `r100-cm7` BD-done + mbtq + QINIT stubs default off)
-  + **P7** (delete them outright) — q-cp on CP0 owns the BD walk
-  (`hq_task → cb_task → cb_complete`), the cmd_descr push to the
-  M9 mailbox (`mtq_push_task`), and the MSI-X completion
-  (`pcie_msix_trigger`). The legacy QEMU-side scaffolding (the
-  Stage 3c BD-done FSM, the M9-1b mbtq push + cmd_descr synth ring,
-  and the Stage 3b QINIT `fw_version` + `init_done` write-back) was
-  removed in P7 along with the three `bd-done-stub` / `mbtq-stub` /
-  `qinit-stub` boolean properties, the `imsix` + `mbtq-mailbox` QOM
-  links, the `r100_hdma_set_cm7_callback` plumbing, and the
-  `cm7-debug` chardev. **No `-global r100-cm7.*-stub=on` knobs are
-  available post-P7** — bisect q-cp regressions with GDB on q-cp
-  itself, or cherry-pick the historical scaffolding from
-  `git log src/machine/r100_cm7.c` (last in `198d8a2`).
-
-Verifying the loop on a `--host` run:
+q-cp on CP0 owns the entire BD walk: `hq_task` reads the BD via the
+chiplet-0 PCIe outbound iATU window (host-ram alias);
+`cb_task → cb_parse_*` walks the CB packet stream; engine HAL drivers
+program `r100-rbdma` / `r100-hdma` MMIO; `cb_complete` writes
+`FUNC_SCRATCH` through the cfg-mirror alias and calls
+`pcie_msix_trigger` for MSI-X.
 
 ```
 $ tail output/<name>/host/serial.log
@@ -646,6 +386,28 @@ EOF
 #                              alias, kmd reads it via rebel_cfg_read)
 ```
 
+Verifying the chiplet-0 outbound iATU stub (P1a):
+
+```
+$ grep "Device descriptor\|Queue descriptor\|Context descriptor" \
+       output/<name>/hils.log
+[HILS … cpu=0 INFO  func=0] Device descriptor addr 0x8002d00000, size 286720
+[HILS … cpu=0 INFO  func=0] Queue descriptor  addr 0x8002d000ec, size 32
+[HILS … cpu=0 INFO  func=0] Context descriptor addr 0x8002d0012c, size 1112
+
+$ python3 - <<'EOF' && echo OK
+import socket
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect("output/<name>/npu/monitor.sock")
+s.sendall(b"xp /4wx 0x102000c0\n")
+print(s.recv(4096).decode())
+EOF
+# 0x102000c0: 0x02d00000 0x00000080 0x00046000 0x00000000
+#   ^ DDH_BASE_LO (= kmd's coherent DMA addr, no HOST_PHYS_BASE)
+#                ^ DDH_BASE_HI = 0x80 (HOST_PHYS_BASE >> 32)
+#                              ^ DDH_SIZE = 0x46000
+```
+
 Failure modes:
 
 - `rbln_queue_test: command-queue-0 has not same value, 0 != cafedead`
@@ -653,21 +415,38 @@ Failure modes:
   doesn't see it. Check that both QEMUs `mmap` the
   `/dev/shm/remu-<name>/cfg-shadow` file (`info mtree -f` on each
   must show the `r100.bar2.cfg.alias` / `r100.cm7.cfg-mirror.alias`
-  subregion). If they do but the magic still isn't visible, check
-  the host monitor `xp /1wx 0xf000200ffc` directly — if it shows
-  `0xcafedead` but the kmd doesn't, the kmd's `rebel_cfg_read`
-  path itself is broken.
-- Soft lockup in `rebel_hw_init` waiting on `init_done` — pre-P10-fix
-  the cfg chardev RX could lag behind the doorbell, leaving DDH
-  unread when q-cp's `hq_task` ran. P10-fix removes this race
-  (cfg-head propagates through the shared `cfg-shadow` alias; the
-  alias is plain TCG RAM, any access width / alignment works for
-  q-sys's cold-boot `memset`).
-- `[cb] Current packet(0x1) is not supported` in `hils.log` —
-  pre-P7 symptom where `r100-cm7`'s legacy BD-done state machine
-  completed the BD before q-cp could parse it. Post-P7 the FSM is
-  deleted; if you still see this on a current build, the only way
-  to reproduce it is to cherry-pick the historical FSM back in.
+  subregion).
+- `Device descriptor addr 0, size 0` on q-cp's hils log even though
+  the kmd dmesg shows `rbln_alloc_dma_buffer ok` — both QEMUs aren't
+  `mmap`ing the same `cfg-shadow` file. Check
+  `/proc/<host-pid>/maps` and `/proc/<npu-pid>/maps`.
+- `hdma … status=dma-fail` on a `OP_READ_REQ` from `r100-hdma`'s
+  `0x80..0xBF` channel partition — host's `pci_dma_read` returned
+  non-`MEMTX_OK` for a bus address q-cp's HDMA-LL chain
+  dereferenced. Usual cause: kmd has already freed / unmapped the
+  DMA buffer.
+
+## DNC kickoff trace
+
+Active path on `INTGR1` bit `qid`: q-cp's CP1 worker calls
+`dnc_send_task` after popping a real `cmd_descr` from the mailbox;
+the writes land on `r100-dnc-cluster`, the final 4-byte store to
+slot+0x81C with `itdone=1` triggers a BH that synthesises a
+`dnc_reg_done_passage` at slot+0xA00 and pulses the matching DNC GIC
+SPI from `r100_dnc_intid()`.
+
+Log signatures (NPU side):
+
+| Trace line | Means |
+|---|---|
+| `r100-dnc cl=C dcl=D slot=S kickoff dnc_id=N cmd_type=T desc_id=0x... → intid=I spi=I-32 fired=...` | q-cp reached `dnc_send_task` and wrote DESC_CFG1 with itdone=1; r100-dnc latched the done passage and pulsed the DNC SPI. |
+| `r100-dnc cl=C dcl=D slot=S: completion FIFO full` | Pending completions exceeded `DNC_DONE_FIFO_DEPTH=32`. Almost certainly indicates an IRQ-storm bug. |
+
+Common failure: the kickoff trace never fires even though the mailbox
+shows `MBTQ_PI_IDX` advancing. That means q-cp's CP1 worker isn't
+reaching `dnc_send_task` for the pushed task. Check via CP1 GDB
+(`tests/scripts/gdb_inspect_cp1.gdb`): is the worker thread on a DNC
+range that includes DNC0?
 
 ## Interpreting a boot log
 
@@ -698,202 +477,60 @@ markers in order — missing marker pinpoints the stall:
 | BL31 secondary crashes into `plat_panic_handler` before banner | MPIDR encoding mismatch, or GIC read hitting `cfg_mr` catch-all | `r100_soc.c:r100_build_chiplet_view` + MPIDR layout |
 | BL2 ERETs to zero page on a secondary | `bl31_cp0.bin` / `freertos_cp0.bin` not at `chiplet_id * CHIPLET_OFFSET + {0x0, 0x200000}` | `cli/remu_cli.py:FW_PER_CHIPLET_IMAGES` |
 | HBM poll never clears | New "done" bit not whitelisted | `r100_hbm.c` PHY region defaults |
-| FreeRTOS banner prints then hangs; a CPU sits in `vApplicationPassiveIdleHook` | gtimer outputs not wired to GIC PPI inputs (CNTVIRQ never delivered, `vTaskDelay` never returns) | `r100_soc.c` — the `qdev_connect_gpio_out(cpudev, GTIMER_*, ... )` block per CPU with `intidbase = (num_irq - GIC_INTERNAL) + local*32` (commit `680f964`) |
-| `--host` hangs after `Start FreeRTOS scheduler` but `--host --no-guest-boot` finishes; host sees fake-looking `FW_BOOT_DONE` (via CM7 stub) while NPU uart0 is silent | SPI INTID mis-wiring — `qdev_get_gpio_in(gic, N)` raises INTID `N+32`, so passing the raw INTID (e.g. 185) collides with *another* INTID's handler and the level-triggered line re-fires forever. See "Post-mortems → PCIe mailbox INTID off-by-32" | `r100_soc.c` mailbox wiring + `remu_addrmap.h:R100_INTID_TO_GIC_SPI_GPIO` |
+| FreeRTOS banner prints then hangs; a CPU sits in `vApplicationPassiveIdleHook` | gtimer outputs not wired to GIC PPI inputs (CNTVIRQ never delivered, `vTaskDelay` never returns) | `r100_soc.c` — the `qdev_connect_gpio_out(cpudev, GTIMER_*, ... )` block per CPU |
+| `--host` hangs after `Start FreeRTOS scheduler`; host sees fake `FW_BOOT_DONE` (via CM7 stub) while NPU uart0 is silent | SPI INTID mis-wiring — `qdev_get_gpio_in(gic, N)` raises INTID `N+32`. Always pass `R100_INTID_TO_GIC_SPI_GPIO(INTID)`. | `r100_soc.c` mailbox wiring + `remu_addrmap.h:R100_INTID_TO_GIC_SPI_GPIO` |
 
 FW ground truth lives in `external/ssw-bundle/products/rebel/q/sys/bootloader/cp/tf-a/`
 — cross-reference via `CLAUDE.md` ("Key external files").
 
-## Post-mortems
-
-### PCIe mailbox INTID off-by-32 (IRQ storm on CA73 CPU 0)
-
-**Symptom.** In `--host` (dual-QEMU with Linux guest), the NPU
-uart0.log halts on the "`Start FreeRTOS scheduler`" line. The host
-driver still prints `[rbln-rbl] FW_BOOT_DONE` in dmesg (because the
-CM7 stub forges it), and a casual observer concludes the system is
-working. Running `--host --no-guest-boot` makes the NPU finish boot
-cleanly and emit `Notify Host - PF FW_BOOT_DONE` — proving the
-freeze is triggered by guest doorbell traffic, not by firmware alone.
-
-**Diagnostic recipe.** While the `--host` run is stuck, live-sample
-NPU CPU 0 via HMP over the unix socket:
-
-```
-python3 <<'EOF' | head -60
-import socket, time
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.connect("output/<name>/npu/monitor.sock")
-s.settimeout(2.0)
-time.sleep(0.1)
-try: s.recv(65536)
-except: pass
-s.sendall(b"info registers\n")
-time.sleep(0.5)
-print(s.recv(65536).decode(errors='ignore'))
-EOF
-```
-
-Fingerprint of the storm:
-- `PC` lives inside `FreeRTOS_IRQ_Handler` (resolve via
-  `nm -n external/ssw-bundle/products/rebel/q/sys/binaries/FreeRTOS_CP/freertos_kernel.elf`).
-- `PSTATE` has `DAIF = 1111` (all interrupts masked — `EL1h`,
-  `-ZC-` or similar flag chars).
-- `x0` consistently equals **`0xd9`** across samples. `0xd9 = 217` —
-  the INTID being acknowledged in the ICC EOI register.
-- Multiple samples 500ms apart show the same PC: CPU 0 is not
-  advancing.
-
-**Root cause.** QEMU's `arm_gicv3` exposes incoming SPI lines as
-`gpio_in[0..num_spi-1]`; `gpio_in[N]` raises INTID `N +
-GIC_INTERNAL`, with `GIC_INTERNAL = 32`. So
-`qdev_get_gpio_in(gic, 185)` raises INTID **217**, not 185. FW's
-`mailbox_data[]` (`drivers/mailbox/mailbox.c`) registers the VF0
-mailbox handler for INTID 185 — *and* registers a **different**
-mailbox's handler (`IDX_MAILBOX_PERI0_M7_CPU0`) for INTID 217.
-
-When the host rings any VF0 doorbell the sequence is:
-
-1. `r100-mailbox` asserts VF0 group-1 IRQ line high.
-2. QEMU raises INTID 217 (the off-by-32 result).
-3. CA73 enters `FreeRTOS_IRQ_Handler` → `ipm_samsung_isr`.
-4. ISR looks up INTID 217 in `mailbox_data[]`, finds the PERI0-M7
-   entry, reads PERI0-M7's `INTSR` (= 0, because PERI0-M7 isn't
-   the caller), clears nothing, returns.
-5. VF0's group-1 pending bit is still set → line still high → GIC
-   immediately re-raises INTID 217. Goto step 3.
-
-CPU 0 is trapped with all IRQs masked. Every task pinned to CPU 0
-(`abort_task`, `bootdone_task`, per-CPU idle) starves. The FreeRTOS
-scheduler on CPU 0 never runs again. `bootdone_notify_to_host`
-never fires. The `issr.log` stays empty. The CM7 stub fills the gap
-from the driver's perspective and the freeze is silent.
-
-**Fix.** `src/include/r100/remu_addrmap.h` exposes the GIC
-convention via `R100_INTID_TO_GIC_SPI_GPIO(intid)` and names the
-constants for what they are (`_INTID`, not `_SPI`). `r100_soc.c`
-wires the VF0 mailbox through that macro. Rule for future
-device-to-GIC wiring in this repo: **always pass
-`R100_INTID_TO_GIC_SPI_GPIO(INTID)` to `qdev_get_gpio_in(gic, …)`,
-never a raw INTID**.
-
-**Latent cousins.** The per-chiplet 16550 UART is wired as
-`qdev_get_gpio_in(gic_dev[chiplet], 33)` (i.e. raw index 33 → INTID
-65). q-sys' `console_uart_init()` doesn't register an RX ISR and TX
-is polled, so this INTID is dead code today — but if anyone adds an
-IRQ-driven RX path to `terminal_task`, the same conversion must be
-applied or the PERI0_M7-style collision repeats. Callout comment
-lives adjacent to the UART block in `r100_soc.c`.
-
-**Verification after the fix:**
-
-```
-./remucli build
-./remucli run --host --name gic-fix-smoke
-# Wait ~45 s then:
-rg 'Notify Host - PF FW_BOOT_DONE' output/gic-fix-smoke/uart0.log
-#   → Notify Host - PF FW_BOOT_DONE
-grep '0x90.*0xfb0d' output/gic-fix-smoke/issr.log
-#   → issr off=0x90 val=0xfb0d status=ok count=1
-```
-
-`issr.log count=1` is the crisp witness: pre-fix that file is empty
-in `--host` mode; post-fix the real firmware emits one frame, then
-the CM7 stub covers any subsequent soft-reset re-handshakes.
-
-### P10 cb[1] non-completion (open)
+## Open issue: P10 — kmd `register_p2pdma` OOM panic
 
 **Status.** Open. `./remucli test p10` times out at 180 s on every
-run. The diagnosis below was assembled from `tests/p10_qcp_gdb_probe.py`
-captures + log forensics; it is recorded here so the next person
-picking up P10 starts from a known map of the failure modes rather
-than from `LOG_LEVEL` archaeology.
+run. Excluded from `./remucli test` defaults via `in_default=False`
+in `TEST_REGISTRY`. The earlier "cb[1] non-completion" failure mode
+was unblocked by P11 (SMMU stage-2 walker) and is no longer the
+bottleneck.
 
 **Symptom.** `command_submission -y 5` (the umd integration test
-staged into the guest by `guest/build-umd.sh`) submits two command
-buffers (`cb[0]`, `cb[1]`) and waits for two MSI-X completions on
-vector 0. Only one fires. The kmd's TDR (`RBLN_REBEL_TASK_DONE_US`
-expansion bug aside, see "Side bug 3" below) eventually times out,
-sends `URG_EVENT_UNLOAD`, and the host kernel logs:
+staged into the guest by `guest/build-umd.sh`) is supposed to submit
+two command buffers and wait for two MSI-X completions. With P11 in
+place, the SMMU LL chain that previously stalled cb[1] now walks
+correctly — but the test still times out earlier in the kmd path.
+`rebel_hw_init` expires its watchdog on the soft-reset under TCG,
+which cascades into a host kernel OOM during `rbln_register_p2pdma`:
 
 ```
 watchdog: BUG: soft lockup - CPU#0 stuck for ...s! [insmod or command_submission]
 RIP: ... rebel_hw_init+0x439 (= rebel_queue_init busy-poll)
+…
+Out of memory: Killed process … (rbln_register_p2pdma)
 ```
 
-**Pinning the hang.** `tests/p10_qcp_gdb_probe.py` snapshots q-cp
-state ~1.5 s after the second CQ doorbell, before TDR fires:
+`output/<name>/npu/qemu.stderr.log` shows **no** `TRANSLATE FAULT`
+lines, confirming the SMMU is no longer the bottleneck. cb[0] /
+cb[1] never run, so `host/msix.log` and `hdma.log` stay empty for
+the whole test budget.
 
-```
-hq_mgr.cb_run_cnt   = 1                # cb_task pulled cb[1] off, never decremented
-hq_mgr.cq[0].pi     = 2
-hq_mgr.cq[0].ci     = 2                # hq_task fully drained both BDs
-hq_mgr.req_funcs    = 0
-cb_mgr.ready_list  empty (next == &ready_list)
-cb_mgr.wait_list   empty (next == &wait_list)
-```
-
-`cb_run_cnt = 1` plus both lists empty means: `cb_task` started
-processing cb[1], dispatched its packets to RBDMA / HDMA, and
-parked on `xTaskNotifyWait` for the engine done IRQ. That IRQ
-never fires. `host/msix.log` reads `count=1` for the entire run.
-
-cb[0]'s completion goes through cleanly (one MSI-X observed, host
-sees `RBLN_MAGIC_CODE` in `FUNC_SCRATCH`). cb[1] picks up state
-that cb[0] did not fully restore — *which* engine's done line
-never fires is the live unknown. `output/<name>/hdma.log` is
-empty across the whole run, which suggests both CB workloads use
-NPU-local addresses (RBDMA OTO between two chiplet-0 DRAM
-offsets) and never cross the chardev — i.e. the missing IRQ is
-likely RBDMA's GIC SPI 978 (`INT_ID_RBDMA1`) on the second kick,
-not an HDMA wire ordering issue. Confirmation requires GDB on
-`r100_rbdma_kickoff` / `r100_rbdma_fnsh_bh` between cb[0] and
-cb[1] — open work.
-
-**Diagnostic recipe.**
+Diagnostic recipe:
 
 ```
 ./remucli fw-build                          # ELFs needed by the gdb probe
-REMU_P10_DEBUG_TAG=cb1 \
-REMU_P10_DEBUG_DELAY_S=1.5 \
-python3 tests/p10_qcp_gdb_probe.py
-ls -la output/p10-debug/qcp-bt-cb1.txt      # the artifact
+./remucli test p10                          # reproduces the OOM
+less output/p10-umd/host/serial.log         # OOM stack trace
 ```
 
-The probe is a diagnostic, not a regression test — it always exits
-0 if it produced an artifact. Read the file to see the actual q-cp
-state. Two interesting settle points to compare are documented in
-the script header (~1.5 s = pre-TDR; ~8 s = mid `handle_unload_event`
-register dump cascade).
+Two diagnostic-only probes (no `TEST_REGISTRY` entry):
 
-**Side bug 1 — TDR `URG_EVENT_UNLOAD` register-dump cascade.**
-Once cb[1] hangs, the kmd's TDR fires and sends
-`URG_EVENT_UNLOAD` over the doorbell wire. q-cp's
-`hq_proc_urg_event` calls `handle_unload_event`, which in turn
-calls `DNC_DUMP_ESSENTIAL`, `RBDMA_DUMP_CDMA`, and
-`rbcm_dump_chiplet_incomplete_ttreg` — a ~700-line register dump
-peppered with `mdelay(500000)` busy-waits. Those `mdelay`s execute
-*synchronously inside the doorbell ISR on CP0.cpu0* under TCG and
-block the CA73 from servicing any other interrupt for many seconds.
-The host kernel's `watchdog` then prints `soft lockup` for
-`rebel_hw_init+0x439` (the `readl_poll_timeout_atomic` busy-poll).
-This is a downstream symptom of the cb[1] hang, **not** the root
-cause — fixing cb[1] removes it. Logged here so future hangs that
-look like a `rebel_hw_init` lockup are not mis-attributed to the
-queue_init handshake (which the P10-fix shm cfg-shadow alias
-already resolved; see commit `d986302`).
+- `tests/p10_qcp_gdb_probe.py` — boots `--host`, waits for the
+  expected CQ doorbell, spawns NPU gdbstub on demand, attaches
+  `aarch64-none-elf-gdb`, dumps `hq_mgr` / `cb_mgr` globals +
+  per-thread backtraces. Useful for any future cb-side regression.
+- `tests/p10_cfgshadow_probe.py` — boots, waits for the first
+  QUEUE_INIT doorbell, samples `cfg-shadow` from three vantage points
+  (direct shm read, NPU `xp`, host `xp`) to verify the alias is
+  working.
 
-**Side bug 2 — `cfg-shadow` NULL-deref (FIXED).** Was: ~30% of
-`--host` boots faulted inside q-cp's `hil_init_descs` at
-`hil.c:519` dereferencing `dev_desc[func_id]->qd_addr_lo` (offset
-`+0x0c` of NULL). The CM7-stub's unconditional `INTGR0 bit 0 →
-PF.ISSR[4]=0xFB0D` synthesis let kmd race ahead of q-sys's
-`main.c:250` DCS memset; see "Side bug 2 — `cfg-shadow`
-NULL-deref ~30% (FIXED)" further down for full root cause +
-fix. Recipe (`tests/p10_cfgshadow_probe.py`) is preserved as a
-plumbing sanity check.
-
-**Side bug 3 — KMD `readl_poll_timeout_atomic` argument unit
+**Side note — KMD `readl_poll_timeout_atomic` argument unit
 mismatch.** `rebel.c:700` calls
 `readl_poll_timeout_atomic(..., 10, jiffies_to_usecs(RBLN_REBEL_TASK_DONE_US))`
 where `RBLN_REBEL_TASK_DONE_US = 3 * 1000000` is **already in
@@ -901,165 +538,20 @@ microseconds** but the macro is being run through
 `jiffies_to_usecs()` again. With HZ=250 the inner conversion
 expands to ~12000 s, so the kmd's "3 s queue_init timeout" is
 actually a ~3-hour busy-loop on TCG. This is a stock-KMD bug,
-upstream — not REMU. It does not cause the cb[1] hang but does
-mean the soft lockup runs for the full 180 s test budget instead
-of the 6 s wall the kmd was meant to wait. Tracked here so future
-people picking up P10 don't try to "fix" the timeout from the REMU
-side.
+upstream — not REMU. Means the soft lockup runs for the full 180 s
+test budget instead of the 6 s wall the kmd was meant to wait.
+Tracked here so future people picking up P10 don't try to "fix" the
+timeout from the REMU side.
 
-**Where things stand.** queue_init handshake is fixed (P10-fix /
-`d986302`). cb[0] passes. cb[1] hangs in q-cp's `cb_task` waiting
-for an engine done IRQ — most likely RBDMA SPI 978 not firing on
-the second kick, given `hdma.log` stays empty. Next step is a
-gdb session on `r100-rbdma`'s kick → BH → fnsh_pulse path with
-breakpoints on `r100_rbdma_kickoff` (`src/machine/r100_rbdma.c`)
-straddling cb[0] and cb[1] to compare the FNSH FIFO depth + GIC
-pulse counts. Until cb[1] clears, P10 stays excluded from
-`./remucli test` defaults (`in_default=False` in `TEST_REGISTRY`).
-
-**2026-04-29 update — root causes pinned, two of three solved.**
-
-The "hdma.log stays empty" + "RBDMA SPI 978 not firing" diagnosis
-was wrong. Adding structural traces to the HDMA LL walker
-(`r100_hdma_emit_trace` over the existing `hdma-debug` chardev,
-one line per doorbell / LL element / completion, always-on, no
-`--trace` overhead) showed the LL walker for cb[1] was kicking
-fine — but never completing — for two independent reasons,
-both in `src/machine/r100_hdma.c`:
-
-1. **HDMA init-time STOP-doorbell pollution (FIXED — see
-   "Side bug 4" below).** q-cp's `hdma_init_channels` posts
-   `R100_HDMA_DB_STOP_BIT` to all 32 channels at boot before any
-   are enabled. The model was treating each as a real abort,
-   poisoning `SUBCTRL_EDMA_INT_CA73` pending mask with all 32 bits
-   and `int_status` with `INT_ABORT`. When the real cb completion
-   fired later, q-cp's `hdma_forward_irq` picked the lowest
-   pending bit (always WR ch 0 from init pollution), looked up
-   `chan->cb_tcb` for it (NULL — that channel never ran), and the
-   real completion's `cb_pkt_done` never executed. Fix is a
-   one-line gate on `c->enable & R100_HDMA_ENABLE_BIT` in
-   `r100_hdma_doorbell`: real DW HDMA absorbs STOP-while-idle
-   silently. With the gate in place, `signal_completion` count
-   drops from 33 (32 spurious + 1 real) to 1 (real only),
-   `msix.log count=1` for cb[0], and the cb[0] path is correct.
-
-2. **HDMA LL walker silently aborts on IPA SAR/DAR (FIXED — P11
-   SMMU stage-2 walker).** With the STOP gate in place, the walker
-   reads its first LLI from `llp = 0x42b86740` (q-cp built the LL
-   chain in its FreeRTOS heap, which lives in the SMMU stage-2
-   SYSTEM IPA region at IPA `0x40000000+` per
-   `q/cp/.../runtime_pt.h` `ptw_s2t_pf`). On real silicon a
-   chiplet-local SMMU stage-2 walks IPA → PA before the AXI burst
-   hits DRAM:
-
-   ```
-   SYSTEM region        : IPA 0x40000000..0x80000000
-                          → PA  0x00000000..0x40000000   (1 GB)
-   CHIPLET0 USER region : IPA 0x140000000..0xA00000000
-                          → PA  0x40000000..0x900000000  (35 GB)
-   ```
-
-   Pre-P11, REMU's `r100_smmu.c` was a register-only stub (no STE
-   / CD / PT walk), so `address_space_read` at IPA `0x42b86740`
-   hit unassigned sysmem and `r100_hdma_walk_ll` returned `false`
-   silently — no `signal_completion`, no GIC pulse, `cb_task`
-   parked forever. Same hazard on the destination side for
-   `dar=0x140000000+`.
-
-   Earlier in the same session, a throwaway pair of
-   `memory_region_init_alias` overlays in `r100_chiplet_init`
-   (mirroring SYSTEM and CHIPLET0_USER IPA windows back onto the
-   chiplet's DRAM container) validated the diagnosis end-to-end
-   — cb[1]'s 3-element LL chain walked cleanly
-   (`output/p10-final-2/hdma.log`):
-
-   ```
-   hdma cl=0 ll_walk_read dir=rd ch=0 elem=1 cursor=0x42b86740 ...
-              sar=0x4e00000  dar=0x140000000  xsize=2097152
-   hdma cl=0 ll_walk_read dir=rd ch=0 elem=2 cursor=0x42b86758 ...
-              sar=0x45400000 dar=0x140200000 xsize=8192
-   hdma cl=0 ll_walk_read dir=rd ch=0 elem=3 cursor=0x42b86770 ...
-              sar=0x45600000 dar=0x140400000 xsize=4096
-   hdma cl=0 ll_walk_end dir=rd ch=0 elems=3 last_seen=1
-   hdma cl=0 signal_completion dir=rd ch=0 pending_mask=0x10000
-   ```
-
-   The aliases were the wrong answer — they would have collapsed
-   stage-1 and stage-2 to identity, hidden every page-table bug,
-   and structurally fought any future STE / CD / PT walker. They
-   were reverted before P11 landed. **P11 replaces the alias
-   shortcut with a real translate hook**: `r100-rbdma` and
-   `r100-hdma` now run NPU-side DVAs through
-   `r100_smmu_translate(SID=0, …)` against the in-DRAM stream
-   table + page tables FW publishes (q-sys's `smmu_s2_enable` →
-   `STE0.config=ALL_TRANS` with stage-2 fields filled). With
-   `CR0.SMMUEN=0` (early boot, single-QEMU runs) the translate is
-   identity, so existing tests keep working. See
-   `docs/roadmap.md` → P11 for the milestone breakdown.
-
-3. **Downstream: CDMA Auto Fetch error.** With the SMMU IPA
-   aliases temporarily in place during the diagnostic dig, cb[0]
-   completed cleanly but the test still failed downstream:
-   q-cp's `hils.log` dumped `[1ff37014e0] 0 0 0 0 0 0 0 0` ...
-   `CDMA Auto Fetch` register sweeps and the host kmd entered a
-   *second* `rebel_hw_init` path (workqueue
-   `rsd_device_reset_wq` → `rsd_sched_device_init`) stuck at
-   `+0x439` again. Tracking through the kmd-side OOM / p2pdma
-   path now is the live P10 work; SMMU is no longer the
-   blocker. Recorded here so future people picking up P10 know
-   the SMMU walker fix didn't fall straight through to a green
-   p10.
-
-**Side bug 4 — HDMA init-time STOP-doorbell pollution (FIXED in
-this session, on the same branch as the SMMU work even though
-it's structurally independent).** See item 1 above; fix is
-`r100_hdma_doorbell` gating the STOP path on
-`c->enable & R100_HDMA_ENABLE_BIT` and matches DW HDMA silicon
-semantics (STOP-while-idle is silently absorbed). Independent
-of the SMMU question and kept regardless.
-
-**Side bug 2 — `cfg-shadow` NULL-deref ~30% (FIXED).** Diagnosis
-preserved as historical context; the fix narrowed the
-`r100-cm7` SOFT_RESET stub. Root cause: q-sys CP0's cold-boot
-main routine (`q/sys/.../osl/FreeRTOS/Source/main.c:250`) does
-`memset((void *)(FREERTOS_VA_OFFSET + DEVICE_COMMUNICATION_SPACE_BASE), 0, CP1_LOGBUF_MAGIC)`
-followed by a tail memset clearing `0x1018..0xFE000`, gated only
-on `pmu_get_chiplet_reset_flag(CHIPLET_ID) & PMU_CL_RST_MASK ==
-PMU_COLD_RESET`. The first memset covers offset 0..0x1040 of the
-DCS, which **includes `DDH_BASE_LO` at offset `0xC0`**. The kmd's
-`rebel_hw_init(RBLN_RESET_FIRST)` flow rang `INTGR0 bit 0`
-SOFT_RESET, the CM7-stub *immediately* synthesised
-`PF.ISSR[4]=0xFB0D`, the kmd saw the synthetic FW_BOOT_DONE and
-proceeded to write `DDH_BASE_LO/HI/SIZE` into the shared
-`cfg-shadow` shm — and if q-sys hadn't yet reached its main.c:250
-memset (the kmd often won this race because its boot is much
-shorter than q-sys's BL1→BL2→BL31→FreeRTOS chain on TCG), q-sys
-later zeroed offsets 0..0x103F including `DDH_BASE_LO`, causing
-q-cp's `hil_init_descs` (`hil.c:519`) to NULL-deref. Both
-processes `mmap MAP_SHARED` the same shm file with no ordering
-guarantee on which one wins; the synthetic FW_BOOT_DONE was the
-ordering lie. (The original TCG-TLB theory was rejected: the
-cfg-mirror subregion is installed at machine-init before any
-vCPU runs, so TCG TLBs can't cache stale translations.)
-
-Fix: the CM7-stub's INTGR0-bit-0 synthesis is now gated on
-`r100_mailbox_fw_boot_done_seen(pf_mailbox)` — a one-shot latch
-on PF that flips the first time q-sys's `bootdone_task` writes
-`R100_FW_BOOT_DONE` into PF.ISSR[4] from the NPU-MMIO source.
-Pre-cold-boot SOFT_RESETs are dropped (logged at LOG_TRACE), so
-the kmd parks on its own `FW_BOOT_DONE` poll
-(`readx_poll_timeout` for `val != 0`) until q-sys publishes
-naturally over the existing `issr` chardev egress. q-sys's
-`bootdone_task` only runs after `cp_create_tasks()` returns
-inside `main()`, which sits below the memset on the source line
-ordering — therefore once kmd observes `0xFB0D`, the memset has
-provably already happened, and any subsequent kmd cfg writes
-land safely. Post-cold-boot SOFT_RESETs (driver re-bind /
-`rebel_hw_init` re-entry) find the latch already set and
-synthesise as before. Verification recipe stays the same:
-`tests/p10_cfgshadow_probe.py` was the diagnostic; pre-fix it
-hit the zero-clobber ~30% of runs, post-fix the three views
-agree on every iteration.
+**Side note — TDR `URG_EVENT_UNLOAD` register-dump cascade.** When
+the kmd's TDR fires, q-cp's `handle_unload_event` runs
+`DNC_DUMP_ESSENTIAL` + `RBDMA_DUMP_CDMA` +
+`rbcm_dump_chiplet_incomplete_ttreg` — a ~700-line register dump
+peppered with `mdelay(500000)` busy-waits that block the doorbell
+ISR on CP0.cpu0 for many seconds under TCG. The host kernel's
+`watchdog: BUG: soft lockup [insmod] rebel_hw_init+0x439` is a
+downstream symptom of any cb hang — fixing the underlying P10 path
+removes it.
 
 ## Cleanup
 
