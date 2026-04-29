@@ -32,14 +32,16 @@ End-to-end shape:
 
 Address-translation note: on real silicon SAR / DAR are device virtual
 addresses (DVAs) translated by the per-chiplet SMMU-600 (S1 + S2 page
-walks) before reaching DDR. REMU's `r100_smmu.c` is a register-only
-stub — STE / CD / page tables FW writes to DRAM are never walked — so
-every engine here behaves as if FW were running SMMU in pure-bypass /
-identity-mapped mode. That's why this test can write raw chiplet-local
-DRAM offsets (0x07000000 / 0x07800000) straight into the descriptor
-and have them land on the correct memory. See
-`docs/roadmap.md` → P4B and § Long-term follow-ons → "SMMU honour FW
-page tables" for the plug points if/when real SMMU translation lands.
+walks) before reaching DDR. P11 made `r100-rbdma` honour stage-2 via
+`r100_smmu_translate(SID=0, …)` before each `address_space_*` call,
+but this test deliberately operates in the **CR0.SMMUEN=0** regime:
+q-sys's `m7_smmu_enable` only fires from a kmd-driven
+`dram_init_done_cb` mailbox callback, which this gdbstub-driven
+harness never triggers. So the SMMU walker stays in pre-enable
+identity mode and raw chiplet-local DRAM offsets (0x07000000 /
+0x07800000) land on the correct memory unchanged. The companion
+`tests/p11_smmu_walk_test.py` is the focused stage-2-walk unit test
+that programs SMMU registers and stages page tables explicitly.
 
 The test exits 0 on PASS, 2 on byte mismatch, 1 on infrastructure
 failure. Tail of `output/p4b-rbdma.log` is dumped on early exit so a

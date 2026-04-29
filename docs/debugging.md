@@ -943,15 +943,14 @@ both in `src/machine/r100_hdma.c`:
    drops from 33 (32 spurious + 1 real) to 1 (real only),
    `msix.log count=1` for cb[0], and the cb[0] path is correct.
 
-2. **HDMA LL walker silently aborts on IPA SAR/DAR (NOT FIXED —
-   needs proper SMMU stage-2 modelling, see
-   `docs/roadmap.md` → "SMMU honour FW page tables" for the
-   plan).** With the STOP gate in place, the walker reads its
-   first LLI from `llp = 0x42b86740` (q-cp built the LL chain in
-   its FreeRTOS heap, which lives in the SMMU stage-2 SYSTEM IPA
-   region at IPA `0x40000000+` per `q/cp/.../runtime_pt.h`
-   `ptw_s2t_pf`). On real silicon a chiplet-local SMMU stage-2
-   walks IPA → PA before the AXI burst hits DRAM:
+2. **HDMA LL walker silently aborts on IPA SAR/DAR (FIXED — P11
+   SMMU stage-2 walker).** With the STOP gate in place, the walker
+   reads its first LLI from `llp = 0x42b86740` (q-cp built the LL
+   chain in its FreeRTOS heap, which lives in the SMMU stage-2
+   SYSTEM IPA region at IPA `0x40000000+` per
+   `q/cp/.../runtime_pt.h` `ptw_s2t_pf`). On real silicon a
+   chiplet-local SMMU stage-2 walks IPA → PA before the AXI burst
+   hits DRAM:
 
    ```
    SYSTEM region        : IPA 0x40000000..0x80000000
@@ -960,20 +959,19 @@ both in `src/machine/r100_hdma.c`:
                           → PA  0x40000000..0x900000000  (35 GB)
    ```
 
-   REMU's `r100_smmu.c` is a register-only stub (no STE / CD / PT
-   walk), so `address_space_read` at IPA `0x42b86740` hits
-   unassigned sysmem (chiplet-0 DRAM only covered 0..0x40000000
-   pre-`R100_DRAM_INIT_SIZE` bump) and `r100_hdma_walk_ll` returns
-   `false` silently — no `signal_completion`, no GIC pulse,
-   `cb_task` parked forever. Same hazard on the destination side
-   for `dar=0x140000000+` even after the SYSTEM alias is in place.
+   Pre-P11, REMU's `r100_smmu.c` was a register-only stub (no STE
+   / CD / PT walk), so `address_space_read` at IPA `0x42b86740`
+   hit unassigned sysmem and `r100_hdma_walk_ll` returned `false`
+   silently — no `signal_completion`, no GIC pulse, `cb_task`
+   parked forever. Same hazard on the destination side for
+   `dar=0x140000000+`.
 
-   This session validated the diagnosis end-to-end with a
-   throwaway pair of `memory_region_init_alias` overlays in
-   `r100_chiplet_init` that mirrored the SYSTEM and CHIPLET0_USER
-   IPA windows back onto the chiplet's DRAM container. With the
-   aliases + DRAM bumped to 2 GB, the cb[1] LL walk completes its
-   3-element chain (`output/p10-final-2/hdma.log`):
+   Earlier in the same session, a throwaway pair of
+   `memory_region_init_alias` overlays in `r100_chiplet_init`
+   (mirroring SYSTEM and CHIPLET0_USER IPA windows back onto the
+   chiplet's DRAM container) validated the diagnosis end-to-end
+   — cb[1]'s 3-element LL chain walked cleanly
+   (`output/p10-final-2/hdma.log`):
 
    ```
    hdma cl=0 ll_walk_read dir=rd ch=0 elem=1 cursor=0x42b86740 ...
@@ -986,28 +984,31 @@ both in `src/machine/r100_hdma.c`:
    hdma cl=0 signal_completion dir=rd ch=0 pending_mask=0x10000
    ```
 
-   The aliases are **not** the right answer — they collapse stage-1
-   and stage-2 to identity, hide every page-table bug, and
-   structurally fight `r100_smmu.c`'s eventual STE / CD / PT walker.
-   They were reverted in this session; the proper plan is in
-   `docs/roadmap.md` → "SMMU honour FW page tables", which now
-   carries a concrete attack outline (concrete IPA values, FW
-   page-table source files, ordering vs. `r100-pcie-outbound` /
-   `r100-rbdma` / `r100-dnc-cluster` translation hooks).
+   The aliases were the wrong answer — they would have collapsed
+   stage-1 and stage-2 to identity, hidden every page-table bug,
+   and structurally fought any future STE / CD / PT walker. They
+   were reverted before P11 landed. **P11 replaces the alias
+   shortcut with a real translate hook**: `r100-rbdma` and
+   `r100-hdma` now run NPU-side DVAs through
+   `r100_smmu_translate(SID=0, …)` against the in-DRAM stream
+   table + page tables FW publishes (q-sys's `smmu_s2_enable` →
+   `STE0.config=ALL_TRANS` with stage-2 fields filled). With
+   `CR0.SMMUEN=0` (early boot, single-QEMU runs) the translate is
+   identity, so existing tests keep working. See
+   `docs/roadmap.md` → P11 for the milestone breakdown.
 
-3. **A new failure mode behind the LL walker — CDMA Auto Fetch
-   error.** With the SMMU IPA aliases temporarily in place, cb[0]
-   completed cleanly (1 MSI-X observed) but the test still failed
-   downstream: q-cp's `hils.log` started dumping
-   `[1ff37014e0] 0 0 0 0 0 0 0 0` ... `CDMA Auto Fetch` register
-   sweeps and the host kmd entered a *second* `rebel_hw_init`
-   path (workqueue `rsd_device_reset_wq` →
-   `rsd_sched_device_init`) that gets stuck at `+0x439` again.
-   Likely a downstream effect of an RBDMA / DNC mismatch on the
-   second cb's task descriptor — diagnosable once SMMU stage-2
-   lands properly and cb[1]'s HDMA walk is honest. Recorded here
-   so future people picking up P10 know the LL walker isn't the
-   final boss.
+3. **Downstream: CDMA Auto Fetch error.** With the SMMU IPA
+   aliases temporarily in place during the diagnostic dig, cb[0]
+   completed cleanly but the test still failed downstream:
+   q-cp's `hils.log` dumped `[1ff37014e0] 0 0 0 0 0 0 0 0` ...
+   `CDMA Auto Fetch` register sweeps and the host kmd entered a
+   *second* `rebel_hw_init` path (workqueue
+   `rsd_device_reset_wq` → `rsd_sched_device_init`) stuck at
+   `+0x439` again. Tracking through the kmd-side OOM / p2pdma
+   path now is the live P10 work; SMMU is no longer the
+   blocker. Recorded here so future people picking up P10 know
+   the SMMU walker fix didn't fall straight through to a green
+   p10.
 
 **Side bug 4 — HDMA init-time STOP-doorbell pollution (FIXED in
 this session, on the same branch as the SMMU work even though

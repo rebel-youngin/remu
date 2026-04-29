@@ -81,6 +81,7 @@
 #include "chardev/char-fe.h"
 #include "exec/address-spaces.h"
 #include "r100_soc.h"
+#include "r100_smmu.h"
 
 /* ========================================================================
  * Register layout (offsets from NBUS_L_RBDMA_CFG_BASE)
@@ -310,6 +311,13 @@ struct R100RBDMAState {
      * second cb's RBDMA kick fire?" without --trace overhead.
      * Mirrors r100-hdma's hdma_debug_chr pattern. */
     CharBackend rbdma_debug_chr;
+
+    /* P11: chiplet's r100-smmu for stage-2 translation of OTO SAR /
+     * DAR. May be NULL (test harnesses without SMMU wiring, e.g.
+     * p4a/p4b which mmap raw chiplet-0 DRAM offsets and never touch
+     * the TCU registers); the translate helper below falls through
+     * to identity in that case so existing tests stay green. */
+    R100SMMUState *smmu;
 };
 typedef struct R100RBDMAState R100RBDMAState;
 
@@ -479,44 +487,82 @@ static void r100_rbdma_done_bh(void *opaque)
      * because we recompute walk from the current head each time. */
 }
 
+/* SID assigned to RBDMA on this device (Notion REBELQ SMMU Design § 1
+ * — "0–4: DNC(dma) / RBDMA / HDMA-IPA, PF + VF0–3"). v1 hardcodes PF
+ * = SID 0; multi-VF (SID 1..4) is gated on workload + P11 v2. */
+#define R100_RBDMA_SMMU_SID     0
+
+/*
+ * P11 — translate a chiplet-local DVA through the chiplet's r100-smmu.
+ * Returns true with `*out_pa` set on success (identity if SMMU is not
+ * wired or CR0.SMMUEN=0 — see r100_smmu.c). On a translate fault,
+ * logs `LOG_GUEST_ERROR` with the fault type + DVA and returns false;
+ * the caller bails out of the engine kick the same way it does on
+ * `MEMTX_DECODE_ERROR` from address_space_*.
+ *
+ * `out_pa` is the chiplet-local PA on success — the caller still adds
+ * `chiplet_id * R100_CHIPLET_OFFSET` afterwards to land in QEMU's
+ * flat global address space (REMU's per-chiplet DRAM mounting
+ * convention; q-sys's stage-2 PTEs encode chiplet-local PAs).
+ */
+static bool r100_rbdma_translate(R100RBDMAState *s, hwaddr dva, int access,
+                                 hwaddr *out_pa)
+{
+    R100SMMUTranslateResult tr = { 0 };
+
+    if (!s->smmu) {
+        *out_pa = dva;
+        return true;
+    }
+    r100_smmu_translate(s->smmu, R100_RBDMA_SMMU_SID, 0, dva, access, &tr);
+    if (!tr.ok) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "r100-rbdma cl=%u OTO: SMMU %s on dva=0x%" PRIx64
+                      " (sid=%u, fault_addr=0x%" PRIx64 ")\n",
+                      s->chiplet_id,
+                      r100_smmu_fault_str(tr.fault),
+                      dva, tr.sid, tr.fault_addr);
+        return false;
+    }
+    *out_pa = tr.pa;
+    return true;
+}
+
 /* P4B — OTO byte mover. Runs inline on RUN_CONF1 store, before the
  * FNSH push, so q-cp's done-handler always observes the data already
  * landed at DAR by the time it walks the cb completion logic.
  *
- * Address handling — read this carefully, the silicon path differs:
+ * Address handling — silicon path:
  *
  *   On real silicon, SAR / DAR carry **device virtual addresses (DVAs)**
  *   programmed by q-cp from kmd-allocated cb_descr fields. The RBDMA
- *   engine emits AXI bursts that traverse the per-chiplet SMMU-600
- *   (`r100_smmu.c`'s real counterpart), which performs the S1 + S2
- *   page-table walk to translate DVA → output PA before the DDR
- *   controller / iATU sees the request.
+ *   engine emits AXI bursts that traverse the per-chiplet SMMU-600,
+ *   which performs the S1 + S2 page-table walk to translate DVA → PA
+ *   before the DDR controller / iATU sees the request.
  *
- *   REMU does NOT model SMMU translation. `r100_smmu.c` is a
- *   register-only stub — it acks `CR0→CR0ACK`, auto-advances
- *   `CMDQ_CONS=PROD`, and never walks the STE / CD / page tables FW
- *   sets up in DRAM. The SMMU's effective transform in REMU is
- *   therefore `S1 ∘ S2 = identity`. This matches how `r100-hdma`,
- *   `r100-dnc-cluster`, and the rest of the engine fleet already
- *   handle DVAs (see `r100_hdma.c:r100_hdma_kick_wr` — same shape).
- *   Honouring real FW page tables is tracked separately as a
- *   long-term follow-on (`docs/roadmap.md` → "SMMU honour FW page
- *   tables"); the natural plug point would be a translation hook
- *   here just before the address_space_{read,write} call.
+ *   P11 made REMU model the stage-2 walk honestly: SAR / DAR run
+ *   through `r100_rbdma_translate` (which calls
+ *   `r100_smmu_translate(... SID 0 ...)` — see Notion REBELQ SMMU
+ *   Design § 1 for the SID-to-master allocation). The translate
+ *   helper falls through to identity when the SMMU isn't wired
+ *   (test harnesses) or `CR0.SMMUEN=0` (early boot), so existing
+ *   tests like p4a/p4b that mmap raw chiplet-0 DRAM offsets keep
+ *   working — they just bypass the walker.
  *
  *   The `chiplet_base += chiplet_id * R100_CHIPLET_OFFSET` step below
- *   is **not** a substitute for SMMU translation. It's REMU's flat
- *   global-vs-chiplet-local plumbing: every chiplet's DRAM is mounted
- *   at its own offset in `&address_space_memory`, and engines on
- *   chiplet N see chiplet-local addresses on their NoC. Without the
- *   add, a SAR like 0x100600000 from chiplet-2 RBDMA would land in
- *   chiplet 0's DRAM instead of chiplet 2's. r100-hdma uses the same
+ *   is **separate** from SMMU translation: it's REMU's flat
+ *   global-vs-chiplet-local plumbing. The SMMU walker returns the
+ *   chiplet-local PA encoded in the FW's stage-2 PTEs; we then add
+ *   chiplet_base to land at the right slot in QEMU's flat address
+ *   space. Without the add, a SAR like 0x100600000 from chiplet-2
+ *   RBDMA would land in chiplet 0's DRAM. r100-hdma uses the same
  *   convention.
  *
- * Returns true on success. On address_space failure we log GUEST_ERROR
- * but still let the caller push the FNSH entry so q-cp doesn't
- * deadlock waiting for a completion that will never arrive — the
- * post-mortem log + the stale dst memory together signal the error. */
+ * Returns true on success. On address_space or SMMU-translate failure
+ * we log GUEST_ERROR but still let the caller push the FNSH entry so
+ * q-cp doesn't deadlock waiting for a completion that will never
+ * arrive — the post-mortem log + the stale dst memory together
+ * signal the error. */
 static bool r100_rbdma_do_oto(R100RBDMAState *s)
 {
     uint32_t src_lo = 0;
@@ -563,6 +609,20 @@ static bool r100_rbdma_do_oto(R100RBDMAState *s)
                       " > cap 0x%x — clamping\n",
                       s->chiplet_id, size, RBDMA_OTO_MAX_BYTES);
         size = RBDMA_OTO_MAX_BYTES;
+    }
+
+    /* P11: translate SAR/DAR through stage-2 BEFORE adding the
+     * chiplet base. Translation returns chiplet-local PA; chiplet
+     * base is then added to land in the flat global address space.
+     * On translate fault we bail (return false) — the caller still
+     * pushes the FNSH entry so q-cp's done loop unwinds. */
+    if (!r100_rbdma_translate(s, src, R100_SMMU_ACCESS_READ, &src)) {
+        s->oto_dma_errors++;
+        return false;
+    }
+    if (!r100_rbdma_translate(s, dst, R100_SMMU_ACCESS_WRITE, &dst)) {
+        s->oto_dma_errors++;
+        return false;
     }
 
     chiplet_base = (uint64_t)s->chiplet_id * R100_CHIPLET_OFFSET;
@@ -831,6 +891,8 @@ static void r100_rbdma_unrealize(DeviceState *dev)
 static Property r100_rbdma_properties[] = {
     DEFINE_PROP_UINT32("chiplet-id", R100RBDMAState, chiplet_id, 0),
     DEFINE_PROP_CHR("debug-chardev", R100RBDMAState, rbdma_debug_chr),
+    DEFINE_PROP_LINK("smmu", R100RBDMAState, smmu,
+                     TYPE_R100_SMMU, R100SMMUState *),
     DEFINE_PROP_END_OF_LIST(),
 };
 

@@ -1,9 +1,23 @@
 # RBDMA + SMMU design review (vs. Notion)
 
-Date: 2026-04-28
+Date: 2026-04-28 (review snapshot, pre-P11)
 Scope: review of the current `r100-smmu` (`src/machine/r100_smmu.c`,
 ~306 LOC) and `r100-rbdma` (`src/machine/r100_rbdma.c`, ~743 LOC)
 device models against the silicon design captured in Notion.
+
+> **2026-04-29 update:** **P11 has landed**, replacing the
+> register-only stub described in § "SMMU — register-only stub" /
+> § "Cross-cutting note" below with a real stage-2 walker (PF only,
+> SID 0). RBDMA OTO and HDMA LL walker now translate through
+> `r100_smmu_translate(SID=0, …)` before each `address_space_*` call.
+> Every "today's identity stub" / "register-only" / "S1∘S2 = identity"
+> phrasing in this document refers to the **pre-P11** state and is
+> kept for design-review historical context. The list of v2 follow-ons
+> in § "SMMU — register-only stub" (stage-1 walk, multi-VF, eventq /
+> GERROR, IOTLB cache, 2LVL stream tables, SID-17 PCIe TBU) is still
+> accurate; P11 deliberately scoped to v1 and deferred all of them.
+> See `docs/roadmap.md` → P11 for the milestone-level breakdown +
+> deferred-v2 list.
 
 Sources read:
 - Notion **REBELQ SMMU Design** (`a27418f9fef34eca8ed4c2dd27f55d26`)

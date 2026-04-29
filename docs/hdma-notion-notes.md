@@ -153,15 +153,25 @@ tagged and translated. HDMA-specific points:
 
 ### REMU implication
 
-REMU's `r100_smmu.c` is a register-only stub
+**Pre-P11**: REMU's `r100_smmu.c` was a register-only stub
 (`CR0→CR0ACK`, `CMDQ_CONS=PROD`, no STE / CD / page-table walk),
 giving an effective `S1 ∘ S2 = identity`. The Notion bypass-region
-rule is *exactly* this regime — HDMA / RBDMA / DNC engines can call
-`address_space_{read,write}` directly on the kmd-published address
-plus `chiplet_id * R100_CHIPLET_OFFSET` (REMU's flat-global vs.
-chiplet-local plumbing) and be silicon-faithful. Honoring real FW
-page tables is tracked as the "SMMU honour FW page tables" follow-on
-in `roadmap.md`.
+rule is *exactly* this regime — HDMA / RBDMA / DNC engines could
+call `address_space_{read,write}` directly on the kmd-published
+address plus `chiplet_id * R100_CHIPLET_OFFSET` (REMU's flat-global
+vs. chiplet-local plumbing) and be silicon-faithful while kmd / q-cp
+left the LUT in all-bypass shape.
+
+**P11** replaced the stub with a real stage-2 walker (PF only).
+HDMA's NPU-side SAR/DAR/cursor go through
+`r100_smmu_translate(SID=0, …)` before each `address_space_*` call;
+when `CR0.SMMUEN=0` the translate is identity, so the bypass regime
+described above keeps working unchanged. When q-sys's
+`smmu_s2_enable` flips STE0.config to ALL_TRANS with stage-2 fields
+filled, the walker honours the in-DRAM page tables. v2 follow-ons
+(stage-1 walk via CD per SSID, multi-VF, IOTLB cache, dedicated
+HDMA-PA-mode SID 16 wiring, host-inbound SID 17 PCIe TBU) are gated
+on workload need.
 
 ## 5. Direct implications for P5
 

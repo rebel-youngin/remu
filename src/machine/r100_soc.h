@@ -128,6 +128,17 @@ struct R100SoCMachineState {
      * received). Mirror of doorbell_debug_chardev_id. */
     char *hdma_debug_chardev_id;
 
+    /* P11: per-chiplet r100-smmu device pointers, populated in
+     * r100_create_smmu and read back by the rbdma / hdma instantiation
+     * sites so they can wire their `smmu` link to the correct chiplet's
+     * TCU. Held as opaque `DeviceState *` here (header doesn't pull in
+     * r100_smmu.h to avoid a public dependency on the SMMU type
+     * machinery — only the wiring code needs the link target, and it
+     * does so via OBJECT(...) casts). NULL slots indicate a chiplet
+     * whose SMMU hasn't been instantiated yet (impossible after
+     * machine init completes). */
+    DeviceState *smmu_dev[R100_NUM_CHIPLETS];
+
     /* `-machine r100-soc,rbdma-debug=<chardev-id>` : optional ASCII
      * trace tail wired to chiplet 0's r100-rbdma only (CharBackend is
      * single-frontend; chiplets 1..3 don't share — their RBDMAs are

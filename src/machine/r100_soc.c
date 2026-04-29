@@ -286,9 +286,16 @@ static void r100_create_pvt_blocks(MemoryRegion *cfg_mr, int chiplet_id)
     }
 }
 
-/* SMMU-600 TCU stub. BL2 smmu_early_init polls CR0ACK&EVENTQEN after
- * programming CR0, and GBPA UPDATE self-clear. Details in r100_smmu.c. */
-static void r100_create_smmu(MemoryRegion *cfg_mr, int chiplet_id)
+/* SMMU-600 TCU. Two roles after P11: (1) MMIO surface for FW init
+ * paths — BL2 smmu_early_init polls CR0ACK&EVENTQEN after programming
+ * CR0, GBPA UPDATE self-clear, FreeRTOS CMDQ walker handles SYNC and
+ * recognises (logs) the TLBI/CFGI/PREFETCH command set; (2) public
+ * stage-2 translate API consumed by NPU-side DMA engines. We stash
+ * the device pointer into the machine state so engines that consume
+ * DVAs (r100-rbdma OTO, r100-hdma LL walker) can resolve their
+ * `smmu` QOM link to this chiplet's TCU at machine-realize time.
+ * Full lifecycle details in r100_smmu.c. */
+static DeviceState *r100_create_smmu(MemoryRegion *cfg_mr, int chiplet_id)
 {
     DeviceState *dev;
     SysBusDevice *sbd;
@@ -299,6 +306,7 @@ static void r100_create_smmu(MemoryRegion *cfg_mr, int chiplet_id)
     sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
     memory_region_add_subregion(cfg_mr, offset, sysbus_mmio_get_region(sbd, 0));
+    return dev;
 }
 
 /* RBC block bases in cfg space (6 per chiplet). */
@@ -595,7 +603,11 @@ static void r100_chiplet_init(MachineState *machine, int chiplet_id,
     }
 
     r100_create_hbm(cfg_mr, chiplet_id);
-    r100_create_smmu(cfg_mr, chiplet_id);
+    /* P11: stash the SMMU device so engine wiring later in this
+     * function (and the chiplet-0 HDMA wiring in r100_machine_realize)
+     * can resolve their `smmu` QOM link. */
+    R100_SOC_MACHINE(machine)->smmu_dev[chiplet_id] =
+        r100_create_smmu(cfg_mr, chiplet_id);
     r100_create_pvt_blocks(cfg_mr, chiplet_id);
     r100_create_dma_pl330(cfg_mr, chiplet_id);
     r100_create_qspi_bridge(cfg_mr, chiplet_id);
@@ -684,6 +696,17 @@ static void r100_chiplet_init(MachineState *machine, int chiplet_id,
             if (rbdma_dbg) {
                 qdev_prop_set_chr(dev, "debug-chardev", rbdma_dbg);
             }
+        }
+        /* P11: hand RBDMA the chiplet's r100-smmu so OTO SAR/DAR are
+         * translated through stage-2 before address_space_*. The link
+         * is optional — without it the RBDMA falls back to identity
+         * (matches today's M9-1c/P4B behaviour for FW workloads that
+         * leave SMMUEN=0 — kernel mode tests like p4b mmap raw
+         * chiplet-0 DRAM offsets and never enable the SMMU). */
+        if (r100m_local->smmu_dev[chiplet_id]) {
+            object_property_set_link(OBJECT(dev), "smmu",
+                                     OBJECT(r100m_local->smmu_dev[chiplet_id]),
+                                     &error_fatal);
         }
         sbd = SYS_BUS_DEVICE(dev);
         sysbus_realize_and_unref(sbd, &error_fatal);
@@ -1212,6 +1235,17 @@ static void r100_soc_init(MachineState *machine)
                 }
                 if (hdma_dbg) {
                     qdev_prop_set_chr(hdma_dev, "debug-chardev", hdma_dbg);
+                }
+                /* P11: same SMMU plumbing as RBDMA above — chiplet-0
+                 * is the only HDMA today. Translation is per-LL-element
+                 * (cursor + SAR/DAR for the d2d path; host-leg paths
+                 * pre-strip REMU_HOST_PHYS_BASE so DAR/SAR there is
+                 * already a host bus address that doesn't go through
+                 * the NPU SMMU). */
+                if (r100m->smmu_dev[0]) {
+                    object_property_set_link(OBJECT(hdma_dev), "smmu",
+                                             OBJECT(r100m->smmu_dev[0]),
+                                             &error_fatal);
                 }
                 sysbus_realize_and_unref(SYS_BUS_DEVICE(hdma_dev),
                                          &error_fatal);

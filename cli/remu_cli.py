@@ -17,7 +17,7 @@ Usage:
     ./remucli gdb [--port PORT] [-b ELF]
     ./remucli status
     ./remucli images [--check | --from-dir PATH]
-    ./remucli test [m5|m6|m7|m8|p4a|p4b|p5|p10|all]...
+    ./remucli test [m5|m6|m7|m8|p4a|p4b|p5|p11|p10|all]...
     ./remucli clean [--name NAME | --all]
     ./remucli completion {bash,zsh,fish}
 """
@@ -2434,6 +2434,13 @@ TEST_REGISTRY = {
         "desc": "P5 r100-hdma LL: gdbstub-driven dw_hdma_v0_lli D2D byte-move",
         "needs": ("aarch64", "x86_64"),
     },
+    "p11": {
+        "script": "tests/p11_smmu_walk_test.py",
+        "run_name": "p11-smmu",
+        "desc": ("P11 SMMU stage-2: gdbstub-driven walk + RBDMA OTO via "
+                 "IPA → 4 KB byte-move"),
+        "needs": ("aarch64", "x86_64"),
+    },
     "p10": {
         "script": "tests/p10_umd_smoke_test.py",
         "run_name": "p10-umd",
@@ -2466,7 +2473,7 @@ DEFAULT_TEST_KEYS = [k for k, v in TEST_REGISTRY.items()
 def test(tests, skip_clean, stop_on_fail):
     """Run REMU bridge end-to-end tests with pre-run cleanup.
 
-    By default runs the regression set (m5..m8 + p4a/p4b/p5).  Pass one
+    By default runs the regression set (m5..m8 + p4a/p4b/p5/p11).  Pass one
     or more test ids to pick specific phases, e.g.:
 
     \b

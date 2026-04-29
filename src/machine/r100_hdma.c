@@ -75,14 +75,18 @@
  * partitions keep r100-pcie-outbound's PF-window reads (0xC0..0xFF)
  * from colliding with this device's channel-driven 0x80..0xBF range.
  *
- * SMMU note: this engine consumes SAR/DAR as device PAs in the
- * "bypass" regime (HDMA-SID LUT all entries SID=17, SSID.V=0; see
- * docs/hdma-notion-notes.md § 4). REMU's r100_smmu.c is a register-
- * only stub so S1∘S2 = identity, matching the regime kmd / q-cp use
- * today. Honouring real FW page tables is tracked as a long-term
- * follow-on (docs/roadmap.md → "SMMU honour FW page tables") — the
- * natural plug point is a translation hook in
- * r100_hdma_lli_{wr,rd,d2d} just before each address_space_* call.
+ * SMMU note (P11): this engine's NPU-side SAR/DAR are DVAs that
+ * traverse the chiplet's SMMU-600 on real silicon. Per Notion REBELQ
+ * SMMU Design § 1, HDMA-IPA uses SID 0 on PF (LUT entries with
+ * SID=17 / SSID.V=0 select the bypass region — that's a kmd/q-cp
+ * configuration choice, not a property of REMU). r100_hdma_lli_{wr,
+ * rd,d2d} now translate via `r100_smmu_translate` before each
+ * `address_space_*` call. When CR0.SMMUEN=0 (early boot, single-
+ * QEMU `--name` runs, p5 test) or the engine has no smmu link, the
+ * translate falls through to identity — matches Arm-SMMU pre-enable
+ * bypass and keeps existing tests working. The walker handles
+ * stage-2 only in v1 (q-sys flips STE0.config to ALL_TRANS with
+ * S1_DSS=BYPASS); stage-1 + multi-VF + IOTLB cache are v2.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -101,6 +105,7 @@
 #include "migration/vmstate.h"
 #include "r100_soc.h"
 #include "r100_hdma.h"
+#include "r100_smmu.h"
 #include "remu_doorbell_proto.h"  /* REMU_HOST_PHYS_BASE */
 #include "remu_hdma_proto.h"
 
@@ -192,6 +197,13 @@ struct R100HDMAState {
     uint64_t doorbells_started;
     uint64_t doorbells_dropped;
     uint64_t channel_completions;
+
+    /* P11: chiplet's r100-smmu for stage-2 translation of LL element
+     * cursor + LLI SAR/DAR (NPU-side). May be NULL (test harnesses
+     * without SMMU wiring, e.g. p5 which mmaps raw chiplet-0 DRAM
+     * offsets and never enables the TCU); the translate helper falls
+     * through to identity in that case. */
+    R100SMMUState *smmu;
 };
 
 /* ------------------------------------------------------------------ */
@@ -298,6 +310,58 @@ bool r100_hdma_emit_read_req(R100HDMAState *s, uint32_t req_id,
                   " read_len=%u req_id=0x%x rc=%d\n", tag, src,
                   read_len, req_id, (int)rc);
     return false;
+}
+
+/* ------------------------------------------------------------------ */
+/* P11 — SMMU stage-2 translate hook                                   */
+/* ------------------------------------------------------------------ */
+
+/* SID for HDMA-IPA path (Notion REBELQ SMMU Design § 1: "0–4:
+ * DNC(dma) / RBDMA / HDMA-IPA, PF + VF0–3"). v1 hardcodes PF = SID 0;
+ * the bypass-LUT "Device HDMA (PA mode)" path lives at SID 16, which
+ * STE0.config=BYPASS gives identity for free — we don't need to dispatch
+ * by SID for v1. Multi-VF (SID 1..4) is gated on workload + P11 v2. */
+#define R100_HDMA_SMMU_SID      0
+
+/*
+ * Translate a chiplet-local DVA through the chiplet's r100-smmu.
+ * Same shape as `r100_rbdma_translate`: identity passthrough when
+ * the SMMU isn't wired or `CR0.SMMUEN=0` (early boot, p5 test
+ * harness), else stage-2 walk.
+ *
+ * `out_pa` is chiplet-local on success. The HDMA caller is
+ * responsible for adding `chiplet_id * R100_CHIPLET_OFFSET` if the
+ * resulting access goes through `&address_space_memory` (the d2d
+ * loop and the LL chain reads do; the host-leg paths chunk through
+ * `hdma` chardev frames where the address is interpreted on the
+ * remote side and never touches our flat global).
+ */
+static bool r100_hdma_translate(R100HDMAState *s, hwaddr dva, int access,
+                                const char *what, hwaddr *out_pa)
+{
+    R100SMMUTranslateResult tr = { 0 };
+
+    if (!s->smmu) {
+        *out_pa = dva;
+        return true;
+    }
+    r100_smmu_translate(s->smmu, R100_HDMA_SMMU_SID, 0, dva, access, &tr);
+    if (!tr.ok) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "r100-hdma cl=%u: SMMU %s on %s dva=0x%" PRIx64
+                      " (sid=%u, fault_addr=0x%" PRIx64 ")\n",
+                      s->chiplet_id,
+                      r100_smmu_fault_str(tr.fault),
+                      what, dva, tr.sid, tr.fault_addr);
+        r100_hdma_emit_trace(s,
+                             "hdma cl=%u smmu_fault %s dva=0x%"
+                             PRIx64 " fault=%s\n",
+                             s->chiplet_id, what, dva,
+                             r100_smmu_fault_str(tr.fault));
+        return false;
+    }
+    *out_pa = tr.pa;
+    return true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -541,11 +605,20 @@ static bool r100_hdma_lli_rd(R100HDMAState *s, uint32_t ch,
                              uint32_t len)
 {
     uint32_t off = 0;
+    hwaddr   dar_pa;
+
+    /* P11: translate the NPU-side DAR; SAR is the host bus address.
+     * Same one-shot translate + block-contiguity assumption as the
+     * WR / D2D helpers — see comment in r100_hdma_lli_wr. */
+    if (!r100_hdma_translate(s, dar_npu, R100_SMMU_ACCESS_WRITE,
+                             "ll-rd-dar", &dar_pa)) {
+        return false;
+    }
 
     while (off < len) {
         uint32_t chunk = MIN(len - off, REMU_HDMA_MAX_PAYLOAD);
         if (!r100_hdma_lli_rd_chunk(s, ch, sar_host + off,
-                                    dar_npu + off, chunk)) {
+                                    dar_pa + off, chunk)) {
             return false;
         }
         off += chunk;
@@ -561,15 +634,29 @@ static bool r100_hdma_lli_wr(R100HDMAState *s, uint32_t ch,
     uint8_t  buf[REMU_HDMA_MAX_PAYLOAD];
     uint32_t off = 0;
     MemTxResult mr;
+    hwaddr   sar_pa;
+
+    /* P11: translate the NPU-side SAR through the chiplet's SMMU
+     * (DAR is the host bus address — never goes through this SMMU,
+     * the host-side r100-npu-pci handles that side). v1 translates
+     * once and assumes the transfer fits in one mapped block; q-sys's
+     * runtime_pt uses 2 MB / 1 GB block descriptors so this holds in
+     * practice (TODO: chunked translate for v2 if a workload crosses
+     * a block boundary). */
+    if (!r100_hdma_translate(s, sar_npu, R100_SMMU_ACCESS_READ,
+                             "ll-wr-sar", &sar_pa)) {
+        return false;
+    }
 
     while (off < len) {
         uint32_t chunk = MIN(len - off, REMU_HDMA_MAX_PAYLOAD);
-        mr = address_space_read(&address_space_memory, sar_npu + off,
+        mr = address_space_read(&address_space_memory, sar_pa + off,
                                 MEMTXATTRS_UNSPECIFIED, buf, chunk);
         if (mr != MEMTX_OK) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "r100-hdma: LL WR ch=%u sar=0x%" PRIx64
-                          " read failed\n", ch, sar_npu + off);
+                          " (pa=0x%" PRIx64 ") read failed\n", ch,
+                          sar_npu + off, (uint64_t)(sar_pa + off));
             return false;
         }
         if (!r100_hdma_emit_write_tagged(s, req_id, dar_host + off, buf,
@@ -581,11 +668,11 @@ static bool r100_hdma_lli_wr(R100HDMAState *s, uint32_t ch,
     return true;
 }
 
-/* D2D / NPU-internal LLI copy. Both SAR and DAR are NPU PAs (with
- * SMMU bypass — see the file-banner SMMU note). 64 KB scratch on the
- * stack is comfortably below FreeRTOS_CP* task stacks (we're running
- * on a vCPU thread, not in a guest task). Larger LLIs loop the
- * scratch.
+/* D2D / NPU-internal LLI copy. Both SAR and DAR are NPU-side DVAs
+ * that go through the chiplet's SMMU on real silicon (see file-banner
+ * SMMU note). 64 KB scratch on the stack is comfortably below
+ * FreeRTOS_CP* task stacks (we're running on a vCPU thread, not in
+ * a guest task). Larger LLIs loop the scratch.
  *
  * `g_alloca` would be clearer but linux/posix `alloca` is
  * size-bounded by the platform stack — keep this on a fixed-size
@@ -597,23 +684,40 @@ static bool r100_hdma_lli_d2d(R100HDMAState *s, uint32_t ch,
     uint8_t  buf[R100_HDMA_D2D_CHUNK];
     uint32_t off = 0;
     MemTxResult mr;
+    hwaddr   sar_pa;
+    hwaddr   dar_pa;
+
+    /* P11: both endpoints are NPU-side, both go through the chiplet's
+     * SMMU. v1 translates once and assumes block-contiguity (FW
+     * runtime_pt's 2 MB / 1 GB block descriptors hold this). v2 will
+     * walk per-page if a workload crosses block boundaries. */
+    if (!r100_hdma_translate(s, sar_npu, R100_SMMU_ACCESS_READ,
+                             "ll-d2d-sar", &sar_pa)) {
+        return false;
+    }
+    if (!r100_hdma_translate(s, dar_npu, R100_SMMU_ACCESS_WRITE,
+                             "ll-d2d-dar", &dar_pa)) {
+        return false;
+    }
 
     while (off < len) {
         uint32_t chunk = MIN(len - off, sizeof(buf));
-        mr = address_space_read(&address_space_memory, sar_npu + off,
+        mr = address_space_read(&address_space_memory, sar_pa + off,
                                 MEMTXATTRS_UNSPECIFIED, buf, chunk);
         if (mr != MEMTX_OK) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "r100-hdma: LL D2D ch=%u sar=0x%" PRIx64
-                          " read failed\n", ch, sar_npu + off);
+                          " (pa=0x%" PRIx64 ") read failed\n", ch,
+                          sar_npu + off, (uint64_t)(sar_pa + off));
             return false;
         }
-        mr = address_space_write(&address_space_memory, dar_npu + off,
+        mr = address_space_write(&address_space_memory, dar_pa + off,
                                  MEMTXATTRS_UNSPECIFIED, buf, chunk);
         if (mr != MEMTX_OK) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "r100-hdma: LL D2D ch=%u dar=0x%" PRIx64
-                          " write failed\n", ch, dar_npu + off);
+                          " (pa=0x%" PRIx64 ") write failed\n", ch,
+                          dar_npu + off, (uint64_t)(dar_pa + off));
             return false;
         }
         off += chunk;
@@ -672,21 +776,36 @@ static bool r100_hdma_walk_ll(R100HDMAState *s, R100HdmaDir dir,
         } QEMU_PACKED elem;
         MemTxResult mr;
         bool ok = true;
+        hwaddr cursor_pa;
 
-        mr = address_space_read(&address_space_memory, cursor,
+        /* P11: cursor (LL element address) is itself an NPU-side
+         * IPA — q-cp's `cmd_descr_hdma` programs the channel's LLP
+         * register with a stage-2 IPA (cb[1]'s 0x42b86740 lives in
+         * the SYSTEM IPA window). Translate before fetching the
+         * 24-byte element. */
+        if (!r100_hdma_translate(s, cursor, R100_SMMU_ACCESS_READ,
+                                 "ll-cursor", &cursor_pa)) {
+            c->walk.ll_active = false;
+            return false;
+        }
+
+        mr = address_space_read(&address_space_memory, cursor_pa,
                                 MEMTXATTRS_UNSPECIFIED, &elem,
                                 sizeof(elem));
         if (mr != MEMTX_OK) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "r100-hdma: LL walk read elem ch=%u "
-                          "addr=0x%" PRIx64 " failed\n", ch,
-                          (uint64_t)cursor);
+                          "addr=0x%" PRIx64 " (pa=0x%" PRIx64
+                          ") failed\n", ch, (uint64_t)cursor,
+                          (uint64_t)cursor_pa);
             r100_hdma_emit_trace(s,
                                  "hdma cl=%u ll_walk_read_fail dir=%s "
-                                 "ch=%u cursor=0x%" PRIx64 " mr=%d\n",
+                                 "ch=%u cursor=0x%" PRIx64
+                                 " pa=0x%" PRIx64 " mr=%d\n",
                                  s->chiplet_id,
                                  dir == R100_HDMA_DIR_RD ? "rd" : "wr",
-                                 ch, (uint64_t)cursor, (int)mr);
+                                 ch, (uint64_t)cursor,
+                                 (uint64_t)cursor_pa, (int)mr);
             c->walk.ll_active = false;
             return false;
         }
@@ -767,10 +886,11 @@ static bool r100_hdma_walk_ll(R100HDMAState *s, R100HdmaDir dir,
                         elem.sar - REMU_HOST_PHYS_BASE,
                         elem.dar, elem.transfer_size);
             } else {
-                /* D2D / NPU-internal copy. q-cp's dev_hdma_handle
-                 * pre-translates SAR/DAR for the local chiplet via
-                 * IPA_TO_PA, so we land here when both SAR and DAR
-                 * are NPU PAs. SMMU bypass means PA == DVA. */
+                /* D2D / NPU-internal copy. Both SAR and DAR are
+                 * NPU-side DVAs; r100_hdma_lli_d2d runs them through
+                 * `r100_smmu_translate` (P11). When CR0.SMMUEN=0 the
+                 * walker is a passthrough so kmd/q-cp's "all entries
+                 * bypass-region" regime keeps working. */
                 ok = r100_hdma_lli_d2d(s, ch, elem.sar, elem.dar,
                                        elem.transfer_size);
             }
@@ -1297,6 +1417,8 @@ static Property r100_hdma_properties[] = {
     DEFINE_PROP_UINT32("chiplet-id", R100HDMAState, chiplet_id, 0),
     DEFINE_PROP_CHR("chardev", R100HDMAState, hdma_chr),
     DEFINE_PROP_CHR("debug-chardev", R100HDMAState, hdma_debug_chr),
+    DEFINE_PROP_LINK("smmu", R100HDMAState, smmu,
+                     TYPE_R100_SMMU, R100SMMUState *),
     DEFINE_PROP_END_OF_LIST(),
 };
 

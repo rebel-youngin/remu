@@ -24,7 +24,7 @@ around `cli/remu_cli.py`). Only runtime dep: `pip install --user click`.
 ./remucli run --name my-test        # Phase 1: NPU only → output/my-test/
 ./remucli run --name dbg --gdb      # Phase 1: paused, GDB on :1234
 ./remucli run --host --name pair    # Phase 2: NPU + x86 host QEMUs + r100-npu-pci bridge
-./remucli test                      # M5/M6/M7/M8/P4A/P4B/P5 bridge tests (`test m5 p5` for subset)
+./remucli test                      # M5/M6/M7/M8/P4A/P4B/P5/P11 bridge tests (`test m5 p5` for subset)
 ./remucli clean --name pair         # wipe orphan procs/shm/sockets from a SIGKILL'd run
 ./remucli clean --all               # nuke every REMU-shaped process + /dev/shm/remu-*
 ./guest/build-guest-image.sh        # M8b Stage 2: stage images/x86_guest/{bzImage,initramfs.cpio.gz}
@@ -300,28 +300,86 @@ the kickoff handler reads `SRCADDRESS_OR_CONST`, `DESTADDRESS`,
 the full 41-bit byte SAR/DAR (lower 32 bits in the address registers,
 top 2 bits in `RUN_CONF0.{src,dst}_addr_msb`, both shifted left by 7
 to convert 128 B-units → bytes). **SAR / DAR carry DVAs on real
-silicon** — RBDMA's AXI burst would normally traverse the per-chiplet
-SMMU-600 (S1 + S2 walk) before hitting DDR. REMU's `r100_smmu.c` is a
-register-only stub (no STE / CD / page-table walk), so the engine
-operates as if FW had set SMMU to identity (`S1 ∘ S2 = identity`),
-the same regime `r100-hdma` and `r100-dnc-cluster` already assume.
-The chiplet base (`chiplet_id * R100_CHIPLET_OFFSET`) is added on top
-to translate chiplet-local NoC addresses into QEMU's flat global
-`&address_space_memory` — that's REMU plumbing, not an SMMU stand-in.
-Then `address_space_read` SAR → temp buf → `address_space_write` DAR.
-Capped at `RBDMA_OTO_MAX_BYTES = 32 MiB`. Other task_types (CST/DAS/
-PTL/IVL/DUM/VCM/OTM/GTH/SCT/GTHR/SCTR) fall through to a `LOG_UNIMP`
-+ `unimp_task_kicks++` no-op so q-cp's done handler still drains the
-FNSH FIFO. Stats counters survive reset: `oto_kicks`, `oto_bytes`,
-`oto_dma_errors`, `unimp_task_kicks`. Honouring real FW page tables
-is tracked as a long-term follow-on
-(`docs/roadmap.md` → "SMMU honour FW page tables") — the natural
-plug point is a `r100_smmu_translate(asid, dva, …, &pa)` hook just
-before the `address_space_*` call here (and in `r100-hdma`). Verified
-end-to-end via `./remucli test p4b` (4 KB byte move between
-chiplet-0 DRAM offsets, gdbstub-driven from outside via the
-on-demand HMP `gdbserver tcp::PORT` + `Qqemu.PhyMemMode:1` packet
-sequence).
+silicon** — RBDMA's AXI burst traverses the per-chiplet SMMU-600 (S1
++ S2 walk) before hitting DDR. P11 made REMU model that walk
+honestly: SAR and DAR are translated through
+`r100_smmu_translate(SID=0, …)` (Notion REBELQ SMMU Design § 1: PF =
+SID 0) before the chiplet base is added. The walker handles stage-2
+(q-sys's `smmu_s2_enable` regime — `STE0.config=ALL_TRANS` with
+S1_DSS=BYPASS); when `CR0.SMMUEN=0` (early boot, single-QEMU runs,
+p4b/p5 tests) the translate is identity, so existing harnesses that
+mmap raw chiplet-0 DRAM offsets keep working. The chiplet base
+(`chiplet_id * R100_CHIPLET_OFFSET`) is added on top to translate
+chiplet-local NoC addresses into QEMU's flat global
+`&address_space_memory` — that's REMU plumbing, separate from SMMU
+translation. Then `address_space_read` SAR → temp buf →
+`address_space_write` DAR. Capped at `RBDMA_OTO_MAX_BYTES = 32 MiB`.
+Other task_types (CST/DAS/PTL/IVL/DUM/VCM/OTM/GTH/SCT/GTHR/SCTR)
+fall through to a `LOG_UNIMP` + `unimp_task_kicks++` no-op so q-cp's
+done handler still drains the FNSH FIFO. Stats counters survive
+reset: `oto_kicks`, `oto_bytes`, `oto_dma_errors`,
+`unimp_task_kicks`. Verified end-to-end via `./remucli test p4b`
+(4 KB byte move between chiplet-0 DRAM offsets, gdbstub-driven via
+the on-demand HMP `gdbserver tcp::PORT` + `Qqemu.PhyMemMode:1`
+packet sequence) and `./remucli test p11` (same harness with a
+hand-staged 3-level stage-2 page table + STE, RBDMA driven with IPA
+SAR/DAR).
+
+#### r100-smmu (P11 — stage-2 walker, PF only)
+
+Per-chiplet `r100-smmu` device (QOM type `r100-smmu`, MMIO at
+`R100_SMMU_TCU_BASE = 0x1FF4200000`, 64 KB) with two roles:
+
+1. **MMIO surface for FW init paths** (BL2 / FreeRTOS / q-cp).
+   `CR0 → CR0ACK` mirroring (with `EVENTQEN`/`SMMUEN`/`CMDQEN` mask),
+   `GBPA.UPDATE` auto-clear, `STRTAB_BASE` / `STRTAB_BASE_CFG` cache
+   the stream-table geometry, `CMDQ_PROD` writes walk the CMDQ from
+   the cached `(old_cons, new_prod]` range. Recognised opcodes:
+   `CMD_SYNC` (writes 0 to msiaddr per `CS=SIG_IRQ`),
+   `CMD_TLBI_NH_*` / `CMD_TLBI_S12_*` / `CMD_TLBI_S2_IPA` /
+   `CMD_TLBI_NSNH_ALL` / `CMD_CFGI_STE{,_RANGE}` / `CMD_CFGI_CD{,_ALL}`
+   / `CMD_PREFETCH_*` (logged + advance CONS as no-ops — v1 has no
+   STE / IOTLB cache to invalidate, every translate re-reads STE).
+
+2. **Public translate API** (`r100_smmu.h`):
+   `r100_smmu_translate(s, sid, ssid, dva, access, *out)`. RBDMA OTO
+   and HDMA LL walker call this on every NPU-side SAR/DAR/LLP before
+   the chiplet base is added. Pre-`CR0.SMMUEN`: identity (matches
+   Arm-SMMU pre-enable bypass). Post-enable: read STE from
+   `STRTAB_BASE_PA + sid * 64`, decode `STE0.{V, config}`:
+   `BYPASS` → identity, `ABORT` → `INV_STE` fault, `S1_TRANS` →
+   v1 identity + `LOG_UNIMP` (q-cp's `smmu_init_ste` sets
+   `STE1.S1DSS=BYPASS` for the SIDs it leaves at S1_TRANS, so the
+   effective behaviour is identity), `S2_TRANS`/`ALL_TRANS` → build
+   `SMMUTransCfg` from STE2/STE3 (`tsz` / `sl0` / `granule_sz` /
+   `eff_ps` / `vmid` / `affd` / `vttb`) and dispatch to QEMU's
+   existing `smmu_ptw()` with `stage=SMMU_STAGE_2`. STE3's `S2TTB` is
+   converted from chiplet-local to QEMU global PA (add `chiplet_id *
+   R100_CHIPLET_OFFSET`) before being handed to the walker so its
+   `address_space_memory` PTE reads land at the right slot.
+
+Engines connect via QOM `link<r100-smmu>` properties on
+`r100-rbdma` / `r100-hdma`, set up in `r100_soc.c`. SID 0 (PF) is
+hardcoded in v1 per Notion REBELQ SMMU Design § 1; multi-VF
+(SIDs 1..4) is v2.
+
+**v1 deliberate omissions** (each unblockable when a workload
+demands it): STE / IOTLB cache (LL chains are 3-4 entries; cost is
+chain reads, not page walks — re-reading STE every translate also
+makes invalidation a free no-op), 2-level stream tables (q-sys uses
+LINEAR for ≤32 SIDs), stage-1 walk, multi-VF, eventq / GERROR fault
+delivery, chiplet-0 PCIe-side TBU SID 17.
+
+`r100-pcie-outbound` keeps its `host-ram` alias (P10-fix); it does
+not currently go through this walker. `r100-dnc-cluster` cmd_descr
+fields stay untranslated until P6 surfaces a workload.
+
+Verification: `./remucli test p11` plants a 3-level stage-2 page
+table + STE in chiplet-0 DRAM via shm mmap, programs `STRTAB_BASE` /
+`STRTAB_BASE_CFG` / `CR0.SMMUEN=1` via gdbstub, drives a 4 KB RBDMA
+OTO with IPAs `0x100000000` / `0x100001000` mapped to chiplet-0
+PAs `0x07000000` / `0x07800000`, asserts byte-for-byte equality at
+the destination shm region. m5..p5 + p11 regression green.
 
 Both QEMUs `mmap` three shared `memory-backend-file`s under
 `/dev/shm/remu-<name>/` with `share=on`:
@@ -430,6 +488,20 @@ cleanup so SIGKILL'd prior state never poisons the next:
   (NPU→host OP_WRITE chunking, host→NPU OP_READ_REQ + parked
   `qemu_cond_wait_bql()` round-trip) fall out of P10's umd `simple_copy`
   via a one-line address_space ↔ chardev swap from the D2D path.
+- `tests/p11_smmu_walk_test.py` — `--host` boot, same shm-splice
+  + gdbstub harness as p4b/p5 (gdbstub on `tcp::4569`). Stages a 3-level
+  stage-2 page table (L1 @ `0x06000000`, L2 @ `0x06001000`, L3 @
+  `0x06002000`) + one `r100-smmu` STE @ `0x06010000` mapping
+  IPA `0x100000000` → PA `0x07000000` and IPA `0x100001000` → PA
+  `0x07800000` directly through the shm mmap, then writes
+  `STRTAB_BASE` / `STRTAB_BASE_CFG` / `CR0.SMMUEN=1` and drives a
+  4 KB RBDMA OTO with the IPAs as SAR / DAR via gdbstub. Asserts
+  byte-for-byte equality at the destination shm region — covers the
+  full `r100_smmu_translate` → `smmu_ptw_64_s2` 3-level walk +
+  STE-decode path end-to-end without an UMD/kmd workload. q-cp's own
+  `m7_smmu_enable` only fires from a kmd-driven `dram_init_done_cb`
+  mailbox callback, which we don't trigger, so chiplet-0 SMMU stays at
+  reset until the test programs it.
 
 All `./remucli run` invocations write into `output/<name>/` (or
 `output/run-<timestamp>/` if `--name` omitted). Never pass `/tmp/`
