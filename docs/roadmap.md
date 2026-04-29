@@ -98,6 +98,7 @@ side of silicon that actually owns it.
 | P7 | Retired the gated cm7 stubs — Stage 3c BD-done FSM, Stage 3b QINIT, M9-1b mbtq push, the three bool properties, the `imsix` / `mbtq-mailbox` QOM links, `r100_hdma_set_cm7_callback` plumbing, `cm7-debug` chardev, the `R100_CMD_DESCR_SYNTH_*` synth ring, and the related constants in `remu_addrmap.h` / `remu_doorbell_proto.h`. ~700 LOC of scaffolding gone; `r100-cm7` reduced to BAR4 doorbell forward + P1b cfg-mirror alias. | `fa9eb20` |
 | P10-fix | Replaced chardev RPC for both BAR2 cfg-head and chiplet-0 PCIe outbound with `memory-backend-file` aliases — the kmd's busy-poll could not be served by the chardev iothread under BQL contention. Both sides `mmap` the same `cfg-shadow` and `host-ram` shm files; `OP_CFG_WRITE` opcode 4 retired, `0xC0..0xFF` `req_id` partition reserved. | `d986302` |
 | P11 | SMMU stage-2 walker (PF only, SID 0). `r100_smmu.c` decodes STE / dispatches `smmu_ptw_64_s2` against in-DRAM page tables FW publishes. `r100-rbdma` OTO and `r100-hdma` LL walker translate via `r100_smmu_translate(SID=0, …)` before `address_space_*`; identity fallback when `CR0.SMMUEN=0`. CMDQ recognises `CFGI_*` / `TLBI_*` / `PREFETCH_*` opcodes (no-op in v1: no cache to invalidate). | `1f04ff2` |
+| SMMU v2 — eventq | Eventq + GERROR fault delivery. `r100_smmu_emit_event` builds 32 B SMMUv3 records on every translate fault (mapped from `R100SMMUFault` to FW event_id per `q/sys/drivers/smmu/smmu.c:165`), writes to in-DRAM eventq at `EVENTQ_BASE_PA + idx*32`, advances PROD with wrap encoding, and pulses GIC SPI 762 (`R100_INT_ID_SMMU_EVT`) when `IRQ_CTRL.EVENTQ_IRQEN=1`. Eventq overflow → `r100_smmu_raise_gerror(EVTQ_ABT_ERR)` toggles `GERROR ^ GERRORN` to make FW's `smmu_gerr_intr` see an active error and pulses SPI 765 (`R100_INT_ID_SMMU_GERR`). Both wired in `r100_soc.c:r100_create_smmu`. MMIO region bumped from 64 KB → 128 KB so `EVENTQ_PROD/CONS` at offset 0x100A8/AC (page 1) hit the device. New `tests/p11b_smmu_evtq_test.py`: V=0 STE + RBDMA OTO kick → expects PROD=1 + slot-0 content (event_id=0x04 C_BAD_STE, sid=0, input_addr=IPA_SRC). | (this commit) |
 
 ### Open / pending milestones
 
@@ -123,9 +124,14 @@ need:
   `CMD_TLBI_S2_IPA` / `CMD_CFGI_STE` / `CMD_CFGI_CD` invalidation —
   v1 re-reads STE on every translate (correct but uncached); v2 needs
   a cache + invalidate path.
-- **Eventq / GERROR fault delivery** — STE.config=ABORT,
-  translate faults, and stage-2 PT walk faults should land on the
-  software event queue with MSI raise.
+- ~~**Eventq / GERROR fault delivery**~~ — **landed (this commit)**:
+  `INV_STE`, `STE_FETCH`, and stage-2 PT-walk faults now build a
+  32 B SMMUv3 event record, write to the in-DRAM eventq at
+  `EVENTQ_BASE + (PROD&MASK)*32`, and pulse GIC SPI 762 when
+  `IRQ_CTRL.EVENTQ_IRQEN=1`. Eventq overflow toggles
+  `GERROR.EVTQ_ABT_ERR` (vs `GERRORN`) and pulses SPI 765
+  (`R100_INT_ID_SMMU_GERR`) for `smmu_gerr_intr`. Verified end-to-end
+  by `tests/p11b_smmu_evtq_test.py`.
 - **2LVL stream-table format** — v1 supports LINEAR only (q-sys's
   ≤32-SID R100 uses LINEAR); v2 adds the two-level layout.
 - **Chiplet-0 PCIe-side TBU SID 17** — host-inbound translation via

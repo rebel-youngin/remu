@@ -2441,6 +2441,13 @@ TEST_REGISTRY = {
                  "IPA → 4 KB byte-move"),
         "needs": ("aarch64", "x86_64"),
     },
+    "p11b": {
+        "script": "tests/p11b_smmu_evtq_test.py",
+        "run_name": "p11b-evtq",
+        "desc": ("P11b SMMU eventq + GERROR: deliberate INV_STE fault → "
+                 "verify event lands on in-DRAM eventq + PROD bumped"),
+        "needs": ("aarch64", "x86_64"),
+    },
     "p10": {
         "script": "tests/p10_umd_smoke_test.py",
         "run_name": "p10-umd",

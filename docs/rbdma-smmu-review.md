@@ -146,11 +146,28 @@ In rough priority order:
    - whole-cache invalidate on `CMD_TLBI_NSNH_ALL`.
    Today's CMDQ already recognises and logs every opcode — adding
    the cache itself is the work.
-4. **Eventq / GERROR fault delivery.** STE.config=ABORT, translate
-   faults, and stage-2 PT walk faults should land on the software
-   event queue with MSI raise. `R100SMMUFault` enum exists for the
-   error-code; missing pieces are eventq pointer plumbing,
-   `EVENTQ_PROD/CONS` advance, and the MSI emit on `IRQ_CTRL`.
+4. ~~**Eventq / GERROR fault delivery.**~~ **Landed.** v1's
+   `R100SMMUFault` enum is now mapped to FW event_id (per
+   `q/sys/drivers/smmu/smmu.c:smmu_print_event` table) by
+   `r100_smmu_fault_to_event_id`. `r100_smmu_emit_event` builds the
+   32 B SMMUv3 record (event_id + sid + input_addr + ipa) into the
+   in-DRAM ring at `EVENTQ_BASE + (PROD & MASK)*32`, advances PROD
+   with the wrap bit, and pulses GIC SPI 762
+   (`R100_INT_ID_SMMU_EVT`) when `IRQ_CTRL.EVENTQ_IRQEN=1`. Overflow
+   (next-PROD == CONS) raises `GERROR.EVTQ_ABT_ERR` via
+   `r100_smmu_raise_gerror`, which toggles the bit against
+   `GERRORN` so `smmu_gerr_intr`'s `(GERROR ^ GERRORN) & ACTIVE_MASK`
+   check fires, and pulses GIC SPI 765 (`R100_INT_ID_SMMU_GERR`).
+   `EVENTQ_PROD/CONS` are wired into the regstore — note the
+   registers live on **page 1** of the SMMU MMIO window
+   (offset 0x100A8/AC), so `R100_SMMU_REG_SIZE` had to grow from
+   64 KB → 128 KB. SMMU sysbus device now has 2 IRQ outputs
+   (`evt_irq` index 0, `gerr_irq` index 1) wired in
+   `r100_create_smmu`. End-to-end coverage:
+   `tests/p11b_smmu_evtq_test.py` deliberately faults a SID via
+   STE0.V=0 + RBDMA OTO kick, and asserts both PROD=1 and the
+   slot-0 event payload (`event_id=C_BAD_STE`, `sid=0`,
+   `input_addr=IPA_SRC`).
 5. **2LVL stream-table format.** v1 supports LINEAR only. q-sys's
    ≤32-SID R100 uses LINEAR; 2LVL is purely for capacity headroom.
    `STRTAB_BASE_CFG.fmt` is already cached — `r100_smmu_read_ste`

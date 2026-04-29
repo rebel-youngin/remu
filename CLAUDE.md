@@ -325,20 +325,25 @@ packet sequence) and `./remucli test p11` (same harness with a
 hand-staged 3-level stage-2 page table + STE, RBDMA driven with IPA
 SAR/DAR).
 
-#### r100-smmu (P11 — stage-2 walker, PF only)
+#### r100-smmu (P11 — stage-2 walker, PF only; v2 — eventq + GERROR)
 
 Per-chiplet `r100-smmu` device (QOM type `r100-smmu`, MMIO at
-`R100_SMMU_TCU_BASE = 0x1FF4200000`, 64 KB) with two roles:
+`R100_SMMU_TCU_BASE = 0x1FF4200000`, 128 KB — page 0 holds the
+SMMU-600 control block, page 1 holds `EVENTQ_PROD/CONS` at offset
+`0x100A8/AC`) with three roles:
 
 1. **MMIO surface for FW init paths** (BL2 / FreeRTOS / q-cp).
    `CR0 → CR0ACK` mirroring (with `EVENTQEN`/`SMMUEN`/`CMDQEN` mask),
    `GBPA.UPDATE` auto-clear, `STRTAB_BASE` / `STRTAB_BASE_CFG` cache
-   the stream-table geometry, `CMDQ_PROD` writes walk the CMDQ from
-   the cached `(old_cons, new_prod]` range. Recognised opcodes:
-   `CMD_SYNC` (writes 0 to msiaddr per `CS=SIG_IRQ`),
-   `CMD_TLBI_NH_*` / `CMD_TLBI_S12_*` / `CMD_TLBI_S2_IPA` /
-   `CMD_TLBI_NSNH_ALL` / `CMD_CFGI_STE{,_RANGE}` / `CMD_CFGI_CD{,_ALL}`
-   / `CMD_PREFETCH_*` (logged + advance CONS as no-ops — v1 has no
+   the stream-table geometry, `EVENTQ_BASE` / `EVENTQ_PROD` /
+   `EVENTQ_CONS` + `IRQ_CTRL.{EVENTQ,GERROR}_IRQEN` (mirrored into
+   `IRQ_CTRLACK`) drive the fault-delivery path below, `CMDQ_PROD`
+   writes walk the CMDQ from the cached `(old_cons, new_prod]`
+   range. Recognised opcodes: `CMD_SYNC` (writes 0 to msiaddr per
+   `CS=SIG_IRQ`), `CMD_TLBI_NH_*` / `CMD_TLBI_S12_*` /
+   `CMD_TLBI_S2_IPA` / `CMD_TLBI_NSNH_ALL` /
+   `CMD_CFGI_STE{,_RANGE}` / `CMD_CFGI_CD{,_ALL}` /
+   `CMD_PREFETCH_*` (logged + advance CONS as no-ops — v1 has no
    STE / IOTLB cache to invalidate, every translate re-reads STE).
 
 2. **Public translate API** (`r100_smmu.h`):
@@ -363,12 +368,49 @@ Engines connect via QOM `link<r100-smmu>` properties on
 hardcoded in v1 per Notion REBELQ SMMU Design § 1; multi-VF
 (SIDs 1..4) is v2.
 
-**v1 deliberate omissions** (each unblockable when a workload
-demands it): STE / IOTLB cache (LL chains are 3-4 entries; cost is
-chain reads, not page walks — re-reading STE every translate also
-makes invalidation a free no-op), 2-level stream tables (q-sys uses
-LINEAR for ≤32 SIDs), stage-1 walk, multi-VF, eventq / GERROR fault
-delivery, chiplet-0 PCIe-side TBU SID 17.
+3. **Eventq + GERROR fault delivery (v2 — this commit).** Every
+   `r100_smmu_translate` fault (`INV_STE`, `STE_FETCH`, page-table
+   walk fault) is mapped to a FW event_id by
+   `r100_smmu_fault_to_event_id` (per `q/sys/drivers/smmu/smmu.c`'s
+   `smmu_print_event` table — `INV_STE` → `C_BAD_STE=0x04`,
+   `WALK` → `F_TRANSLATION=0x10`, `STE_FETCH` →
+   `F_STE_FETCH=0x06`), packaged as a 32 B SMMUv3 event record
+   (event_id + sid + input_addr + ipa, words 4-7 reserved), and
+   written to `EVENTQ_BASE_PA + (PROD & MASK) * 32` via
+   `address_space_write` against the chiplet's flat global PA
+   (FW writes already include the chiplet offset, so no
+   `chiplet_id * R100_CHIPLET_OFFSET` add here — distinct from the
+   pre-existing `STRTAB_BASE` double-add bug noted below). PROD
+   then advances with the wrap bit, and GIC SPI 762
+   (`R100_INT_ID_SMMU_EVT`) is pulsed when
+   `IRQ_CTRL.EVENTQ_IRQEN=1`. If `((PROD+1) & MASK) == CONS`
+   (overflow) the new event is dropped, `events_dropped++`, and
+   `r100_smmu_raise_gerror(EVTQ_ABT_ERR)` toggles
+   `SMMU_GERROR.EVTQ_ABT_ERR` against `GERRORN` — FW's
+   `smmu_gerr_intr` reads `(GERROR ^ GERRORN) & ACTIVE_MASK`, so
+   the toggle is what makes the bit "active". GIC SPI 765
+   (`R100_INT_ID_SMMU_GERR`) pulses next. Both IRQ outputs
+   (`evt_irq` index 0, `gerr_irq` index 1) are wired to the
+   chiplet GIC in `r100_create_smmu`. Verified end-to-end by
+   `tests/p11b_smmu_evtq_test.py`: V=0 STE + RBDMA OTO kick →
+   PROD=1 + slot-0 event payload matches.
+
+**Known v1 → v2 carry-over bug.** `r100_smmu_update_strtab` adds
+`chiplet_id * R100_CHIPLET_OFFSET` to `strtab_base_pa`, but FW
+already writes a global PA (you can see this in the cold-boot log:
+chiplet 1 writes `0x4014000000` while the local-PA target is
+`0x2014000000`). Latent because no test currently exercises a
+non-zero chiplet's STRTAB; the v2 eventq path is written without
+the double-add to keep new code correct. Fix scheduled for a
+separate dedicated commit.
+
+**v1 → v2 deferred** (each unblockable when a workload demands it):
+STE / IOTLB cache (LL chains are 3-4 entries; cost is chain reads,
+not page walks — re-reading STE every translate also makes
+invalidation a free no-op), 2-level stream tables (q-sys uses
+LINEAR for ≤32 SIDs), stage-1 walk, multi-VF, chiplet-0 PCIe-side
+TBU SID 17, dedicated HDMA-PA SID 16. **Done in v2:** eventq /
+GERROR fault delivery (this commit).
 
 `r100-pcie-outbound` keeps its `host-ram` alias (P10-fix); it does
 not currently go through this walker. `r100-dnc-cluster` cmd_descr
@@ -379,7 +421,13 @@ table + STE in chiplet-0 DRAM via shm mmap, programs `STRTAB_BASE` /
 `STRTAB_BASE_CFG` / `CR0.SMMUEN=1` via gdbstub, drives a 4 KB RBDMA
 OTO with IPAs `0x100000000` / `0x100001000` mapped to chiplet-0
 PAs `0x07000000` / `0x07800000`, asserts byte-for-byte equality at
-the destination shm region. m5..p5 + p11 regression green.
+the destination shm region. `./remucli test p11b` (this commit)
+mirrors the harness: plants a deliberately invalid STE (`STE0.V=0`)
+at SID 0 and a zeroed in-DRAM eventq, programs `STRTAB_BASE` +
+`EVENTQ_BASE` (log2size=10, 1024-slot ring) + `IRQ_CTRL` (both EVT
+and GERR IRQEN) + `CR0.{SMMUEN,EVENTQEN}=1`, kicks a 4 KB RBDMA
+OTO, asserts `EVENTQ_PROD=1` + slot-0 = `(event_id=C_BAD_STE,
+sid=0, input_addr=IPA_SRC)`. m5..p5 + p11 + p11b regression green.
 
 Both QEMUs `mmap` three shared `memory-backend-file`s under
 `/dev/shm/remu-<name>/` with `share=on`:
@@ -502,6 +550,19 @@ cleanup so SIGKILL'd prior state never poisons the next:
   `m7_smmu_enable` only fires from a kmd-driven `dram_init_done_cb`
   mailbox callback, which we don't trigger, so chiplet-0 SMMU stays at
   reset until the test programs it.
+- `tests/p11b_smmu_evtq_test.py` — `--host` boot, same shm-splice +
+  gdbstub harness (gdbstub on `tcp::4570`). Stages a deliberately
+  invalid STE (`STE0.V=0`) at SID 0 in chiplet-0 DRAM and zeroes a
+  1024-slot eventq region (`log2size=10`, 32 KB), then writes
+  `STRTAB_BASE` + `EVENTQ_BASE` + `IRQ_CTRL.{EVENTQ,GERROR}_IRQEN=1`
+  + `CR0.{SMMUEN,EVENTQEN}=1` via gdbstub and kicks an RBDMA OTO with
+  any source IPA so `r100_smmu_translate` returns `INV_STE`. Asserts
+  the SMMU advanced `EVENTQ_PROD` to 1 and that slot 0 of the in-DRAM
+  ring contains a 32 B SMMUv3 record with `event_id=C_BAD_STE` (0x04),
+  `sid=0`, `input_addr=IPA_SRC`. Verifies the v2 fault-delivery path
+  (`r100_smmu_emit_event`, GIC SPI 762 wiring) end-to-end — the
+  GERROR overflow path is exercised by a follow-up if/when overflow
+  semantics need their own test.
 
 All `./remucli run` invocations write into `output/<name>/` (or
 `output/run-<timestamp>/` if `--name` omitted). Never pass `/tmp/`

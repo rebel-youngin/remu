@@ -286,16 +286,21 @@ static void r100_create_pvt_blocks(MemoryRegion *cfg_mr, int chiplet_id)
     }
 }
 
-/* SMMU-600 TCU. Two roles after P11: (1) MMIO surface for FW init
- * paths — BL2 smmu_early_init polls CR0ACK&EVENTQEN after programming
- * CR0, GBPA UPDATE self-clear, FreeRTOS CMDQ walker handles SYNC and
- * recognises (logs) the TLBI/CFGI/PREFETCH command set; (2) public
- * stage-2 translate API consumed by NPU-side DMA engines. We stash
- * the device pointer into the machine state so engines that consume
- * DVAs (r100-rbdma OTO, r100-hdma LL walker) can resolve their
- * `smmu` QOM link to this chiplet's TCU at machine-realize time.
- * Full lifecycle details in r100_smmu.c. */
-static DeviceState *r100_create_smmu(MemoryRegion *cfg_mr, int chiplet_id)
+/* SMMU-600 TCU. Three roles after P11 + v2-eventq: (1) MMIO surface
+ * for FW init paths — BL2 smmu_early_init polls CR0ACK&EVENTQEN after
+ * programming CR0, GBPA UPDATE self-clear, FreeRTOS CMDQ walker
+ * handles SYNC and recognises (logs) the TLBI/CFGI/PREFETCH command
+ * set; (2) public stage-2 translate API consumed by NPU-side DMA
+ * engines; (3) eventq + GERROR fault delivery — translate faults
+ * land on the in-DRAM eventq and pulse SPI 762 (q-sys's
+ * smmu_event_intr drains them and prints a diagnostic line per
+ * entry); GERROR sources (eventq overflow, future CMDQ_ERR) pulse
+ * SPI 765. We stash the device pointer into the machine state so
+ * engines that consume DVAs (r100-rbdma OTO, r100-hdma LL walker)
+ * can resolve their `smmu` QOM link to this chiplet's TCU at
+ * machine-realize time. Full lifecycle details in r100_smmu.c. */
+static DeviceState *r100_create_smmu(MemoryRegion *cfg_mr, int chiplet_id,
+                                     DeviceState *gic_dev)
 {
     DeviceState *dev;
     SysBusDevice *sbd;
@@ -306,6 +311,19 @@ static DeviceState *r100_create_smmu(MemoryRegion *cfg_mr, int chiplet_id)
     sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
     memory_region_add_subregion(cfg_mr, offset, sysbus_mmio_get_region(sbd, 0));
+
+    /* Both wired SPIs land on this chiplet's GICv3 distributor. q-sys
+     * connects 762 / 765 with `IRQ_TYPE_EDGE` so r100-smmu uses
+     * qemu_irq_pulse on emit / raise. The IRQs are gated by
+     * IRQ_CTRL.{EVENTQ_IRQEN,GERROR_IRQEN} — both bits are set
+     * together by FW after wiring its handlers (see
+     * `q/sys/drivers/smmu/smmu.c:smmu_enable_interrupt`). */
+    sysbus_connect_irq(sbd, 0,
+        qdev_get_gpio_in(gic_dev,
+            R100_INTID_TO_GIC_SPI_GPIO(R100_INT_ID_SMMU_EVT)));
+    sysbus_connect_irq(sbd, 1,
+        qdev_get_gpio_in(gic_dev,
+            R100_INTID_TO_GIC_SPI_GPIO(R100_INT_ID_SMMU_GERR)));
     return dev;
 }
 
@@ -607,7 +625,7 @@ static void r100_chiplet_init(MachineState *machine, int chiplet_id,
      * function (and the chiplet-0 HDMA wiring in r100_machine_realize)
      * can resolve their `smmu` QOM link. */
     R100_SOC_MACHINE(machine)->smmu_dev[chiplet_id] =
-        r100_create_smmu(cfg_mr, chiplet_id);
+        r100_create_smmu(cfg_mr, chiplet_id, gic_dev);
     r100_create_pvt_blocks(cfg_mr, chiplet_id);
     r100_create_dma_pl330(cfg_mr, chiplet_id);
     r100_create_qspi_bridge(cfg_mr, chiplet_id);

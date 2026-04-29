@@ -505,6 +505,27 @@ static inline uint32_t r100_dnc_intid(uint32_t dnc_id, uint32_t cmd_type)
 #define R100_INT_ID_RBDMA0_ERR          977u
 #define R100_INT_ID_RBDMA1              978u
 
+/* SMMU-600 TCU non-secure wired SPIs (q/sys/drivers/smmu/smmu.c:31-67).
+ *   SMMU_EVT_IRQ  = 762 — non-secure event queue overflow / new entry.
+ *                          q-sys connects smmu_event_intr() here, which
+ *                          drains EVENTQ via SMMU_EVENTQ_PROD/CONS and
+ *                          calls smmu_print_event() for every entry.
+ *   SMMU_GERR_IRQ = 765 — global error (CMDQ_ERR / EVTQ_ABT / SFM_ERR /
+ *                          MSI_*_ABT_ERR). q-sys's smmu_gerr_intr() reads
+ *                          GERROR ^ GERRORN, services each active bit,
+ *                          and write-1-clears via GERRORN.
+ * (763 = TCU_CMD_SYNC_NS_ID — referenced by FW source as a label but
+ * the CMD_SYNC completion path uses the in-DRAM MSI write-back trick,
+ * not a wired SPI; we leave 763 unused.)
+ *
+ * IRQ_CTRL gates both lines: q-sys writes IRQ_CTRL =
+ * IRQ_CTRL_GERROR_IRQEN | IRQ_CTRL_EVENTQ_IRQEN, so r100-smmu must
+ * respect both bits before pulsing. Wiring lives in r100_soc.c
+ * r100_create_smmu — both lines on the same chiplet's GIC
+ * (gic_dev[chiplet_id]). The `num-irq = 992` cap fits both. */
+#define R100_INT_ID_SMMU_EVT            762u
+#define R100_INT_ID_SMMU_GERR           765u
+
 /* HDMA register block (q/cp/src/hal/hdma/hdma_if.c hdma_init_dev).
  *   hdma_base = cl_id * CHIPLET_INTERVAL + U_PCIE_CORE_OFFSET +
  *               PCIE_HDMA_OFFSET
