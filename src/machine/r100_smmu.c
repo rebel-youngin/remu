@@ -51,18 +51,46 @@
  *        c) Decode STE0.{V, config}:
  *             - !V or ABORT → fault.
  *             - BYPASS → identity.
- *             - S1_TRANS → v1 stage-1 not implemented, identity +
- *               LOG_UNIMP. q-cp's `smmu_init_ste` sets STE1.S1DSS=BYPASS
- *               for the 4 SIDs it leaves at S1_TRANS, so the effective
- *               behaviour is identity anyway — v1 collapses that to
- *               "identity + log once" and skips the CD walk. v2 will
- *               walk CD per SSID.
+ *             - S1_TRANS → real stage-1 walk (P10):
+ *                 * Read STE1.S1DSS to gate stage-1.
+ *                   q-sys's `smmu_init_ste` (SIDs 0..4) leaves
+ *                   `S1DSS=BYPASS` so stage-1 is skipped and the
+ *                   IOVA is passed through unchanged (effective
+ *                   identity for these SIDs, because their
+ *                   config doesn't include S2_TRANS yet — that
+ *                   gets ORed in later by `smmu_s2_enable`).
+ *                   `smmu_init_ste_bypass` (SIDs 8..12) sets
+ *                   `S1DSS=SUBSTREAM0` so stage-1 walks
+ *                   `CD[0]` from `STE0.S1ContextPtr`.
+ *                 * Read CD[0] (64 B / 8 dwords; matches QEMU's
+ *                   `CD` struct in `smmuv3-internal.h`) and
+ *                   decode TT0 / TT1 fields. q-sys's
+ *                   `smmu_init_cd_bypass` programs T0SZ=20,
+ *                   TG0=4 KB, IPS=40, EPD1=1 (TT1 disabled),
+ *                   AA64=1, AFFD=1, R=1, ASET=1, VALID=1 with
+ *                   TTB0 = `SMMU_BYPASS_PT + CHIPLET_BASE_ADDR`
+ *                   — a stage-1 PT (`smmu_create_bypass_table`)
+ *                   whose HTID0 entry identity-maps VA
+ *                   `0x40000000..0x8000000000` for the local
+ *                   chiplet, HTID1..15 map the same VA window
+ *                   to remote chiplets at `c*0x10000000000 +
+ *                   0x40000000`. We hand the populated cfg to
+ *                   QEMU's `smmu_ptw_64_s1`.
+ *               No more "v1 collapses S1_TRANS to identity"
+ *               shortcut. SSID != 0 stays unimp (SS-SS lookup is
+ *               v2).
  *             - S2_TRANS / ALL_TRANS → build SMMUTransCfg from
  *               STE2/STE3 and dispatch to QEMU's `smmu_ptw()` with
  *               stage=SMMU_STAGE_2. The walker reads PTEs through
  *               `address_space_memory`, so STE3 (S2TTB) is converted
  *               to a global PA (chiplet-local + chiplet_id *
  *               R100_CHIPLET_OFFSET) before we hand it to the cfg.
+ *               For ALL_TRANS the FW always pairs S2_TRANS with
+ *               STE1.S1DSS=BYPASS (`smmu_init_ste`'s SIDs 0..4),
+ *               so stage-1 is skipped and the IOVA == IPA fed to
+ *               stage-2 — v1 collapses that to a stage-2-only
+ *               walk (no nested decode). v2 honours S1DSS for
+ *               ALL_TRANS too.
  *      Faults route through `r100_smmu_emit_event` (below) so FW's
  *      `smmu_event_intr` handler sees a real entry on the eventq.
  *
@@ -350,6 +378,105 @@ DECLARE_INSTANCE_CHECKER(R100SMMUState, R100_SMMU, TYPE_R100_SMMU)
 #define R100_STE2_S2AA64               BIT_ULL(51)
 #define R100_STE2_S2AFFD               BIT_ULL(53)
 #define R100_STE2_S2R                  BIT_ULL(58)
+
+/* STE0 stage-1 fields (`q-sys/.../smmu.h:321-329`). The CD pointer
+ * `S1ContextPtr` is the chiplet-local PA of the CD table; the FW
+ * masks it by `CHIPLET_OFFSET - 1` before writing, so we need to
+ * add `chiplet_id * R100_CHIPLET_OFFSET` to recover the global PA
+ * for `address_space_*`. */
+#define R100_STE0_S1CONTEXTPTR_S       6
+#define R100_STE0_S1CONTEXTPTR_M       (0x3FFFFFFFFFFFULL << \
+                                        R100_STE0_S1CONTEXTPTR_S)
+
+/* STE1.S1DSS — stage-1 default substream behaviour (`q-sys/.../
+ * smmu.h:331-335`). FW programs SUBSTREAM0 on the bypass STEs
+ * (smmu_init_ste_bypass; we walk CD[0]) and BYPASS on the regular
+ * STEs (smmu_init_ste; we skip stage-1 → IOVA pass-through). */
+#define R100_STE1_S1DSS_S              0
+#define R100_STE1_S1DSS_M              (0x3ULL << R100_STE1_S1DSS_S)
+#define R100_STE1_S1DSS_TERMINATE      (0x0ULL << R100_STE1_S1DSS_S)
+#define R100_STE1_S1DSS_BYPASS         (0x1ULL << R100_STE1_S1DSS_S)
+#define R100_STE1_S1DSS_SUBSTREAM0     (0x2ULL << R100_STE1_S1DSS_S)
+
+/* CD field decode. SMMUv3 CD is 64 B / 8 dwords / 16 words; the FW
+ * uses `struct context_desc { uint64_t val[6]; uint64_t rsvd[2]; }`
+ * with the same layout. r100_smmu reads the 64 bytes into a `union`
+ * with both `uint32_t word[16]` (matches QEMU's `CD` struct in
+ * `smmuv3-internal.h`) and `uint64_t val[8]` (matches FW's struct).
+ *
+ * Layout (per Arm SMMUv3 spec § 5.3 + cross-checked vs q-sys's
+ * `CD0_*` macros and QEMU's `CD_*` macros):
+ *
+ *   word[0]  bits[5:0]   T0SZ
+ *            bits[7:6]   TG0
+ *            bit[14]     EPD0
+ *            bit[15]     ENDI
+ *            bits[21:16] T1SZ
+ *            bits[23:22] TG1
+ *            bit[30]     EPD1
+ *            bit[31]     VALID
+ *   word[1]  bits[2:0]   IPS
+ *            bit[3]      AFFD
+ *            bits[7:6]   TBI
+ *            bit[9]      AARCH64
+ *            bit[10]     HD (must be 0)
+ *            bit[11]     HA (must be 0)
+ *            bit[12]     S
+ *            bit[13]     R
+ *            bit[14]     A
+ *            bits[31:16] ASID
+ *   word[2]  TTB0[31:4] (bits[3:0] are MIR/HAD/CnP)
+ *   word[3]  bits[18:0]  TTB0[51:32]
+ *   word[4]  TTB1[31:4]
+ *   word[5]  bits[18:0]  TTB1[51:32]
+ *   word[6]  MAIR
+ *   word[7]  reserved / etc
+ *
+ * Macros mirror QEMU's `CD_*` style so the decoder reads naturally
+ * if a future contributor cross-references `smmuv3-internal.h`. */
+#define R100_CD_VALID(w)        (((w)[0] >> 31) & 0x1U)
+#define R100_CD_AARCH64(w)      (((w)[1] >>  9) & 0x1U)
+#define R100_CD_S(w)            (((w)[1] >> 12) & 0x1U)
+#define R100_CD_HA(w)           (((w)[1] >> 11) & 0x1U)
+#define R100_CD_HD(w)           (((w)[1] >> 10) & 0x1U)
+#define R100_CD_A(w)            (((w)[1] >> 14) & 0x1U)
+#define R100_CD_R(w)            (((w)[1] >> 13) & 0x1U)
+#define R100_CD_AFFD(w)         (((w)[1] >>  3) & 0x1U)
+#define R100_CD_TBI(w)          (((w)[1] >>  6) & 0x3U)
+#define R100_CD_IPS(w)          (((w)[1] >>  0) & 0x7U)
+#define R100_CD_ASID(w)         (((w)[1] >> 16) & 0xFFFFU)
+#define R100_CD_ENDI(w)         (((w)[0] >> 15) & 0x1U)
+#define R100_CD_TSZ(w, sel)     (((w)[0] >> (16 * (sel) +  0)) & 0x3FU)
+#define R100_CD_TG(w, sel)      (((w)[0] >> (16 * (sel) +  6)) & 0x3U)
+#define R100_CD_EPD(w, sel)     (((w)[0] >> (16 * (sel) + 14)) & 0x1U)
+#define R100_CD_TTB(w, sel)                                       \
+    ((((uint64_t)((w)[(sel) * 2 + 3] & 0x7FFFFU)) << 32) |        \
+     ((uint64_t)((w)[(sel) * 2 + 2] & ~0xFU)))
+
+/* CD.IPS → effective output address bits. Same table as
+ * `smmu_ptw_64_s2`'s S2PS field (and oas2bits in
+ * smmuv3-internal.h). */
+static inline uint8_t r100_cd_ips_to_bits(uint8_t ips)
+{
+    static const uint8_t tbl[] = { 32, 36, 40, 42, 44, 48, 48, 48 };
+
+    return tbl[ips & 0x7];
+}
+
+/* CD.TGx → granule shift (matches QEMU's `tg2granule`). The FW
+ * uses 4 KB on both TT0 (CD0_TG0_4KB) and TT1; non-4 KB granules
+ * happen on TF-A's RoT init paths only and aren't on the engine
+ * translate path. */
+static inline uint8_t r100_cd_tg_to_granule_sz(uint8_t tg, int sel)
+{
+    switch (tg) {
+    case 0:  return sel ? 0  : 12;
+    case 1:  return sel ? 14 : 16;
+    case 2:  return sel ? 12 : 14;
+    case 3:  return sel ? 16 :  0;
+    default: return 0;
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /* Debug-tail helper                                                   */
@@ -821,7 +948,12 @@ static uint8_t r100_smmu_s2tg_to_granule_sz(uint64_t s2tg)
 /* Translate an `SMMUPTWErrorType` from `smmu-common.h` into the
  * R100-specific fault enum. The cardinality is 1:1 today; this
  * indirection keeps the public header decoupled from QEMU's SMMU
- * internals. */
+ * internals. The `S2_*` enum names date from v1's stage-2-only
+ * walker; the same enum doubles for stage-1 faults post-P10
+ * (no point in proliferating S1_TRANSLATION / S1_PERMISSION / …
+ * variants that the FW eventq consumer can't tell apart anyway —
+ * SMMUv3 events report the fault type through `event_id`, which
+ * is identical for S1 and S2 translation faults). */
 static R100SMMUFault r100_smmu_map_ptw_err(SMMUPTWEventType type)
 {
     switch (type) {
@@ -871,6 +1003,139 @@ static bool r100_smmu_read_ste(R100SMMUState *s, uint32_t sid,
                       s->chiplet_id, sid, (uint64_t)ste_pa, (int)mr);
         return false;
     }
+    return true;
+}
+
+/*
+ * Read the 64-byte CD at @cd_chiplet_local_pa (the chiplet-local
+ * S1ContextPtr extracted from STE0). We add `chiplet_id *
+ * R100_CHIPLET_OFFSET` here so the walker reads the right CD on
+ * non-zero chiplets. `cd_words` is a 16-element u32 array matching
+ * QEMU's `CD` struct layout (and the FW's `struct context_desc`
+ * binary layout) — see banner comment on R100_CD_* macros above.
+ */
+static bool r100_smmu_read_cd(R100SMMUState *s, hwaddr cd_chiplet_local_pa,
+                              uint32_t cd_words[16])
+{
+    hwaddr cd_pa;
+    MemTxResult mr;
+
+    cd_pa = cd_chiplet_local_pa +
+            (uint64_t)s->chiplet_id * R100_CHIPLET_OFFSET;
+    mr = address_space_read(&address_space_memory, cd_pa,
+                            MEMTXATTRS_UNSPECIFIED, cd_words, 64);
+    if (mr != MEMTX_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "r100-smmu cl=%u: CD fetch failed cd_pa=0x%"
+                      PRIx64 " mr=%d\n",
+                      s->chiplet_id, (uint64_t)cd_pa, (int)mr);
+        return false;
+    }
+    return true;
+}
+
+/*
+ * Build a stage-1 SMMUTransCfg from a freshly-read CD. Returns
+ * false on any "C_BAD_CD" condition QEMU's `decode_cd` rejects —
+ * matches Arm SMMUv3 spec § 5.3 (V=1 / AA64=1 / A=1 / S=0 / HA=0
+ * / HD=0 / per-TT TSZ in [16,39] / per-TT granule ∈ {12,14,16}).
+ *
+ * Both TT0 and TT1 are populated; `select_tt(cfg, iova)` in
+ * `smmu_ptw_64_s1` picks the right one based on the high bits of
+ * the input IOVA. Disabled TTs (CD.EPD{0,1}=1) are flagged so
+ * `select_tt` skips them — q-sys's `smmu_init_cd_bypass` sets
+ * EPD1=1 because the bypass PT only covers the low VA half (TT0
+ * range = `0..2^(64-T0SZ)`).
+ *
+ * On success, `cfg->tt[i].ttb` holds a *global* PA — the FW writes
+ * a chiplet-local PA into the CD (`SMMU_BYPASS_PT +
+ * CHIPLET_BASE_ADDR`, which is already global, but smmu_init_cd
+ * stores 0 for TT0 in the PF user-CD path), so we add `chiplet_id
+ * * CHIPLET_OFFSET` only when TTB looks chiplet-local (top 12
+ * bits zero). The FW's bypass init writes a global TTB so this is
+ * a no-op in the umd path; the conversion is here for forward
+ * compatibility with `smmu_activate_ctx` (which writes a different
+ * pt_base for q-cp's per-context address spaces).
+ */
+static bool r100_smmu_build_s1cfg(R100SMMUState *s,
+                                  const uint32_t cd[16],
+                                  SMMUTransCfg *cfg)
+{
+    uint8_t  oas;
+    int      i;
+
+    /* Sanity-check the CD. We deliberately *don't* require CD.A=1
+     * (TERM_MODEL=1 enforcement in QEMU's strict path) because q-sys's
+     * `smmu_init_cd_bypass` leaves CD_A=0 (the line `val |= CD0_A;`
+     * is commented out in `drivers/smmu/smmu.c`); real SMMU-600
+     * silicon doesn't fault that bypass CD, and we'd defeat the
+     * whole "make the FW SMMU init's impact real" point if we
+     * rejected the FW's own programming. CD.S / CD.HA / CD.HD must
+     * still be 0 — those gate features (stalls, hardware AF/DBM
+     * updates) the v1 walker doesn't model, and the FW programs them
+     * 0 anyway. */
+    if (!R100_CD_VALID(cd) || !R100_CD_AARCH64(cd) ||
+        R100_CD_S(cd) || R100_CD_HA(cd) || R100_CD_HD(cd)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "r100-smmu cl=%u: bad CD val[0]=0x%x val[1]=0x%x"
+                      " (V=%u AA64=%u S=%u HA=%u HD=%u)\n",
+                      s->chiplet_id, cd[0], cd[1],
+                      R100_CD_VALID(cd), R100_CD_AARCH64(cd),
+                      R100_CD_S(cd), R100_CD_HA(cd), R100_CD_HD(cd));
+        return false;
+    }
+
+    oas = r100_cd_ips_to_bits(R100_CD_IPS(cd));
+
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->stage         = SMMU_STAGE_1;
+    cfg->aa64          = true;
+    cfg->oas           = oas;
+    cfg->tbi           = R100_CD_TBI(cd);
+    cfg->asid          = R100_CD_ASID(cd);
+    cfg->affd          = R100_CD_AFFD(cd);
+    cfg->record_faults = R100_CD_R(cd);
+    cfg->s2cfg.vmid    = -1;
+
+    for (i = 0; i < 2; i++) {
+        SMMUTransTableInfo *tt = &cfg->tt[i];
+        uint8_t tsz = R100_CD_TSZ(cd, i);
+        uint8_t tg  = R100_CD_TG(cd, i);
+        uint8_t gran;
+        uint64_t ttb;
+
+        tt->disabled = R100_CD_EPD(cd, i);
+        if (tt->disabled) {
+            continue;
+        }
+
+        if (tsz < 16 || tsz > 39 || R100_CD_ENDI(cd)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "r100-smmu cl=%u: bad CD TT%d tsz=%u endi=%u\n",
+                          s->chiplet_id, i, tsz, R100_CD_ENDI(cd));
+            return false;
+        }
+        gran = r100_cd_tg_to_granule_sz(tg, i);
+        if (gran != 12 && gran != 14 && gran != 16) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "r100-smmu cl=%u: bad CD TT%d granule"
+                          " (tg=%u → gran=%u)\n",
+                          s->chiplet_id, i, tg, gran);
+            return false;
+        }
+        if (gran != 16) {
+            cfg->oas = MIN(cfg->oas, 48);
+        }
+        tt->granule_sz = gran;
+        tt->tsz        = tsz;
+        ttb            = R100_CD_TTB(cd, i);
+        if (ttb && (ttb >> 36) == 0) {
+            ttb += (uint64_t)s->chiplet_id * R100_CHIPLET_OFFSET;
+        }
+        tt->ttb        = ttb;
+        tt->had        = false;
+    }
+
     return true;
 }
 
@@ -1087,29 +1352,180 @@ void r100_smmu_translate(R100SMMUState *s, uint32_t sid, uint32_t ssid,
         return;
     }
     if (cfg_field == R100_STE0_CONFIG_S1_TRANS) {
-        /* v1: stage-1 walker not implemented. q-sys leaves SIDs
-         * 0..4 at S1_TRANS with `STE1.S1DSS=BYPASS`, so the
-         * effective behaviour is identity anyway — but log
-         * once-per-sid so v2 work has a paper trail. No event
-         * emit: this is a "missing feature" path, not a fault. */
-        qemu_log_mask(LOG_UNIMP,
-                      "r100-smmu cl=%u: S1_TRANS sid=%u — stage-1 "
-                      "walk not implemented in v1, identity\n",
-                      s->chiplet_id, sid);
+        /* P10: real stage-1 walk. Dispatch by STE1.S1DSS:
+         *
+         *   - SUBSTREAM0: walk CD[0] from STE0.S1ContextPtr. The
+         *     FW's `smmu_init_ste_bypass` programs this for the
+         *     bypass SIDs (8..12), with a CD pointing at
+         *     SMMU_BYPASS_PT.
+         *   - BYPASS: stage-1 disabled → IOVA pass-through. The
+         *     FW's `smmu_init_ste` programs this for the regular
+         *     SIDs (0..4) so engines see identity until
+         *     `smmu_s2_enable` ORs in S2_TRANS.
+         *   - TERMINATE: any non-substream0 transaction faults.
+         *     We don't see this on a translate (engines don't
+         *     issue substream IDs to v1 r100_hdma / r100_rbdma),
+         *     so log + identity for safety. v2 will fault.
+         *
+         * SSID != 0 stays unimp (substream-aware lookup). The
+         * `r100_hdma_translate` caller passes ssid=0 today; if a
+         * future caller passes a real SSID we LOG_UNIMP and walk
+         * CD[0] anyway (the bypass PT is the same for all
+         * substreams). */
+        uint64_t ste1 = ste[1];
+        uint64_t s1dss = ste1 & R100_STE1_S1DSS_M;
+        uint64_t s1ctxptr = (ste0 & R100_STE0_S1CONTEXTPTR_M);
+        uint32_t cd[16];
+        const char *dss_str =
+            (s1dss == R100_STE1_S1DSS_TERMINATE) ? "TERMINATE" :
+            (s1dss == R100_STE1_S1DSS_BYPASS)    ? "BYPASS" :
+            (s1dss == R100_STE1_S1DSS_SUBSTREAM0)? "SUBSTREAM0" :
+                                                   "RES";
+
+        r100_smmu_emit_debug(s,
+                             "smmu cl=%u s1_dispatch sid=%u s1dss=%s"
+                             " s1ctxptr=0x%" PRIx64 " ssid=%u\n",
+                             s->chiplet_id, sid, dss_str,
+                             (uint64_t)s1ctxptr, ssid);
+
+        if (s1dss == R100_STE1_S1DSS_BYPASS) {
+            out->ok = true;
+            out->pa = dva;
+            s->translates_bypass++;
+            r100_smmu_emit_debug(s,
+                                 "smmu cl=%u xlate_out sid=%u dva=0x%"
+                                 PRIx64 " bypass=s1dss_bypass pa=0x%"
+                                 PRIx64 "\n",
+                                 s->chiplet_id, sid, (uint64_t)dva,
+                                 (uint64_t)dva);
+            return;
+        }
+        if (s1dss == R100_STE1_S1DSS_TERMINATE) {
+            qemu_log_mask(LOG_UNIMP,
+                          "r100-smmu cl=%u: S1DSS=TERMINATE sid=%u "
+                          "ssid=%u — v1 falls through to identity\n",
+                          s->chiplet_id, sid, ssid);
+            out->ok = true;
+            out->pa = dva;
+            s->translates_bypass++;
+            r100_smmu_emit_debug(s,
+                                 "smmu cl=%u xlate_out sid=%u dva=0x%"
+                                 PRIx64 " bypass=s1dss_term_v1 pa=0x%"
+                                 PRIx64 "\n",
+                                 s->chiplet_id, sid, (uint64_t)dva,
+                                 (uint64_t)dva);
+            return;
+        }
+        if (ssid != 0) {
+            qemu_log_mask(LOG_UNIMP,
+                          "r100-smmu cl=%u: substream lookup sid=%u "
+                          "ssid=%u — v1 walks CD[0]\n",
+                          s->chiplet_id, sid, ssid);
+        }
+
+        if (!r100_smmu_read_cd(s, s1ctxptr, cd)) {
+            out->ok = false;
+            out->fault = R100_SMMU_FAULT_STE_FETCH;
+            s->translates_fault++;
+            r100_smmu_emit_debug(s,
+                                 "smmu cl=%u xlate_out sid=%u dva=0x%"
+                                 PRIx64 " FAULT cd_fetch s1ctxptr=0x%"
+                                 PRIx64 "\n",
+                                 s->chiplet_id, sid, (uint64_t)dva,
+                                 (uint64_t)s1ctxptr);
+            r100_smmu_emit_event(s,
+                r100_smmu_fault_to_event_id(out->fault), sid, dva);
+            return;
+        }
+
+        if (!r100_smmu_build_s1cfg(s, cd, &cfg)) {
+            out->ok = false;
+            out->fault = R100_SMMU_FAULT_INV_STE;
+            s->translates_fault++;
+            r100_smmu_emit_debug(s,
+                                 "smmu cl=%u xlate_out sid=%u dva=0x%"
+                                 PRIx64 " FAULT inv_ste reason=bad_cd"
+                                 " cd[0]=0x%x cd[1]=0x%x\n",
+                                 s->chiplet_id, sid, (uint64_t)dva,
+                                 cd[0], cd[1]);
+            r100_smmu_emit_event(s,
+                r100_smmu_fault_to_event_id(out->fault), sid, dva);
+            return;
+        }
+
+        /* One line per CD decode for the debug tail — TT0 is the
+         * "interesting" half (TT1 is disabled by FW's bypass CD
+         * via EPD1=1). */
+        r100_smmu_emit_debug(s,
+                             "smmu cl=%u cd sid=%u v=1 aa64=%d ips=%u"
+                             " oas=%u tbi=%u asid=%u affd=%d r=%d"
+                             " tt0_tsz=%u tt0_gran=%u tt0_ttb=0x%"
+                             PRIx64 " tt0_dis=%d tt1_dis=%d\n",
+                             s->chiplet_id, sid,
+                             cfg.aa64, R100_CD_IPS(cd), cfg.oas,
+                             cfg.tbi, cfg.asid, cfg.affd,
+                             cfg.record_faults,
+                             cfg.tt[0].tsz, cfg.tt[0].granule_sz,
+                             (uint64_t)cfg.tt[0].ttb,
+                             cfg.tt[0].disabled, cfg.tt[1].disabled);
+        r100_smmu_emit_debug(s,
+                             "smmu cl=%u ptw_s1 sid=%u dva=0x%" PRIx64
+                             " ttb=0x%" PRIx64 " tsz=%u gran=%u"
+                             " perm=%s\n",
+                             s->chiplet_id, sid, (uint64_t)dva,
+                             (uint64_t)cfg.tt[0].ttb,
+                             cfg.tt[0].tsz, cfg.tt[0].granule_sz,
+                             acc_str);
+
+        rc = smmu_ptw(NULL, &cfg, dva, perm, &tlbe, &info);
+        if (rc != 0) {
+            out->ok = false;
+            out->fault = r100_smmu_map_ptw_err(info.type);
+            out->fault_addr = info.addr ? info.addr : dva;
+            s->translates_fault++;
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "r100-smmu cl=%u TRANSLATE FAULT (s1) sid=%u"
+                          " dva=0x%" PRIx64 " perm=%d → %s @ 0x%"
+                          PRIx64 " (ttb=0x%" PRIx64 " tsz=%u gran=%u)\n",
+                          s->chiplet_id, sid, dva, (int)perm,
+                          r100_smmu_fault_str(out->fault),
+                          out->fault_addr, cfg.tt[0].ttb,
+                          cfg.tt[0].tsz, cfg.tt[0].granule_sz);
+            r100_smmu_emit_debug(s,
+                                 "smmu cl=%u xlate_out sid=%u dva=0x%"
+                                 PRIx64 " FAULT(s1) %s @ 0x%" PRIx64
+                                 " ttb=0x%" PRIx64 " tsz=%u gran=%u\n",
+                                 s->chiplet_id, sid, (uint64_t)dva,
+                                 r100_smmu_fault_str(out->fault),
+                                 (uint64_t)out->fault_addr,
+                                 (uint64_t)cfg.tt[0].ttb,
+                                 cfg.tt[0].tsz, cfg.tt[0].granule_sz);
+            r100_smmu_emit_event(s,
+                r100_smmu_fault_to_event_id(out->fault), sid,
+                out->fault_addr);
+            return;
+        }
+
         out->ok = true;
-        out->pa = dva;
-        s->translates_bypass++;
+        out->pa = tlbe.entry.translated_addr +
+                  (dva & tlbe.entry.addr_mask);
+        s->translates_ok++;
         r100_smmu_emit_debug(s,
                              "smmu cl=%u xlate_out sid=%u dva=0x%" PRIx64
-                             " bypass=s1_not_impl pa=0x%" PRIx64 "\n",
+                             " ok(s1) pa=0x%" PRIx64 " page_base=0x%"
+                             PRIx64 " mask=0x%" PRIx64 "\n",
                              s->chiplet_id, sid, (uint64_t)dva,
-                             (uint64_t)dva);
+                             (uint64_t)out->pa,
+                             (uint64_t)tlbe.entry.translated_addr,
+                             (uint64_t)tlbe.entry.addr_mask);
         return;
     }
     /* S2_TRANS or ALL_TRANS — both consume STE2/STE3 stage-2 fields.
-     * For ALL_TRANS, q-sys's `smmu_init_ste_bypass` sets the CD's
-     * stage-1 to bypass so the IPA fed to stage-2 == the IOVA fed
-     * by the master. v1 collapses both to a stage-2-only walk. */
+     * For ALL_TRANS, q-sys's `smmu_init_ste` sets STE1.S1DSS=BYPASS
+     * (stage-1 skipped), so the IPA fed to stage-2 == the IOVA fed
+     * by the master. v1 collapses ALL_TRANS to a stage-2-only walk
+     * (no nested decode). v2 honours S1DSS for ALL_TRANS and walks
+     * CD when S1DSS=SUBSTREAM0. */
 
     if (!r100_smmu_build_s2cfg(s, ste, &cfg)) {
         out->ok = false;

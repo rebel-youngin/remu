@@ -75,18 +75,60 @@
  * partitions keep r100-pcie-outbound's PF-window reads (0xC0..0xFF)
  * from colliding with this device's channel-driven 0x80..0xBF range.
  *
- * SMMU note (P11): this engine's NPU-side SAR/DAR are DVAs that
- * traverse the chiplet's SMMU-600 on real silicon. Per Notion REBELQ
- * SMMU Design § 1, HDMA-IPA uses SID 0 on PF (LUT entries with
- * SID=17 / SSID.V=0 select the bypass region — that's a kmd/q-cp
- * configuration choice, not a property of REMU). r100_hdma_lli_{wr,
- * rd,d2d} now translate via `r100_smmu_translate` before each
- * `address_space_*` call. When CR0.SMMUEN=0 (early boot, single-
- * QEMU `--name` runs, p5 test) or the engine has no smmu link, the
- * translate falls through to identity — matches Arm-SMMU pre-enable
- * bypass and keeps existing tests working. The walker handles
- * stage-2 only in v1 (q-sys flips STE0.config to ALL_TRANS with
- * S1_DSS=BYPASS); stage-1 + multi-VF + IOTLB cache are v2.
+ * SMMU note (P11/P10): this engine's NPU-side addresses traverse
+ * the chiplet's SMMU-600 on real silicon. Two SIDs are in play
+ * because the FW programs different STE configs for the LL chain
+ * cursor and the LLI's payload SAR/DAR:
+ *
+ *   - LL chain cursor (the `LLP` register q-cp programs in
+ *     `cb_parse_linked_dma` after `+ PF_SYSTEM_IPA_BASE`) is a
+ *     genuine PF system IPA. It needs stage-2 translation through
+ *     STE 0 (`STE0_CONFIG_ALL_TRANS` after `smmu_s2_enable(0)`),
+ *     and FW's stage-2 PT (`ptw_s2t_pf[]`'s SYSTEM region) maps
+ *     IPA `0x40000000..0x80000000` → PA `0x0..0x40000000` so the
+ *     chain in q-cp's CPVA-region rl_malloc'd buffer resolves
+ *     cleanly.
+ *
+ *   - LLI payload SAR/DAR (the `sar.reg` / `dar.reg` words inside
+ *     each `dw_hdma_v0_lli`) are *not* IPA-transformed by q-cp —
+ *     they come straight from the kmd's per-cb chain. The FW
+ *     pre-programs STE 8 (`smmu_init_ste_bypass(0)` from
+ *     `smmu_s2_enable`) with `STE0_CONFIG_S1_TRANS` + a CD that
+ *     points at `SMMU_BYPASS_PT`, a stage-1 PT
+ *     (`smmu_create_bypass_table`) whose HTID0 entry identity-maps
+ *     VA `0x40000000..0x8000000000` for the local chiplet (HTID1..15
+ *     map the same VA window to remote chiplets at
+ *     `chiplet_id*0x10000000000`). r100-smmu walks that PT honestly
+ *     via QEMU's `smmu_ptw_64` stage-1 path so the FW's bypass init
+ *     has its silicon-equivalent effect: addresses inside the
+ *     mapped window pass through cleanly, addresses outside fault
+ *     back through the eventq + GERROR path same as silicon.
+ *
+ * On real silicon the per-channel SID is set by `SM_HDMA_SID_LUT`
+ * (`sid_mapper.c`): regular HDMA channels use `func_id` (= 0 on PF
+ * → stage-2 ALL_TRANS via the user PT), and the last channel (the
+ * `dev_hdma_ch` reserved by `hdma_init_ch_all`) uses `func_id +
+ * BYPASS_START_SID` (= 8 → stage-1 bypass). REMU folds the SAR/DAR
+ * onto SID 8 unconditionally because q-cp's `cb_parse_linked_dma`
+ * doesn't IPA-transform the LLI payload, so the bypass STE is the
+ * matching FW init — the `SM_HDMA_SID_LUT` shadow's per-channel
+ * dispatch can wait on multi-VF (P11 v2). When a workload puts a
+ * VA outside the bypass-PT window into an LLI's SAR/DAR (e.g.
+ * raw host IOVA `0x0b800000` from the umd's `MAP_USERPTR` HDMA
+ * chain), the walker faults faithfully and the eventq carries
+ * an `F_TRANSLATION` event — same path as silicon. The fix isn't
+ * to bypass-shortcut here; it's either (a) extend the FW bypass
+ * PT to cover the kmd's IOVA range, or (b) teach REMU that an
+ * HDMA RD's SAR is by convention a raw host IOVA (per
+ * `kmd/.../memory.c:rbln_dma_host_convert`'s "MAP_USERPTR pages
+ * use the raw IOVA" comment) and route via the host-leg
+ * OP_READ_REQ chardev path regardless of the `>=
+ * REMU_HOST_PHYS_BASE` heuristic. Tracked in
+ * `docs/debugging.md` → "P10 …".
+ *
+ * Pre-`CR0.SMMUEN` (single-QEMU runs, p5 test, early boot) the
+ * translate is identity for *both* SIDs — no regression on existing
+ * regression tests.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -316,27 +358,49 @@ bool r100_hdma_emit_read_req(R100HDMAState *s, uint32_t req_id,
 /* P11 — SMMU stage-2 translate hook                                   */
 /* ------------------------------------------------------------------ */
 
-/* SID for HDMA-IPA path (Notion REBELQ SMMU Design § 1: "0–4:
- * DNC(dma) / RBDMA / HDMA-IPA, PF + VF0–3"). v1 hardcodes PF = SID 0;
- * the bypass-LUT "Device HDMA (PA mode)" path lives at SID 16, which
- * STE0.config=BYPASS gives identity for free — we don't need to dispatch
- * by SID for v1. Multi-VF (SID 1..4) is gated on workload + P11 v2. */
-#define R100_HDMA_SMMU_SID      0
+/*
+ * SID 0 ("HDMA-IPA, PF") for the LL chain cursor — the address
+ * `cb_parse_linked_dma` writes into the channel's LLP register is
+ * a stage-2 IPA in the SYSTEM region (`PF_SYSTEM_IPA_BASE` +
+ * CPVA-stripped `rl_malloc` pointer). q-sys's `smmu_s2_enable(0)`
+ * sets STE0.config = ALL_TRANS with the user-PT vttb, so the
+ * walker correctly resolves it.
+ *
+ * SID 8 ("HDMA-IPA bypass, PF + 0") for the LLI's payload SAR/DAR
+ * — q-cp does not IPA-transform these fields. q-sys's
+ * `smmu_init_ste_bypass(0)` programs STE 8 = S1_TRANS with a CD
+ * pointing at `SMMU_BYPASS_PT` (which identity-maps
+ * `0x40000000..0x8000000000`). v1's walker treats S1_TRANS as
+ * identity, so any address on SID 8 passes through unchanged —
+ * which lines up with the umd's expectation that SAR/DAR are PAs
+ * (or self-mapped IPAs) the byte mover can dereference directly.
+ *
+ * v1 hardcodes PF (func_id=0) on both SIDs. Multi-VF (SID 1..4
+ * for IPA + SID 9..12 for bypass) is gated on workload + P11 v2.
+ * The Notion REBELQ SMMU Design § 1 documents the per-channel
+ * `SM_HDMA_SID_LUT` (sid_mapper.c) that selects between these on
+ * real silicon — see file-banner SMMU note above.
+ */
+#define R100_HDMA_SMMU_SID_LL_PTR   0u   /* LL chain cursor — IPA → stage-2 */
+#define R100_HDMA_SMMU_SID_PAYLOAD  8u   /* LLI SAR/DAR — bypass via S1_TRANS */
 
 /*
  * Translate a chiplet-local DVA through the chiplet's r100-smmu.
  * Same shape as `r100_rbdma_translate`: identity passthrough when
  * the SMMU isn't wired or `CR0.SMMUEN=0` (early boot, p5 test
- * harness), else stage-2 walk.
+ * harness), else dispatch via the requested SID.
  *
- * `out_pa` is chiplet-local on success. The HDMA caller is
- * responsible for adding `chiplet_id * R100_CHIPLET_OFFSET` if the
- * resulting access goes through `&address_space_memory` (the d2d
- * loop and the LL chain reads do; the host-leg paths chunk through
- * `hdma` chardev frames where the address is interpreted on the
- * remote side and never touches our flat global).
+ * `sid` selects which STE the walker reads — see
+ * R100_HDMA_SMMU_SID_{LL_PTR,PAYLOAD} above. `out_pa` is
+ * chiplet-local on success. The HDMA caller is responsible for
+ * adding `chiplet_id * R100_CHIPLET_OFFSET` if the resulting
+ * access goes through `&address_space_memory` (the d2d loop and
+ * the LL chain reads do; the host-leg paths chunk through `hdma`
+ * chardev frames where the address is interpreted on the remote
+ * side and never touches our flat global).
  */
-static bool r100_hdma_translate(R100HDMAState *s, hwaddr dva, int access,
+static bool r100_hdma_translate(R100HDMAState *s, uint32_t sid,
+                                hwaddr dva, int access,
                                 const char *what, hwaddr *out_pa)
 {
     R100SMMUTranslateResult tr = { 0 };
@@ -345,7 +409,7 @@ static bool r100_hdma_translate(R100HDMAState *s, hwaddr dva, int access,
         *out_pa = dva;
         return true;
     }
-    r100_smmu_translate(s->smmu, R100_HDMA_SMMU_SID, 0, dva, access, &tr);
+    r100_smmu_translate(s->smmu, sid, 0, dva, access, &tr);
     if (!tr.ok) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "r100-hdma cl=%u: SMMU %s on %s dva=0x%" PRIx64
@@ -354,10 +418,12 @@ static bool r100_hdma_translate(R100HDMAState *s, hwaddr dva, int access,
                       r100_smmu_fault_str(tr.fault),
                       what, dva, tr.sid, tr.fault_addr);
         r100_hdma_emit_trace(s,
-                             "hdma cl=%u smmu_fault %s dva=0x%"
-                             PRIx64 " fault=%s\n",
-                             s->chiplet_id, what, dva,
-                             r100_smmu_fault_str(tr.fault));
+                             "hdma cl=%u smmu_fault %s sid=%u"
+                             " dva=0x%" PRIx64 " fault=%s"
+                             " fault_addr=0x%" PRIx64 "\n",
+                             s->chiplet_id, what, sid, dva,
+                             r100_smmu_fault_str(tr.fault),
+                             (uint64_t)tr.fault_addr);
         return false;
     }
     *out_pa = tr.pa;
@@ -607,10 +673,18 @@ static bool r100_hdma_lli_rd(R100HDMAState *s, uint32_t ch,
     uint32_t off = 0;
     hwaddr   dar_pa;
 
-    /* P11: translate the NPU-side DAR; SAR is the host bus address.
-     * Same one-shot translate + block-contiguity assumption as the
-     * WR / D2D helpers — see comment in r100_hdma_lli_wr. */
-    if (!r100_hdma_translate(s, dar_npu, R100_SMMU_ACCESS_WRITE,
+    /* P11/P10: translate the NPU-side DAR through the bypass SID
+     * (SID 8). DAR is an LLI payload field — q-cp doesn't apply
+     * `+ PF_SYSTEM_IPA_BASE` to it, so the right STE is the
+     * bypass STE the FW publishes via `smmu_init_ste_bypass(0)`
+     * (S1_TRANS + CD pointing at `SMMU_BYPASS_PT`). The walker
+     * actually walks that stage-1 PT (no v1 identity shortcut for
+     * S1_TRANS — see r100_smmu.c's stage-1 path), so an address
+     * outside `0x40000000..0x8000000000` faults faithfully. SAR is
+     * the host bus address and never touches our SMMU. See
+     * file-banner "SMMU note (P11/P10)". */
+    if (!r100_hdma_translate(s, R100_HDMA_SMMU_SID_PAYLOAD,
+                             dar_npu, R100_SMMU_ACCESS_WRITE,
                              "ll-rd-dar", &dar_pa)) {
         return false;
     }
@@ -636,14 +710,21 @@ static bool r100_hdma_lli_wr(R100HDMAState *s, uint32_t ch,
     MemTxResult mr;
     hwaddr   sar_pa;
 
-    /* P11: translate the NPU-side SAR through the chiplet's SMMU
-     * (DAR is the host bus address — never goes through this SMMU,
-     * the host-side r100-npu-pci handles that side). v1 translates
-     * once and assumes the transfer fits in one mapped block; q-sys's
-     * runtime_pt uses 2 MB / 1 GB block descriptors so this holds in
-     * practice (TODO: chunked translate for v2 if a workload crosses
-     * a block boundary). */
-    if (!r100_hdma_translate(s, sar_npu, R100_SMMU_ACCESS_READ,
+    /* P11/P10: translate the NPU-side SAR through the bypass SID
+     * (SID 8). SAR is an LLI payload field — same reasoning as
+     * `ll-rd-dar` in `r100_hdma_lli_rd` (see banner SMMU note):
+     * q-cp doesn't IPA-transform LLI payloads, so the FW's
+     * `smmu_init_ste_bypass(0)` STE 8 (S1_TRANS + CD →
+     * `SMMU_BYPASS_PT`) is the right STE for the device-side end
+     * of the transfer. The walker walks that stage-1 PT honestly,
+     * so an SAR outside the bypass window faults same as silicon.
+     * DAR is the host bus address (REMU_HOST_PHYS_BASE-stripped at
+     * the call site) and never touches our SMMU. v1 translates
+     * once and assumes the transfer fits one mapped block (FW's
+     * bypass PT uses 2 MB / 1 GB block descriptors, holds in
+     * practice). */
+    if (!r100_hdma_translate(s, R100_HDMA_SMMU_SID_PAYLOAD,
+                             sar_npu, R100_SMMU_ACCESS_READ,
                              "ll-wr-sar", &sar_pa)) {
         return false;
     }
@@ -687,15 +768,20 @@ static bool r100_hdma_lli_d2d(R100HDMAState *s, uint32_t ch,
     hwaddr   sar_pa;
     hwaddr   dar_pa;
 
-    /* P11: both endpoints are NPU-side, both go through the chiplet's
-     * SMMU. v1 translates once and assumes block-contiguity (FW
-     * runtime_pt's 2 MB / 1 GB block descriptors hold this). v2 will
-     * walk per-page if a workload crosses block boundaries. */
-    if (!r100_hdma_translate(s, sar_npu, R100_SMMU_ACCESS_READ,
+    /* P11/P10: both endpoints are LLI payloads from q-cp's chain,
+     * so both go through the bypass SID (SID 8 → STE_S1_TRANS →
+     * bypass PT). The walker honestly walks the FW's bypass PT,
+     * not a v1 identity shortcut — see banner SMMU note. v1
+     * translates once and assumes block-contiguity (FW's bypass PT
+     * uses 2 MB / 1 GB block descriptors, holds in practice). v2
+     * will walk per-page if a workload crosses block boundaries. */
+    if (!r100_hdma_translate(s, R100_HDMA_SMMU_SID_PAYLOAD,
+                             sar_npu, R100_SMMU_ACCESS_READ,
                              "ll-d2d-sar", &sar_pa)) {
         return false;
     }
-    if (!r100_hdma_translate(s, dar_npu, R100_SMMU_ACCESS_WRITE,
+    if (!r100_hdma_translate(s, R100_HDMA_SMMU_SID_PAYLOAD,
+                             dar_npu, R100_SMMU_ACCESS_WRITE,
                              "ll-d2d-dar", &dar_pa)) {
         return false;
     }
@@ -778,12 +864,17 @@ static bool r100_hdma_walk_ll(R100HDMAState *s, R100HdmaDir dir,
         bool ok = true;
         hwaddr cursor_pa;
 
-        /* P11: cursor (LL element address) is itself an NPU-side
-         * IPA — q-cp's `cmd_descr_hdma` programs the channel's LLP
-         * register with a stage-2 IPA (cb[1]'s 0x42b86740 lives in
-         * the SYSTEM IPA window). Translate before fetching the
+        /* P11/P10: cursor (LL element address) is itself an NPU-side
+         * IPA — q-cp's `cb_parse_linked_dma` programs the channel's
+         * LLP register with a stage-2 IPA in the SYSTEM region (the
+         * `+ PF_SYSTEM_IPA_BASE` step at the end of the non-D2D
+         * branch). The right STE is `STE 0` with config=ALL_TRANS
+         * + the user PT (vttb = q-cp's `runtime_pt`'s
+         * `ptw_s2t_pf[]`), which `smmu_s2_enable(0)` programs
+         * once at boot. Translate via SID 0 before fetching the
          * 24-byte element. */
-        if (!r100_hdma_translate(s, cursor, R100_SMMU_ACCESS_READ,
+        if (!r100_hdma_translate(s, R100_HDMA_SMMU_SID_LL_PTR,
+                                 cursor, R100_SMMU_ACCESS_READ,
                                  "ll-cursor", &cursor_pa)) {
             c->walk.ll_active = false;
             return false;

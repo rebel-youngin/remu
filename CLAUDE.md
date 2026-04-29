@@ -405,20 +405,32 @@ SMMU-600 control block, page 1 holds `EVENTQ_PROD/CONS` at offset
    Arm-SMMU pre-enable bypass). Post-enable: read STE from
    `STRTAB_BASE_PA + sid * 64`, decode `STE0.{V, config}`:
    `BYPASS` → identity, `ABORT` → `INV_STE` fault, `S1_TRANS` →
-   v1 identity + `LOG_UNIMP` (q-cp's `smmu_init_ste` sets
-   `STE1.S1DSS=BYPASS` for the SIDs it leaves at S1_TRANS, so the
-   effective behaviour is identity), `S2_TRANS`/`ALL_TRANS` → build
+   real stage-1 walk (P10): read STE1.S1DSS to gate
+   (`SUBSTREAM0` walks `CD[0]` from `STE0.S1ContextPtr`,
+   `BYPASS` skips stage-1 → identity matching FW's
+   `smmu_init_ste` regular SIDs, `TERMINATE` falls through with
+   `LOG_UNIMP`), the CD decoder skips QEMU's strict `CD_A=1`
+   check because `smmu_init_ste_bypass`'s CD intentionally
+   leaves `CD_A=0` (real SMMU-600 doesn't fault that bypass CD;
+   rejecting it would defeat the "make the FW SMMU init's
+   impact real" goal); `S2_TRANS` / `ALL_TRANS` → build
    `SMMUTransCfg` from STE2/STE3 (`tsz` / `sl0` / `granule_sz` /
    `eff_ps` / `vmid` / `affd` / `vttb`) and dispatch to QEMU's
-   existing `smmu_ptw()` with `stage=SMMU_STAGE_2`. STE3's `S2TTB` is
-   converted from chiplet-local to QEMU global PA (add `chiplet_id *
-   R100_CHIPLET_OFFSET`) before being handed to the walker so its
-   `address_space_memory` PTE reads land at the right slot.
+   existing `smmu_ptw()` with `stage=SMMU_STAGE_2`. STE3's `S2TTB`
+   is converted from chiplet-local to QEMU global PA (add
+   `chiplet_id * R100_CHIPLET_OFFSET`) before being handed to
+   the walker so its `address_space_memory` PTE reads land at the
+   right slot. The same conversion rule applies to the CD's TTB0
+   when it looks chiplet-local.
 
 Engines connect via QOM `link<r100-smmu>` properties on
 `r100-rbdma` / `r100-hdma`, set up in `r100_soc.c`. SID 0 (PF) is
-hardcoded in v1 per Notion REBELQ SMMU Design § 1; multi-VF
-(SIDs 1..4) is v2.
+the default for engine masters per Notion REBELQ SMMU Design § 1.
+**HDMA splits SIDs (P10):** the LL chain *cursor* uses SID 0
+(stage-2 ALL_TRANS via the user PT) but the LLI's *payload*
+SAR/DAR use `R100_HDMA_SMMU_SID_PAYLOAD = 8` — the FW's bypass
+STE that `smmu_init_ste_bypass(0)` programs (S1_TRANS + CD →
+`SMMU_BYPASS_PT`). Multi-VF (SIDs 1..4 + 9..12) is v2.
 
 3. **Eventq + GERROR fault delivery (v2 — this commit).** Every
    `r100_smmu_translate` fault (`INV_STE`, `STE_FETCH`, page-table
@@ -460,9 +472,13 @@ separate dedicated commit.
 STE / IOTLB cache (LL chains are 3-4 entries; cost is chain reads,
 not page walks — re-reading STE every translate also makes
 invalidation a free no-op), 2-level stream tables (q-sys uses
-LINEAR for ≤32 SIDs), stage-1 walk, multi-VF, chiplet-0 PCIe-side
-TBU SID 17, dedicated HDMA-PA SID 16. **Done in v2:** eventq /
-GERROR fault delivery (this commit).
+LINEAR for ≤32 SIDs), per-SSID CD lookup (current path always
+walks CD[0] regardless of SSID; only matters once
+`smmu_activate_ctx` starts publishing per-context CDs for DNC
+compute), multi-VF (SIDs 1..4 + 9..12), chiplet-0 PCIe-side TBU
+SID 17, dedicated HDMA-PA SID 16. **Done in v2:** eventq +
+GERROR fault delivery, honest stage-1 walking via
+`smmu_ptw_64_s1` against the FW's bypass PT (P10).
 
 **Debug surface.** Optional `debug-chardev` property on `r100-smmu`
 (wired to chiplet 0 only — same single-frontend reasoning as
