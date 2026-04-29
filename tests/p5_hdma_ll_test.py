@@ -85,10 +85,11 @@ CTRL1_LLEN_BIT = 1 << 0
 DB_START_BIT   = 1 << 0
 ENABLE_BIT     = 1 << 0
 
-# DRAM offsets within the chiplet-0 shm splice (first 128 MB). Layout
-# matches P4B (src/dst at 0x07000000 / 0x07800000) plus an LLI / LLP
-# region at 0x07900000. All sit comfortably above FreeRTOS_CP0
-# (~0x00200000, 2.2 MB) and below BL31_CP1 @ 0x14100000.
+# DRAM offsets within the chiplet-0 shm splice (full DRAM, 36 GB =
+# R100_RBLN_DRAM_SIZE; previously 128 MB before the silicon-accurate
+# bump). Layout matches P4B (src/dst at 0x07000000 / 0x07800000)
+# plus an LLI / LLP region at 0x07900000. All sit comfortably above
+# FreeRTOS_CP0 (~0x00200000, 2.2 MB) and below BL31_CP1 @ 0x14100000.
 SRC_DRAM_OFFSET  = 0x07000000
 DST_DRAM_OFFSET  = 0x07800000
 DESC_DRAM_OFFSET = 0x07900000

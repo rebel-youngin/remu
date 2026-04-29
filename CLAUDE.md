@@ -51,7 +51,7 @@ binds with no changes). BAR sizes match `rebel_check_pci_bars_size`:
 
 | BAR | Size  | Role |
 |-----|-------|------|
-| 0   | 64 GB | DDR — first 128 MB = shm file, tail = lazy RAM |
+| 0   | 64 GB | DDR — next power of 2 above `RBLN_DRAM_SIZE = 36 GB` (PCI BARs must be `is_power_of_2`); first 36 GB shared with chiplet-0 DRAM via `remu-shm` (default `--shm-size = 36 GB`), upper 28 GB is host-private `bar0_tail` lazy RAM (= reserved alias on real silicon). Shorter `--shm-size` extends the lazy tail downward |
 | 2   | 64 MB | ACP / SRAM / logbuf; 4 KB prio-10 trap @ `FW_LOGBUF_SIZE` (M8b 3b cfg-head) forwards writes on `cfg` chardev, rest lazy RAM |
 | 4   | 8 MB  | 4 KB MMIO head (INTGR M6 + MAILBOX_BASE M8a bidir + CM7-stub Stage 3a + queue-start doorbell relayed as SPI 185 to wake q-cp's `hq_task` post-P1c); rest lazy RAM |
 | 5   | 1 MB  | MSI-X table (32 vectors) + PBA (`msix_notify()` target for M7; q-cp's `cb_complete → pcie_msix_trigger` post-P1c — formerly Stage 3c BD-done) |
@@ -432,11 +432,26 @@ sid=0, input_addr=IPA_SRC)`. m5..p5 + p11 + p11b regression green.
 Both QEMUs `mmap` three shared `memory-backend-file`s under
 `/dev/shm/remu-<name>/` with `share=on`:
 
-- **`remu-shm`** (128 MB, M4/M5) — `r100-npu-pci.memdev` over BAR0
-  offset 0 on the host; `r100-soc.memdev` over chiplet-0 DRAM offset
-  0 on the NPU. Tail `0x08000000..0x40000000` stays private lazy
-  RAM so BL31_CP1 / FreeRTOS_CP1 loaded at `0x14100000` / `0x14200000`
-  don't leak to host.
+- **`remu-shm`** (36 GB by default — `R100_RBLN_DRAM_SIZE`, matches
+  real CR03 silicon's per-PF DRAM window; M4/M5) —
+  `r100-npu-pci.memdev` over BAR0 offset 0 on the host;
+  `r100-soc.memdev` over chiplet-0 DRAM offset 0 on the NPU. Layout
+  per chiplet, as the kmd allocates it: 1 GB `CP_SYSTEM_SIZE` system
+  region (FW images / MMU page-table pool / sync block) + 35 GB user
+  region (kmd's DVA pool for umd buffers); aggregate device memory
+  across the 4 CR03 chiplets is 144 GB but only chiplet 0 is
+  PCIe-exposed via BAR0 — chiplets 1..3 stay NPU-private. Tmpfs is
+  sparse so the 36 GB ftruncate only reserves address range; the
+  hard requirement is `/dev/shm` with ≥ 36 GB free (default tmpfs
+  size = 50 % of host RAM, so a host with ≥ 72 GB RAM clears it).
+  Override with `./remucli run --shm-size <bytes>` on tighter hosts;
+  the lazy `bar0_tail` / `dram_tail` paths in
+  `r100_npu_pci.c` / `r100_soc.c` keep BL31_CP1 / FreeRTOS_CP1 at
+  `0x14100000` / `0x14200000` reachable for sub-default `--shm-size`,
+  but the historical "tail stays private lazy RAM" comment no longer
+  applies — at the default the FW image area is inside the splice,
+  visible to host. (No security boundary here: REMU is a functional
+  emulator, the host x86 is just another vCPU.)
 - **`host-ram`** (`--host-mem`, default 512 MB; P10-fix) — host x86
   QEMU's main RAM `memory-backend-file`. The NPU's
   `r100-pcie-outbound` aliases the same backend over the chiplet-0

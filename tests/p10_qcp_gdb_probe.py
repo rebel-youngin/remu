@@ -3,7 +3,7 @@
 
 This is **not** a regression test (it carries no pass/fail assertion) — it
 is the live-debug recipe for the open P10 issue documented in
-`docs/debugging.md` → "P10 cb[1] non-completion (open)" and
+`docs/debugging.md` → "P10 — cb[1] HDMA LL chain reads all zeros" and
 `docs/roadmap.md` → P10. Run it manually when investigating the hang.
 The companion regression test is `tests/p10_umd_smoke_test.py` (which
 just times out today; this probe explains why).
@@ -22,8 +22,13 @@ the upstream `aarch64-none-elf-gdb` and dumps:
   - hq_mgr / cb_mgr globals (cb_run_cnt, cq[0].ci/pi, ready_list/wait_list
     head sentinels — the headline state for "did cb_task pull cb[1]
     off the ready list?")
-  - rbdma_mgr / hdma_mgr globals (engine-side completion counters)
+  - hdma_mgr + per-channel state (hdma_queue[0/1], htask handle —
+    answers "did hdma_task get notified?")
   - cfg-shadow region @ 0x10200000 (DDH + FUNC_SCRATCH)
+  - HDMA RD ch0 register block @ 0x1D80380300/0x400 (LLP / CTRL1
+    after the kick — confirms vacuous completion)
+  - LL cursor neighborhood @ 0x42B86700..0x42B867BF (192 B window
+    centred on the empty chain)
   - `info threads` + `bt 40` per CA73 thread (32 vCPUs across 4 chiplets)
 
 Output
@@ -57,8 +62,10 @@ Two interesting settle points to compare:
   ~8.0 s  TDR has fired (kmd timeout = 3 s). q-cp is now mid
           `handle_unload_event` doing the 700-line register dump with
           `mdelay(500000)` busy-waits — useful for the unload-cascade
-          analysis but hides the cb[1] root cause. See "P10 cb[1]
-          non-completion → side bug 1" in `docs/debugging.md`.
+          analysis but hides the cb[1] root cause. See "P10 — cb[1]
+          HDMA LL chain reads all zeros → Side note — TDR
+          `URG_EVENT_UNLOAD` register-dump cascade" in
+          `docs/debugging.md`.
 
 Exit codes
 ==========
@@ -96,7 +103,10 @@ POST_DOORBELL_SETTLE_S = float(os.environ.get("REMU_P10_DEBUG_DELAY_S", "1.5"))
 GDB_FALLBACK = ("/mnt/data/tools/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-elf"
                 "/bin/aarch64-none-elf-gdb")
 FW_BUNDLE = REPO / "external" / "ssw-bundle" / "products" / "rebel" / "q" / "sys"
-ELF_FREERTOS_CP0 = FW_BUNDLE / "binaries" / "FreeRTOS_CP" / "freertos_kernel.elf"
+# FreeRTOS_CP is the FW image that hosts q-cp's hq_task / cb_task / hdma_mgr
+# globals (verified via `nm`). FreeRTOS_CP1 is the second-cluster image
+# (also FreeRTOS, but no hq_mgr / cb_mgr symbols). q-cp runs on CP0.
+ELF_FREERTOS_QCP = FW_BUNDLE / "binaries" / "FreeRTOS_CP" / "freertos_kernel.elf"
 ELF_FREERTOS_CP1 = FW_BUNDLE / "binaries" / "FreeRTOS_CP1" / "freertos_kernel.elf"
 ELF_BL31_CP0 = FW_BUNDLE / "binaries" / "BootLoader_CP" / "bl31.elf"
 ELF_BL31_CP1 = FW_BUNDLE / "binaries" / "FreeRTOS_CP1" / "bl31.elf"
@@ -166,8 +176,14 @@ def hmp(sock_path, cmd, timeout=10.0):
 # --------------------------------------------------------------------------
 
 def boot_remu(log_path):
+    # `--host-mem 4G`: the kmd's `pci_p2pdma_add_resource` call against
+    # the 64 GB BAR0 needs ~1 GB of `struct page` vmemmap; the default
+    # 512 MB guest OOM-kills `sh` while reclaiming, which takes
+    # `setup.sh` and the test along with it. Same rationale as
+    # `tests/p10_umd_smoke_test.py`.
     return subprocess.Popen(
         [str(REPO / "remucli"), "run", "--host", "--name", RUN_NAME,
+         "--host-mem", "4G",
          "--guest-cmdline-extra", "remu.run_p10=1"],
         stdout=open(log_path, "wb"),
         stderr=subprocess.STDOUT,
@@ -249,21 +265,23 @@ def wait_for_cq_count(proc, target, timeout):
 # can ask for both rbdma_mgr and hdma_mgr without guarding each one.
 # --------------------------------------------------------------------------
 
-GDB_CMDS_TEMPLATE = """\
+GDB_CMDS_TEMPLATE = r"""
 set pagination off
 set confirm off
 set print pretty on
+set print elements 256
 set logging file {artifact}
 set logging overwrite on
 set logging redirect on
 set logging enabled on
 target remote :{port}
-echo \\n========== Symbol files ==========\\n
-file {elf_freertos_cp0}
+echo \n========== Symbol files ==========\n
+file {elf_freertos_qcp}
 add-symbol-file {elf_bl31_cp0}
 add-symbol-file {elf_freertos_cp1}
 add-symbol-file {elf_bl31_cp1}
-echo \\n========== hq_mgr globals ==========\\n
+
+echo \n========== hq_mgr globals ==========\n
 print hq_mgr.cb_run_cnt
 print hq_mgr.req_funcs
 print hq_mgr.req_funcs_init_q
@@ -271,28 +289,49 @@ print hq_mgr.next_sched_func
 print hq_mgr.func_id
 print hq_mgr.num_vfs
 print hq_mgr.cq[0].initialized
-print hq_mgr.cq[0].base_addr
+print/x hq_mgr.cq[0].base_addr
 print hq_mgr.cq[0].ci
 print hq_mgr.cq[0].pi
 print hq_mgr.cq[0].size
 print hq_mgr.cq[0].mask
-echo \\n========== cb_mgr state ==========\\n
+
+echo \n========== cb_mgr state ==========\n
 print cb_mgr
 print cb_mgr.ready_list.next == &cb_mgr.ready_list
 print cb_mgr.wait_list.next == &cb_mgr.wait_list
 print *cb_mgr.htask
-echo \\n========== rbdma / hdma mgr (best-effort, may not link) ==========\\n
-print rbdma_mgr
+
+echo \n========== hdma_mgr state ==========\n
 print hdma_mgr
-echo \\n========== cfg-shadow region (DDH + FUNC_SCRATCH) ==========\\n
+print hdma_mgr.hdma_queue[0]
+print hdma_mgr.hdma_queue[1]
+print *hdma_mgr.htask
+
+echo \n========== cfg-shadow region (DDH + FUNC_SCRATCH) ==========\n
 x/16wx 0x102000C0
 x/8wx  0x10200FFC
-echo \\n========== Threads ==========\\n
+
+echo \n========== HDMA RD ch0 register block (chiplet-0 0x1D80380000) ==========\n
+monitor xp /16wx 0x1D80380300
+monitor xp /16wx 0x1D80380400
+
+echo \n========== LL cursor neighborhood (NPU PA 0x42B86700..0x42B867BF) ==========\n
+monitor xp /16wx 0x42B86700
+monitor xp /16wx 0x42B86740
+monitor xp /16wx 0x42B86780
+
+echo \n========== chiplet-0 DRAM head 1 KB ==========\n
+monitor xp /16wx 0x07F00000
+
+echo \n========== Threads ==========\n
 info threads
-echo \\n========== Per-thread backtraces ==========\\n
+
+echo \n========== Per-thread backtraces ==========\n
 thread apply all bt 40
-echo \\n========== Per-thread registers (PC/SP/FP/LR) ==========\\n
+
+echo \n========== Per-thread registers (PC/SP/FP/LR) ==========\n
 thread apply all info registers pc sp x29 x30
+
 detach
 quit
 """
@@ -303,7 +342,7 @@ def run_gdb_snapshot(gdb_bin):
     cmds = GDB_CMDS_TEMPLATE.format(
         artifact=str(ARTIFACT),
         port=GDB_PORT,
-        elf_freertos_cp0=str(ELF_FREERTOS_CP0),
+        elf_freertos_qcp=str(ELF_FREERTOS_QCP),
         elf_bl31_cp0=str(ELF_BL31_CP0),
         elf_freertos_cp1=str(ELF_FREERTOS_CP1),
         elf_bl31_cp1=str(ELF_BL31_CP1),
@@ -325,8 +364,8 @@ def run_gdb_snapshot(gdb_bin):
 def main():
     os.environ["PYTHONUNBUFFERED"] = "1"
 
-    if not ELF_FREERTOS_CP0.exists():
-        print("ERR: missing %s — run ./remucli fw-build" % ELF_FREERTOS_CP0)
+    if not ELF_FREERTOS_QCP.exists():
+        print("ERR: missing %s — run ./remucli fw-build" % ELF_FREERTOS_QCP)
         return 1
     gdb_bin = find_gdb()
     if not gdb_bin:

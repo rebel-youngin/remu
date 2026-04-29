@@ -27,8 +27,32 @@
 
 /* DRAM */
 #define R100_DRAM_BASE              0x0000000000ULL
-#define R100_DRAM_SIZE              0x1000000000ULL  /* 64GB max, 1GB initial */
-#define R100_DRAM_INIT_SIZE         0x0040000000ULL  /* 1GB for emulation */
+#define R100_DRAM_SIZE              0x1000000000ULL  /* 64GB max addressable */
+/*
+ * Per-chiplet device DRAM size — single source of truth. Mirrors
+ * `RBLN_DRAM_SIZE` in `external/.../kmd/.../rebel/rebel.h` (= 0x900000000
+ * = 36 GB). Layout per chiplet, as the kmd allocates it: 1 GB
+ * `CP_SYSTEM_SIZE` system region (FW images, MMU page tables, sync /
+ * cfg blocks at the head; `DRAM_BASE_ADDR_USER = DRAM_PHYS_BASE +
+ * CP_SYSTEM_SIZE`) plus 35 GB user region (kmd's DVA pool for umd
+ * buffers). Aggregate device memory across the 4 CR03 chiplets is
+ * 144 GB; only chiplet 0's DRAM is PCIe-exposed via BAR0 — the
+ * shm splice (M5) shares it byte-for-byte with the host x86 QEMU.
+ * Chiplets 1..3 stay NPU-private (cross-chiplet reach goes through
+ * RBDMA / ICPI on real silicon, not the host BAR).
+ *
+ * On Linux, both the shm tmpfs file (chiplet-0) and the anonymous
+ * mmap backing chiplets 1..3 are sparse — only pages that q-cp /
+ * kmd actually touch cost real RAM. Phase-1 boot (m5..p5) stays in
+ * the 0..1 GB FW-image area, so the bump from 4 GB → 36 GB is free
+ * for those tests; the only host-side requirement is that
+ * `/dev/shm` has ≥ 36 GB available (default tmpfs is 50 % of host
+ * RAM, so a host with ≥ 72 GB RAM clears it; below that, either
+ * `mount -o remount,size=64G /dev/shm` or override with
+ * `--shm-size <bytes>` on `./remucli run`).
+ */
+#define R100_RBLN_DRAM_SIZE         0x0900000000ULL  /* 36 GB per chiplet (= RBLN_DRAM_SIZE) */
+#define R100_DRAM_INIT_SIZE         R100_RBLN_DRAM_SIZE
 #define R100_DRAM_SECURE_BASE       0x003F000000ULL
 #define R100_DRAM_USER_BASE         0x0040000000ULL
 

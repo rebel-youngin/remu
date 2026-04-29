@@ -80,12 +80,13 @@ RUN_CONF1_REG = RBDMA_BASE + 0x21C
 
 RUN_CONF1_INTR_DISABLE = 1 << 0
 
-# DRAM offsets within the chiplet-0 shm splice (first 128 MB). Both
-# 0x07000000 and 0x07800000 sit comfortably above the FreeRTOS_CP0
-# image (loaded at 0x00200000, ~2.2 MB) and below the next FW slot
-# (BL31_CP1 @ 0x14100000), well clear of q-cp's high-DRAM SHM_BASE
-# (~63 GB on quad). 4 KB == 32 × 128 B blocks satisfies the RBDMA
-# block-aligned size encoding.
+# DRAM offsets within the chiplet-0 shm splice (full DRAM, 36 GB =
+# R100_RBLN_DRAM_SIZE; previously 128 MB before the silicon-accurate
+# bump). Both 0x07000000 and 0x07800000 sit comfortably above the
+# FreeRTOS_CP0 image (loaded at 0x00200000, ~2.2 MB) and below the
+# next FW slot (BL31_CP1 @ 0x14100000), well clear of q-cp's
+# high-DRAM SHM_BASE (~63 GB on quad). 4 KB == 32 × 128 B blocks
+# satisfies the RBDMA block-aligned size encoding.
 SRC_DRAM_OFFSET = 0x07000000
 DST_DRAM_OFFSET = 0x07800000
 COPY_SIZE = 0x1000

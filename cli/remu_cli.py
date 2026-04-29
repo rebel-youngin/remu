@@ -60,12 +60,34 @@ QEMU_TARGETS_MARKER = QEMU_BUILD / ".remu-targets"
 QEMU_CONFIGURE_MARKER = QEMU_BUILD / ".remu-configure"
 
 # Phase 2 shared-memory bridge defaults.
-# 128 MB is a power-of-2 scratch size — plenty to prove cross-process
-# mmap without using much tmpfs. M4 will grow this to match the BAR0
-# DRAM window (1 GB per chiplet). Kept outside the repo tree (/dev/shm
-# is tmpfs on all supported hosts) so large sizes don't land on disk.
+#
+# 36 GB matches R100_RBLN_DRAM_SIZE / R100_DRAM_INIT_SIZE: the shm covers
+# ALL of chiplet-0 DRAM (the kmd's actual PCIe BAR0 is 64 GB — next power
+# of 2 above the 36 GB DRAM, since PCI requires `is_power_of_2(bar_size)`
+# — but the upper 28 GB is a reserved alias on real silicon and a
+# host-private lazy-RAM `bar0_tail` here, so 36 GB is the right shm
+# size). Any byte the kmd writes via memcpy_toio(BAR0 + N, ...) for
+# N < 36 GB is visible at chiplet-0 DRAM offset N for q-cp on the NPU
+# side. Layout per chiplet, as the kmd allocates it:
+# 1 GB CP_SYSTEM_SIZE system region (FW images / MMU page tables / sync
+# block) + 35 GB user region (kmd's DVA pool). Aggregate device memory
+# across the 4 CR03 chiplets is 144 GB; only chiplet 0 is exposed via
+# BAR0, the rest are NPU-private (cross-chiplet reach through RBDMA /
+# ICPI on real silicon).
+#
+# Cost on Linux: tmpfs (`/dev/shm`) is sparse, so the 36 GB ftruncate
+# just reserves the address range — only pages q-cp / kmd actually
+# touch consume real memory. Phase-1 boot tests (m5..p5, p11) only
+# touch the 0..1 GB FW-image head, so the bump from the historical
+# 128 MB / 4 GB defaults is free for those. Hard requirement is that
+# `/dev/shm` has at least 36 GB free; the kernel default sets tmpfs
+# size = 50 % of host RAM, so a host with ≥ 72 GB RAM clears it. On a
+# tighter host either `mount -o remount,size=64G /dev/shm` or override
+# `./remucli run --shm-size <bytes>` (the lazy `bar0_tail` /
+# `dram_tail` paths in r100_npu_pci.c / r100_soc.c still kick in for
+# any shm smaller than R100_BAR0_DDR_SIZE / R100_DRAM_INIT_SIZE).
 SHM_ROOT = Path("/dev/shm")
-SHM_SIZE_DEFAULT = 128 * 1024 * 1024
+SHM_SIZE_DEFAULT = 36 * 1024 * 1024 * 1024
 HOST_MEM_DEFAULT = "512M"
 # P10-fix: 4 KB cfg-shadow buffer shared between the host x86 QEMU's
 # BAR2 cfg-head trap and the NPU r100-cm7 cfg-mirror trap. Eliminates

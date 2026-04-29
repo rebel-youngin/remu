@@ -107,7 +107,7 @@ side of silicon that actually owns it.
 | P6 | `r100-dnc` behavioural — parse `cmd_descr_dnc`, run a host-CPU kernel against input tensors, write outputs, fire `itdone` BH. | pending | gated by umd workload that needs DNC kernel emulation |
 | P8 | Real CA73 soft-reset — replace M8b 3a's synthetic `0xFB0D` from `INTGR0 bit 0` with a bracketed reset of CP0/CP1 cluster CPUs + their GIC redistributor state + the PCIe mailbox regs (preserve DRAM/SRAM/cfg-head/kmd-loaded firmware images), restart from BL1; q-sys `bootdone_task` re-emits `0xFB0D` through the existing `issr` chardev path naturally. Removes the last QEMU-side cold-boot lie. Candidate hooks: `DeviceReset` on an aggregated `r100-ca73-cluster` QOM wrapper, or `qemu_system_reset_request` with a fine-grained `ShutdownCause`. | pending | independent of P1..P7 |
 | P9 | UMQ multi-queue — `NUMBER_OF_CMD_QUEUES > 1`. q-cp's `hq_task` already loops over `qid`; work is mostly host-side allocation + per-queue MSI-X vector wiring. The reserved `0x01..0x7F` `req_id` partition on the `hdma` wire is available for per-queue tagging. | pending | depends on P1..P7 (done) |
-| P10 | umd smoke test in `guest/` — `command_submission -y 5` → 2 CBs submitted → 2 MSI-X completions → exit 0. Scaffolding in place; cb[0] passes; cb[1] is no longer SMMU-blocked (P11 done). The remaining failure is in the kmd-side `rebel_soft_reset` → `rbln_register_p2pdma` → x86 guest OOM panic path under TCG (independent of SMMU). See `docs/debugging.md` → "P10 cb[1] non-completion" for the diagnostic flow. | open | excluded from `./remucli test` defaults via `in_default=False` |
+| P10 | umd smoke test in `guest/` — `command_submission -y 5` → 2 CBs submitted → 2 MSI-X completions → exit 0. Scaffolding in place; cb[0] passes (cfg-mirror trap returns `FUNC_SCRATCH = 0xcafedead` and one MSI-X frame egresses). cb[1] is no longer SMMU-blocked (P11) and no longer P2PDMA-OOM-blocked (`tests/p10_umd_smoke_test.py` + `tests/p10_qcp_gdb_probe.py` pass `--host-mem 4G`; the silicon-accurate `R100_RBLN_DRAM_SIZE = 36 GB` is now the single source of truth for `cli/remu_cli.py:SHM_SIZE_DEFAULT`, `src/include/r100/remu_addrmap.h:R100_DRAM_INIT_SIZE`, and `src/host/r100_npu_pci.c:R100_BAR0_DDR_SIZE` so the kmd's MMU pool at `0x51800000+0x2800000` and q-cp's `0x40000000+` PF system IPA allocations are coherent on the shm splice across the full chiplet-0 DRAM window — see `CLAUDE.md` → "M5 splice points"). The current failure is q-cp's HDMA RD ch0 walking an empty LL chain at NPU PA `0x42b86740` — gdb peek over a 192-byte window shows 48 contiguous zero words, walker reports `ll_walk_read elem=1 ctrl=0`, breaks immediately, and pulses `INT_ID_HDMA = 186` for a vacuous completion. See `docs/debugging.md` → "P10 — cb[1] HDMA LL chain reads all zeros" for the diagnostic flow + the next-step `chan->mem->addr` vs `chan->desc` alignment check. | open | excluded from `./remucli test` defaults via `in_default=False` |
 
 ## SMMU v2 — next focus area
 
@@ -244,7 +244,9 @@ for the HMP sanity recipes.
   `doorbell.sock` (host → NPU), `msix.sock` (NPU → host),
   `issr.sock` (NPU → host), `hdma.sock` (bidirectional NPU ↔ host
   DMA). Three shared-memory files under `/dev/shm/remu-<name>/`
-  back the splices: `remu-shm` (128 MB chiplet-0 DRAM head),
+  back the splices: `remu-shm` (36 GB by default — `R100_RBLN_DRAM_SIZE`,
+  full chiplet-0 DRAM = real BAR0 size; sparse on tmpfs so untouched
+  pages cost nothing; override with `--shm-size`),
   `host-ram` (sized by `--host-mem`, chiplet-0 PCIe outbound iATU
   window), `cfg-shadow` (4 KB BAR2 cfg-head).
 - `src/bridge/remu_hdma_proto.h` — 24 B `RemuHdmaHeader` + payload.

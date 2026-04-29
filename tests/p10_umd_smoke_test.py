@@ -109,8 +109,18 @@ def boot_remu(log_path):
     # and a plain `./remucli run --host` keeps the M8b interactive boot
     # shape regardless of whether `guest/bin/command_submission` is
     # staged from a prior `guest/build-umd.sh`.
+    #
+    # `--host-mem 4G` is required for `pci_p2pdma_add_resource` against
+    # the 64 GB BAR0: the kernel allocates ~1 GB of `struct page`
+    # vmemmap to back the BAR's worth of pages, which OOMs the default
+    # 512 MB guest. The kmd handles `-ENOMEM` gracefully (just a
+    # `dev_warn`), but the OOM-killer takes out `sh` while reclaiming,
+    # killing setup.sh and the test along with it. With 4 GB the
+    # allocation succeeds and probe continues past P2PDMA. See
+    # `docs/debugging.md` → "P10 — cb[1] HDMA LL chain reads all zeros".
     return subprocess.Popen(
         [str(REPO / "remucli"), "run", "--host", "--name", RUN_NAME,
+         "--host-mem", "4G",
          "--guest-cmdline-extra", "remu.run_p10=1"],
         stdout=open(log_path, "wb"),
         stderr=subprocess.STDOUT,

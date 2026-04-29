@@ -483,52 +483,109 @@ markers in order — missing marker pinpoints the stall:
 FW ground truth lives in `external/ssw-bundle/products/rebel/q/sys/bootloader/cp/tf-a/`
 — cross-reference via `CLAUDE.md` ("Key external files").
 
-## Open issue: P10 — kmd `register_p2pdma` OOM panic
+## Open issue: P10 — cb[1] HDMA LL chain reads all zeros
 
 **Status.** Open. `./remucli test p10` times out at 180 s on every
 run. Excluded from `./remucli test` defaults via `in_default=False`
-in `TEST_REGISTRY`. The earlier "cb[1] non-completion" failure mode
-was unblocked by P11 (SMMU stage-2 walker) and is no longer the
-bottleneck.
+in `TEST_REGISTRY`. The pre-P11 "cb[1] SMMU translate fault" mode
+is gone. The pre-fix "x86 guest OOM during `rbln_register_p2pdma`"
+mode is also gone — `tests/p10_umd_smoke_test.py` and
+`tests/p10_qcp_gdb_probe.py` now both pass `--host-mem 4G`, and
+`SHM_SIZE_DEFAULT` / `R100_DRAM_INIT_SIZE` / `R100_BAR0_DDR_SIZE` are
+all aliased to `R100_RBLN_DRAM_SIZE = 36 GB` (one chiplet's full DRAM
+= real CR03 BAR0) so the kmd's MMU page-table pool at
+`0x51800000+0x2800000` and q-cp's user-allocator hits in the
+`0x40000000+` PF system IPA window are both addressable on the shared
+shm splice across the full BAR0 — there are no host-private lazy-RAM
+holes inside the silicon-visible window (see `CLAUDE.md` → "M5 splice
+points" + the inline comment at
+`src/include/r100/remu_addrmap.h:R100_RBLN_DRAM_SIZE`). The 36 GB
+ftruncate is sparse on tmpfs so phase-1 boot tests (m5..p5, p11) still
+only commit ~tens of MB; the only host requirement is `/dev/shm` with
+≥ 36 GB available — `df -h /dev/shm` shows the cap, default tmpfs is
+50 % of host RAM. `--shm-size <bytes>` overrides on tighter hosts and
+the shorter splice falls back to a host-private `bar0_tail` /
+NPU-private `dram_tail` for the rest of BAR0.
 
-**Symptom.** `command_submission -y 5` (the umd integration test
-staged into the guest by `guest/build-umd.sh`) is supposed to submit
-two command buffers and wait for two MSI-X completions. With P11 in
-place, the SMMU LL chain that previously stalled cb[1] now walks
-correctly — but the test still times out earlier in the kmd path.
-`rebel_hw_init` expires its watchdog on the soft-reset under TCG,
-which cascades into a host kernel OOM during `rbln_register_p2pdma`:
+**Symptom (post-memory-fix).** `command_submission -y 5` from the
+umd staged into the guest by `guest/build-umd.sh` submits two CBs
+to queue 0. cb[0] completes — `output/<name>/npu/cfg.log` /
+`xp /1wx 0xf000200ffc` shows `FUNC_SCRATCH = 0xcafedead` and
+`output/<name>/host/msix.log` records one MSI-X frame. cb[1] then
+stalls. The kmd's TDR fires (`queue_timedout: command-queue-0 TDR 1
+Qseq 1/1/2`), then `rsd_device_reset` runs the dump+unload+reset
+cascade documented below, then a second `rebel_queue_init` from
+`rsd_sched_device_init` busy-polls forever (the
+`jiffies_to_usecs` side-bug below) and the host watchdog
+eventually prints `soft lockup ... rebel_hw_init+0x439`.
 
-```
-watchdog: BUG: soft lockup - CPU#0 stuck for ...s! [insmod or command_submission]
-RIP: ... rebel_hw_init+0x439 (= rebel_queue_init busy-poll)
-…
-Out of memory: Killed process … (rbln_register_p2pdma)
-```
+**Proximate cause.** `output/<name>/hdma.log` shows q-cp kicked HDMA
+RD ch0 with `llp=0x42b86740` (NPU-local PA in chiplet-0 DRAM, well
+inside the 36 GB shm splice). The walker fetches a 24-byte LL
+element at that cursor and reads **all zeros** (`ctrl=0`,
+`xsize=0`, `sar=0`, `dar=0`), breaks immediately, signals
+completion, and pulses `INT_ID_HDMA = 186` to q-cp. The gdb probe
+confirms the same: `monitor xp /16wx 0x42B86700` over a 192-byte
+window centred on the cursor returns 48 contiguous zero words. So
+either q-cp programmed `regs->llp = 0x42b86740` without ever
+populating the chain at that NPU IPA, or the CA73 stage-1 stores
+the chain elsewhere than where `CPVA_TO_PA(CHIPLET_ID, chan->mem->addr)`
+claims. Distinguishing the two requires walking q-cp's heap on the
+gdb probe — there's a follow-on note below.
 
 `output/<name>/npu/qemu.stderr.log` shows **no** `TRANSLATE FAULT`
-lines, confirming the SMMU is no longer the bottleneck. cb[0] /
-cb[1] never run, so `host/msix.log` and `hdma.log` stay empty for
-the whole test budget.
+or `RBDMA OTO` activity for the cb[1] window — both SMMU (P11) and
+RBDMA (P4B) are silent on the cb[1] slot, consistent with the
+"HDMA fired but transferred 0 bytes, downstream RBDMA never gated
+in" reading. cb[0] uses `PACKET_WRITE_DATA` and goes straight
+through the cfg-mirror trap to `FUNC_SCRATCH` so it doesn't touch
+HDMA at all (which is why cb[0] passes).
 
 Diagnostic recipe:
 
 ```
-./remucli fw-build                          # ELFs needed by the gdb probe
-./remucli test p10                          # reproduces the OOM
-less output/p10-umd/host/serial.log         # OOM stack trace
+./remucli fw-build                                   # ELFs needed by gdb
+./remucli test p10                                   # reproduces the hang
+python3 tests/p10_qcp_gdb_probe.py                   # snapshot cb[1] state
+less output/p10-umd/hdma.log                         # ll_walk_read elem=1 ctrl=0
+less output/p10-debug/qcp-bt-cb1.txt                 # gdb dump
 ```
 
-Two diagnostic-only probes (no `TEST_REGISTRY` entry):
+The probe pauses 1.5 s after the second `INTGR1=0x1` doorbell —
+exactly between cb[1] doorbell delivery and TDR — so the snapshot
+catches q-cp with `cb_run_cnt = 1`, `cq[0].ci = 1`, `cq[0].pi = 2`,
+all `cb_mgr.{ready,wait}_list` empty, and `cb_task` / `hdma_task`
+both suspended in `xTaskNotifyWait`. None of the running threads
+in `info threads` is in cb_task or hdma_task — they're all
+runtime-idle CSes / DNC fetch workers. Override the settle window
+with `REMU_P10_DEBUG_DELAY_S=8.0` to catch the unload cascade
+instead.
 
-- `tests/p10_qcp_gdb_probe.py` — boots `--host`, waits for the
-  expected CQ doorbell, spawns NPU gdbstub on demand, attaches
-  `aarch64-none-elf-gdb`, dumps `hq_mgr` / `cb_mgr` globals +
-  per-thread backtraces. Useful for any future cb-side regression.
+Two more diagnostic-only probes (no `TEST_REGISTRY` entry):
+
 - `tests/p10_cfgshadow_probe.py` — boots, waits for the first
   QUEUE_INIT doorbell, samples `cfg-shadow` from three vantage points
   (direct shm read, NPU `xp`, host `xp`) to verify the alias is
   working.
+
+**Follow-on hypothesis (next debugging step).** The cb[1] HDMA path
+in q-cp is `cb_parse → cmd_descr_hdma → hdma_ll_trigger →
+hdma_ch_trigger`, which writes `regs->llp = chan->desc =
+hdma_pkt->addr` (the address from the `PACKET_LINKED_DMA` packet
+the kmd emitted). For `cmdgen_rebel_record_rbdma` simple_copy
+flows the LL chain is **not** populated by the kmd — it's emitted
+by q-cp's own `record_lli` / `record_llp` helpers writing into
+`chan->mem->addr`. If q-cp set `chan->desc` to the packet addr but
+emitted the chain into `chan->mem`, the two will only line up if
+the PACKET_LINKED_DMA's addr was reused as the mem buffer. Spot
+check: dump `chan->mem->addr` and `chan->mem->used_size` on the
+hdma channel q-cp picked, compare to `regs->llp.{lsb,msb}` and to
+`hdma_pkt->addr` from the cb body, and check whether
+`CPVA_TO_PA(CHIPLET_ID, chan->mem->addr) == llp` modulo the
+chiplet-base offset. The gdb probe's `print hdma_mgr` already pulls
+the htask handle; the missing piece is walking from the active
+hdma_chan back to its mem pool — cheapest route is to add a `print
+hdev` there once the q-cp source is mapped to the running ELF.
 
 **Side note — KMD `readl_poll_timeout_atomic` argument unit
 mismatch.** `rebel.c:700` calls
@@ -544,14 +601,23 @@ Tracked here so future people picking up P10 don't try to "fix" the
 timeout from the REMU side.
 
 **Side note — TDR `URG_EVENT_UNLOAD` register-dump cascade.** When
-the kmd's TDR fires, q-cp's `handle_unload_event` runs
-`DNC_DUMP_ESSENTIAL` + `RBDMA_DUMP_CDMA` +
-`rbcm_dump_chiplet_incomplete_ttreg` — a ~700-line register dump
-peppered with `mdelay(500000)` busy-waits that block the doorbell
-ISR on CP0.cpu0 for many seconds under TCG. The host kernel's
-`watchdog: BUG: soft lockup [insmod] rebel_hw_init+0x439` is a
-downstream symptom of any cb hang — fixing the underlying P10 path
-removes it.
+the kmd's TDR fires (because cb[1] never completed), the
+`rebel_quiesce_device` path writes `REBEL_EVENT_DUMP = 4` to ISSR[6]
+and rings INTGR1 bit 6. The kmd-side `REBEL_EVENT_DUMP = 4`
+intentionally aliases the q-cp-side `URG_EVENT_UNLOAD = 4`, so
+q-cp's `handle_unload_event` runs `DNC_DUMP_ESSENTIAL` +
+`RBDMA_DUMP_CDMA` + `rbcm_dump_chiplet_incomplete_ttreg` — a
+~700-line register dump peppered with `mdelay(500000)` busy-waits
+that block the doorbell ISR on CP0.cpu0 for many seconds under TCG.
+The kmd then proceeds with `rebel_soft_reset`, REMU's CM7 stub
+synthesises `FW_BOOT_DONE` (because we don't model a real CA73
+cluster reset — see roadmap → P8), the kmd thinks the device is
+fresh, and `rebel_hw_init → rebel_queue_init` rings `INTGR1` bit 7
+(QUEUE_INIT). q-cp's `hq_task` is still mid-dump, never gets to
+re-run `hq_init`, `desc->init_done` is never written back through
+the P1a outbound iATU, and the busy-loop above eats the rest of
+the 180 s test budget. Fixing the underlying cb[1] path removes
+the entire cascade.
 
 ## Cleanup
 

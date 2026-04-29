@@ -72,7 +72,26 @@
 #define R100_PCI_REVISION       0x01
 #define R100_PCI_CLASS          0x1200  /* Processing accelerator */
 
-#define R100_BAR0_DDR_SIZE      (64ULL * GiB)  /* >= RBLN_DRAM_SIZE (36 GB) */
+/* BAR0 = 64 GB = next power of 2 above `R100_RBLN_DRAM_SIZE` (= 36 GB,
+ * the real chiplet-0 DRAM size). PCI BARs must be power-of-2 sized
+ * (`pci_register_bar` asserts `is_power_of_2(size)`), so we can't
+ * advertise the 36 GB DRAM exactly — real silicon hits the same
+ * constraint and exposes a 64 GB BAR0 with the upper 28 GB as a
+ * reserved alias of the 36 GB DRAM window (kmd's
+ * `rebel_check_pci_bars_size` only enforces `len >= RBLN_DRAM_SIZE`,
+ * so 64 GB is fine). On REMU the M4 splice puts the shared
+ * `memory-backend-file` over offset `0..shm_size` — at the default
+ * `--shm-size = R100_RBLN_DRAM_SIZE` the splice exactly covers the
+ * DRAM portion, and a host-private `bar0_tail` lazy-RAM region
+ * covers the remaining 28 GB so the kmd's BAR scan still finds a
+ * 64 GB region. The tail is also exercised when callers pass
+ * `--shm-size` smaller than 36 GB (regression hosts with a tight
+ * `/dev/shm`). Cost: `pci_p2pdma_add_resource` allocates
+ * `struct page` vmemmap proportional to BAR size (~1 GB for 64 GB
+ * → the x86 guest needs `--host-mem 4G` for P10's umd workload to
+ * survive the kernel's vmemmap commit; see
+ * `tests/p10_umd_smoke_test.py`). */
+#define R100_BAR0_DDR_SIZE      (64ULL * GiB)
 #define R100_BAR2_ACP_SIZE      (64ULL * MiB)  /* == RBLN_SRAM_SIZE  */
 #define R100_BAR4_DB_SIZE       (8ULL  * MiB)  /* == RBLN_PERI_SIZE  */
 #define R100_BAR5_MSIX_SIZE     (1ULL  * MiB)  /* == RBLN_PCIE_SIZE  */
