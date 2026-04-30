@@ -42,7 +42,7 @@ End-to-end shape (mirrors tests/p4b_rbdma_oto_test.py):
      equality with the seeded SRC pattern.
 
 The test exits 0 on PASS, 2 on byte mismatch, 1 on infrastructure
-failure. Tail of `output/p5-hdma.log` is dumped on early exit.
+failure. Tail of `output/p5-hdma/run.log` is dumped on early exit.
 
 SMMU note: like P4B, the SAR/DAR fields here are written as raw
 chiplet-local DRAM offsets — the engine treats them as device PAs
@@ -61,7 +61,7 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-RUN_NAME = "p5-hdma"
+RUN_NAME = os.environ.get("REMU_RUN_NAME", "p5-hdma")
 RUN_DIR = REPO / "output" / RUN_NAME
 SHM_PATH = Path("/dev/shm/remu-" + RUN_NAME) / "remu-shm"
 
@@ -353,7 +353,7 @@ def first_diff(got, expected, ctx=8):
 def main():
     os.environ["PYTHONUNBUFFERED"] = "1"
 
-    log_path = RUN_DIR.with_suffix(".log")
+    log_path = RUN_DIR / "run.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     proc = boot_remu(log_path)

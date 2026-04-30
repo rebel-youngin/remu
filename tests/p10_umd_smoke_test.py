@@ -71,7 +71,7 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-RUN_NAME = "p10-umd"
+RUN_NAME = os.environ.get("REMU_RUN_NAME", "p10-umd")
 RUN_DIR = REPO / "output" / RUN_NAME
 
 # Where the x86 guest's serial console (and hence /init + setup.sh stdout)
@@ -161,7 +161,7 @@ def main():
               "guest/build-umd.sh on the host first.")
         return 77
 
-    log_path = RUN_DIR.with_suffix(".log")
+    log_path = RUN_DIR / "run.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Belt-and-suspenders against stale state: drop the prior serial.log

@@ -42,9 +42,13 @@ boot (check with `./remucli status`).
 
 ## Run — output layout
 
-Everything lands in `output/<name>/` (or `output/run-<timestamp>/` if
-`--name` omitted). `output/latest` is a symlink to the newest run.
-Re-using the same name overwrites in place. Nothing goes to `/tmp`.
+`./remucli run` requires `--name <run_name>` (no auto-timestamp
+fallback) — every run is addressed by an explicit name so
+`clean --name <run_name>` can scope teardown precisely and concurrent
+runs with different names never collide. Everything for a given
+invocation lands in `output/<run_name>/`. `output/latest` is a symlink
+to the newest run. Re-using the same name overwrites in place.
+Nothing goes to `/tmp`.
 
 Phase 1 (NPU only):
 
@@ -54,6 +58,10 @@ output/my-test/
   uart{0..3}.log  # per-chiplet UARTs; uart0 also muxed to stdio + monitor
   hils.log        # FreeRTOS HILS ring tail (DRAM @ 0x10000000)
   qemu.log        # only if --trace
+  run.log         # captured remucli/QEMU stdout (only when launched
+                  #  via a tests/ wrapper; interactive runs leave stdout on the tty)
+  test.log        # `./remucli test <id>` orchestrator log (only when
+                  #  the run was driven by `./remucli test`)
 ```
 
 Phase 2 (`./remucli run --host` — both QEMUs + chardev bridges):
@@ -966,6 +974,6 @@ source.
 ## Cleanup
 
 ```
-rm -rf output/run-20260101-*    # drop older timestamped runs
-rm -rf output/                  # nuke everything; next run recreates
+rm -rf output/iter-*    # drop a name-prefixed family of runs
+rm -rf output/          # nuke everything; next run recreates
 ```

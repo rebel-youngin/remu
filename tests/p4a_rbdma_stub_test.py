@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-RUN_NAME = "p4a-rbdma"
+RUN_NAME = os.environ.get("REMU_RUN_NAME", "p4a-rbdma")
 RUN_DIR = REPO / "output" / RUN_NAME
 
 # Chiplet-0 RBDMA register addresses (NBUS_L_RBDMA_CFG_BASE + offset).
@@ -84,7 +84,7 @@ def read_word(npu_mon, addr):
 def main():
     os.environ["PYTHONUNBUFFERED"] = "1"
     remucli = REPO / "remucli"
-    log = RUN_DIR.with_suffix(".log")
+    log = RUN_DIR / "run.log"
     log.parent.mkdir(parents=True, exist_ok=True)
 
     with open(log, "wb") as f:

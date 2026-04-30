@@ -70,7 +70,7 @@ QEMU_BIN_X86 = REPO / "build" / "qemu" / "qemu-system-x86_64"
 QEMU_BIN_ARM = REPO / "build" / "qemu" / "qemu-system-aarch64"
 IMAGES_DIR = REPO / "images"
 
-RUN_NAME = "m8-issr"
+RUN_NAME = os.environ.get("REMU_RUN_NAME", "m8-issr")
 RUN_DIR = REPO / "output" / RUN_NAME
 
 # ── Constants — must match src/include/r100/remu_addrmap.h ─────────────────

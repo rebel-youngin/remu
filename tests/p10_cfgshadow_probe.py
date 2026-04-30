@@ -64,7 +64,7 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-RUN_NAME = "p10-debug"
+RUN_NAME = os.environ.get("REMU_RUN_NAME", "p10-debug")
 RUN_DIR = REPO / "output" / RUN_NAME
 NPU_MON = RUN_DIR / "npu" / "monitor.sock"
 HOST_MON = RUN_DIR / "host" / "monitor.sock"
@@ -156,7 +156,7 @@ def hexdump_shm(off, n):
 
 
 def main():
-    log_path = RUN_DIR.with_suffix(".log")
+    log_path = RUN_DIR / "run.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     for stale in (DOORBELL_LOG, NPU_MON, HOST_MON):

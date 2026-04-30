@@ -70,7 +70,7 @@ mirrored in `src/machine/r100_smmu.c`'s `R100_STE0_*` / `R100_STE2_*`):
 
 The test exits 0 on PASS, 2 on byte mismatch, 1 on infrastructure
 failure (boot timeout / gdbstub failure / shm mismatch). On early exit
-we dump the tail of `output/p11-smmu.log` so a broken q-cp boot is
+we dump the tail of `output/p11-smmu/run.log` so a broken q-cp boot is
 distinguishable from an SMMU walker bug.
 """
 import mmap
@@ -84,7 +84,7 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-RUN_NAME = "p11-smmu"
+RUN_NAME = os.environ.get("REMU_RUN_NAME", "p11-smmu")
 RUN_DIR = REPO / "output" / RUN_NAME
 SHM_PATH = Path("/dev/shm/remu-" + RUN_NAME) / "remu-shm"
 
@@ -465,7 +465,7 @@ def first_diff(got, expected, ctx=8):
 def main():
     os.environ["PYTHONUNBUFFERED"] = "1"
 
-    log_path = RUN_DIR.with_suffix(".log")
+    log_path = RUN_DIR / "run.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     proc = boot_remu(log_path)

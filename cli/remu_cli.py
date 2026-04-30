@@ -13,7 +13,7 @@ doubles on a fresh tree; incremental rebuilds only touch changed files.
 Usage:
     ./remucli build [--clean] [--jobs N]
     ./remucli fw-build [-c tf-a -c cp0 -c cp1] [--clean]   # -p silicon implicit
-    ./remucli run [--name NAME] [--gdb] [--trace] [--chiplets N]
+    ./remucli run --name NAME [--gdb] [--trace] [--chiplets N]
     ./remucli gdb [--port PORT] [-b ELF]
     ./remucli status
     ./remucli images [--check | --from-dir PATH]
@@ -543,13 +543,17 @@ def fw_build(components, platform, mode, chiplets, clean, install):
 # ── run ──────────────────────────────────────────────────────────────────────
 
 def _make_run_dir(name, output_root):
-    """Create <output_root>/<name>/ (defaulting to output/run-<ts>/) and
-    refresh the output/latest -> <name> convenience symlink. Returns
-    (run_dir, run_name)."""
+    """Create <output_root>/<name>/ and refresh the output/latest -> <name>
+    convenience symlink. `name` must be non-empty — every REMU run is
+    addressed by an explicit run_name so its outputs co-locate under
+    `output/<name>/` and `clean --name <name>` can scope cleanup
+    precisely. Returns (run_dir, run_name)."""
+    if not name:
+        raise click.UsageError(
+            "run_name is required: pass --name/-n NAME so outputs land "
+            "under <output-root>/<NAME>/.")
     root = Path(output_root).resolve() if output_root else OUTPUT_ROOT
     root.mkdir(parents=True, exist_ok=True)
-    if not name:
-        name = "run-" + time.strftime("%Y%m%d-%H%M%S")
     run_dir = root / name
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1670,9 +1674,10 @@ def _verify_npu_shared_mapping(npu_monitor_sock, mtree_log):
 
 
 @cli.command()
-@click.option("--name", "-n", default=None,
-              help="Run name. Outputs land in <output-root>/<name>/. "
-                   "Default: run-<YYYYmmdd-HHMMSS>.")
+@click.option("--name", "-n", required=True,
+              help="Run name (required). All outputs land in "
+                   "<output-root>/<name>/, and `clean --name <name>` "
+                   "scopes orphan-state teardown to the same path.")
 @click.option("--output-root", type=click.Path(file_okay=False), default=None,
               help="Parent directory for run outputs. "
                    "Default: <repo>/output/.")
@@ -1713,7 +1718,7 @@ def run(name, output_root, gdb, trace, chiplets, memory,
     """Boot R100 firmware on the emulated SoC.
 
     Every invocation gets a dedicated output directory under
-    <repo>/output/<name>/ (or a timestamped default) containing:
+    <repo>/output/<name>/ (named via the required `--name`) containing:
 
     \b
       uart0.log       — chiplet 0 UART (also muxed to stdio + monitor)
@@ -1764,13 +1769,12 @@ def run(name, output_root, gdb, trace, chiplets, memory,
     if with_host:
         _check_qemu_bin("x86_64")
 
-    # Resolve the run name BEFORE creating the output dir so the cleanup
-    # sweep narrows to exactly this run's prior state (orphan QEMUs from
-    # a SIGKILL'd previous invocation, the stale /dev/shm backing file,
-    # and *.sock files that would block a fresh socket bind). Runs with
-    # different --name values stay untouched.
-    if not name:
-        name = "run-" + time.strftime("%Y%m%d-%H%M%S")
+    # `--name` is required (Click enforces); pre-clean BEFORE creating
+    # the output dir so the sweep narrows to exactly this run's prior
+    # state (orphan QEMUs from a SIGKILL'd previous invocation, the
+    # stale /dev/shm backing file, and *.sock files that would block a
+    # fresh socket bind). Runs with different --name values stay
+    # untouched.
     click.echo("Preparing run '%s' (clearing prior state)..." % name)
     _cleanup_run_trash(name, output_root=output_root, verbose=True)
 
@@ -2524,17 +2528,25 @@ DEFAULT_TEST_KEYS = [k for k, v in TEST_REGISTRY.items()
               help="Don't pre-clean each test's run dir (not recommended).")
 @click.option("--stop-on-fail", is_flag=True,
               help="Abort the suite on the first failing test.")
-def test(tests, skip_clean, stop_on_fail):
+@click.option("--name", "-n", "name_override", default=None,
+              help="Override the run_name for the selected test. Only "
+                   "valid when running exactly one test (so independent "
+                   "runs never collide on a shared name). Propagated to "
+                   "the test script via the REMU_RUN_NAME environment "
+                   "variable; the script then passes it to "
+                   "`./remucli run --name` and roots its RUN_DIR there.")
+def test(tests, skip_clean, stop_on_fail, name_override):
     """Run REMU bridge end-to-end tests with pre-run cleanup.
 
     By default runs the regression set (m5..m8 + p4a/p4b/p5/p11).  Pass one
     or more test ids to pick specific phases, e.g.:
 
     \b
-        ./remucli test              # full default regression
-        ./remucli test m5 m6        # just M5 + M6
-        ./remucli test p10          # opt-in test (not in default)
-        ./remucli test all p10      # default regression + P10
+        ./remucli test                       # full default regression
+        ./remucli test m5 m6                 # just M5 + M6
+        ./remucli test p10                   # opt-in test (not in default)
+        ./remucli test all p10               # default regression + P10
+        ./remucli test p10 --name p10-iter2  # rename the run dir for one test
 
     Tests flagged `in_default=False` in TEST_REGISTRY (currently just
     P10 — see docs/roadmap.md for the open queue_init handshake) are
@@ -2544,9 +2556,12 @@ def test(tests, skip_clean, stop_on_fail):
     Each test is launched after `./remucli clean --name <its-run>` so
     orphan QEMU processes / stale shm / stale sockets from a prior
     invocation never contaminate the result. Per-test stdout is
-    captured under output/test-<id>.log; only a one-line PASS/FAIL
-    plus a short tail on failure is printed, so the suite's total
-    output stays small enough to paste into a bug report.
+    captured under output/<run-name>/test.log (co-located with the
+    QEMU run.log + monitor sockets so all artifacts of one test
+    invocation live in one directory); only a one-line PASS/FAIL plus
+    a short tail on failure is printed to the terminal, so the
+    suite's total output stays small enough to paste into a bug
+    report.
     """
     if not tests or "all" in tests:
         # `all` and the bare `./remucli test` form intentionally skip
@@ -2563,6 +2578,15 @@ def test(tests, skip_clean, stop_on_fail):
         seen = set()
         selected = [t for t in tests if not (t in seen or seen.add(t))]
 
+    if name_override and len(selected) != 1:
+        # A single REMU_RUN_NAME shared across multiple tests would make
+        # them stomp on each other's output dir, /dev/shm backing, and
+        # cleanup scope. Force the user to be explicit one-test-at-a-time.
+        raise click.UsageError(
+            "--name/-n is only valid when running exactly one test "
+            "(got %d: %s). Re-invoke per test with its own --name."
+            % (len(selected), " ".join(selected)))
+
     needs = set()
     for t in selected:
         needs.update(TEST_REGISTRY[t]["needs"])
@@ -2574,17 +2598,39 @@ def test(tests, skip_clean, stop_on_fail):
     for t in selected:
         info = TEST_REGISTRY[t]
         script = REMU_ROOT / info["script"]
-        log = OUTPUT_ROOT / ("test-%s.log" % t)
+        # Resolve the effective run_name for this iteration: the CLI
+        # override (only set when len(selected)==1) wins over the
+        # registry default. The same name is used for cleanup scope,
+        # the orchestrator's test.log location, and — via REMU_RUN_NAME
+        # — the test script's own RUN_DIR / `./remucli run --name`.
+        effective_run_name = name_override or info["run_name"]
+        # Co-locate the orchestrator log with the per-run artifacts the
+        # test script will produce (run.log, monitor.sock, info-*.log,
+        # …) under output/<run_name>/. Cleanup only sweeps shm dirs and
+        # *.sock files, so this test.log survives across re-runs of the
+        # same name and its tail can be diffed offline.
+        run_dir = OUTPUT_ROOT / effective_run_name
+        run_dir.mkdir(parents=True, exist_ok=True)
+        log = run_dir / "test.log"
 
         click.echo()
-        click.secho("[%s] %s" % (t, info["desc"]), fg="cyan")
+        click.secho("[%s] %s (run: %s)" % (t, info["desc"],
+                                           effective_run_name),
+                    fg="cyan")
         if not skip_clean:
-            _cleanup_run_trash(info["run_name"], verbose=False)
+            _cleanup_run_trash(effective_run_name, verbose=False)
 
         if not script.is_file():
             click.secho("  SKIP: %s not found" % script, fg="yellow")
             results.append((t, None))
             continue
+
+        # Propagate the effective run_name to the test script via env;
+        # each script reads `REMU_RUN_NAME` (with its hardcoded default
+        # as fallback) so standalone `python3 tests/m5_dataflow_test.py`
+        # invocations keep working unchanged.
+        child_env = os.environ.copy()
+        child_env["REMU_RUN_NAME"] = effective_run_name
 
         start = time.time()
         with open(log, "wb") as lf:
@@ -2592,6 +2638,7 @@ def test(tests, skip_clean, stop_on_fail):
                 [sys.executable, str(script)],
                 stdout=lf, stderr=subprocess.STDOUT,
                 cwd=REMU_ROOT,
+                env=child_env,
             ).returncode
         dur = time.time() - start
 

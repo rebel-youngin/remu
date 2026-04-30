@@ -49,7 +49,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 QEMU_BIN = REPO / "build" / "qemu" / "qemu-system-aarch64"
 IMAGES_DIR = REPO / "images"
-RUN_NAME = "m6-doorbell"
+RUN_NAME = os.environ.get("REMU_RUN_NAME", "m6-doorbell")
 RUN_DIR = REPO / "output" / RUN_NAME
 DOORBELL_SOCK = RUN_DIR / "doorbell.sock"
 DOORBELL_LOG = RUN_DIR / "doorbell.log"

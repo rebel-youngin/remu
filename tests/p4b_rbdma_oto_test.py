@@ -44,7 +44,7 @@ identity mode and raw chiplet-local DRAM offsets (0x07000000 /
 that programs SMMU registers and stages page tables explicitly.
 
 The test exits 0 on PASS, 2 on byte mismatch, 1 on infrastructure
-failure. Tail of `output/p4b-rbdma.log` is dumped on early exit so a
+failure. Tail of `output/p4b-rbdma/run.log` is dumped on early exit so a
 broken q-cp boot doesn't silently look like a P4B regression.
 
 Once P5 lands and the umd command_buffer integration test boots
@@ -63,7 +63,7 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-RUN_NAME = "p4b-rbdma"
+RUN_NAME = os.environ.get("REMU_RUN_NAME", "p4b-rbdma")
 RUN_DIR = REPO / "output" / RUN_NAME
 SHM_PATH = Path("/dev/shm/remu-" + RUN_NAME) / "remu-shm"
 
@@ -349,7 +349,7 @@ def first_diff(got, expected, ctx=8):
 def main():
     os.environ["PYTHONUNBUFFERED"] = "1"
 
-    log_path = RUN_DIR.with_suffix(".log")
+    log_path = RUN_DIR / "run.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     proc = boot_remu(log_path)

@@ -85,7 +85,7 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-RUN_NAME = "p10-debug"
+RUN_NAME = os.environ.get("REMU_RUN_NAME", "p10-debug")
 RUN_DIR = REPO / "output" / RUN_NAME
 NPU_MON_SOCK = RUN_DIR / "npu" / "monitor.sock"
 HOST_MON_SOCK = RUN_DIR / "host" / "monitor.sock"
@@ -375,7 +375,7 @@ def main():
     print("  using gdb: %s" % gdb_bin)
 
     RUN_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = RUN_DIR.with_suffix(".log")
+    log_path = RUN_DIR / "run.log"
 
     # Drop stale state — boot would clean it anyway, but we need
     # doorbell.log to be the new run's so count_cq_doorbells() doesn't

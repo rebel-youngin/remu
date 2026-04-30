@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-RUN_NAME = "m5-flow"
+RUN_NAME = os.environ.get("REMU_RUN_NAME", "m5-flow")
 RUN_DIR = REPO / "output" / RUN_NAME
 SHM_FILE = Path("/dev/shm/remu-%s/remu-shm" % RUN_NAME)
 
@@ -69,7 +69,7 @@ def hmp(sock_path, cmd, timeout=5.0):
 def main():
     os.environ["PYTHONUNBUFFERED"] = "1"
     remucli = REPO / "remucli"
-    log = RUN_DIR.with_suffix(".log")
+    log = RUN_DIR / "run.log"
     log.parent.mkdir(parents=True, exist_ok=True)
 
     # Spawn remucli run in a new session so we can kill the whole tree.

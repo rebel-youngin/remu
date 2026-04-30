@@ -114,9 +114,13 @@ booting the full umd/kmd/x86 stack.
 | `p11_smmu_walk_test.py` | hand-staged 3-level S2 PT + STE → 4 KB OTO |
 | `p11b_smmu_evtq_test.py` | invalid STE → eventq emit + GIC SPI 762 |
 
-All `./remucli run` invocations write into `output/<name>/` (or
-`output/run-<timestamp>/` if `--name` omitted). Never pass `/tmp/`
-paths. See `docs/debugging.md` for the full agent loop.
+Every `./remucli run` invocation requires `--name <run_name>`; all
+artifacts (UART logs, monitor sockets, info dumps, the captured QEMU
+stdout, and — when launched via `./remucli test` — the orchestrator's
+`test.log`) land under `output/<run_name>/`. Run names must be
+explicit so `clean --name <run_name>` can scope teardown precisely
+and concurrent runs with different names never collide. Never pass
+`/tmp/` paths. See `docs/debugging.md` for the full agent loop.
 
 ### Shell completion (optional)
 

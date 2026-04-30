@@ -63,7 +63,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 QEMU_BIN_X86 = REPO / "build" / "qemu" / "qemu-system-x86_64"
-RUN_NAME = "m7-msix"
+RUN_NAME = os.environ.get("REMU_RUN_NAME", "m7-msix")
 RUN_DIR = REPO / "output" / RUN_NAME
 HOST_DIR = RUN_DIR / "host"
 MSIX_SOCK = HOST_DIR / "msix.sock"

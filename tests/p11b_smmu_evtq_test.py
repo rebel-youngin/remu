@@ -78,7 +78,7 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-RUN_NAME = "p11b-evtq"
+RUN_NAME = os.environ.get("REMU_RUN_NAME", "p11b-evtq")
 RUN_DIR = REPO / "output" / RUN_NAME
 SHM_PATH = Path("/dev/shm/remu-" + RUN_NAME) / "remu-shm"
 
@@ -405,7 +405,7 @@ def teardown(proc):
 def main():
     os.environ["PYTHONUNBUFFERED"] = "1"
 
-    log_path = RUN_DIR.with_suffix(".log")
+    log_path = RUN_DIR / "run.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     proc = boot_remu(log_path)
