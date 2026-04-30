@@ -4,6 +4,13 @@
 > Each completed milestone is a one-liner + commit SHA — read the
 > commit message for rationale, alternatives rejected, and post-mortem
 > detail. This file focuses on ongoing and future work.
+>
+> `CLAUDE.md` is intentionally a thin quick-reference (build commands,
+> BAR table, test matrix, code style). Per-device internals live in
+> `docs/architecture.md` → "Source File Map" + "Shared Memory
+> Backends"; the "X used to be Y" / "P10-fix replaced P1b" /
+> "pre-P10 plumbing" evolution narrative lives here and in `git log`.
+> `CLAUDE.md` does not duplicate either.
 
 ## Phase 1: FW Boot — complete
 
